@@ -1,30 +1,61 @@
 {
   "expo": {
-    "name": "ImpactAI-app",
-    "slug": "ImpactAI-app",
+    "name": "ImpactAI",
+    "slug": "impactai",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
+    "scheme": "impactai",
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": false,
+      "bundleIdentifier": "com.impactai.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "ImpactAI needs camera access to record your golf swing.",
+        "NSMicrophoneUsageDescription": "ImpactAI needs microphone access when recording video.",
+        "NSPhotoLibraryUsageDescription": "ImpactAI needs photo library access to upload your golf swing."
+      }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "package": "com.impactai.app",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_EXTERNAL_STORAGE"
+      ]
     },
     "web": {
-      "favicon": "./assets/favicon.png"
-    }
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-web-browser",
+      "expo-video",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "ImpactAI needs camera access to record your golf swing.",
+          "microphonePermission": "ImpactAI needs microphone access when recording video.",
+          "recordAudioAndroid": true
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "ImpactAI needs photo library access to upload your golf swing."
+        }
+      ]
+    ]
   }
 }
