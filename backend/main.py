@@ -5,7 +5,7 @@ import numpy as np
 import tempfile
 import urllib.request
 import mediapipe as mp
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -48,6 +48,46 @@ class AnalyzeFramesRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/extract-frames")
+async def extract_frames(video: UploadFile = File(...), frameCount: int = Form(6)):
+    """
+    Accept a video file, extract evenly-spaced frames using OpenCV,
+    return them as base64 JPEG strings for AI analysis.
+    """
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp.write(await video.read())
+            tmp_path = tmp.name
+
+        cap = cv2.VideoCapture(tmp_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            return {"frames": []}
+
+        count = min(frameCount, total_frames)
+        indices = [int(i * total_frames / count) for i in range(count)]
+        frames_b64 = []
+
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            frames_b64.append(base64.b64encode(buf).decode("utf-8"))
+
+        cap.release()
+        return {"frames": frames_b64}
+
+    except Exception as e:
+        print(f"[extract-frames] error: {e}")
+        return {"frames": []}
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 @app.post("/analyze-frames")
