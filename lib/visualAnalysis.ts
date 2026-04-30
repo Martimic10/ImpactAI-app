@@ -3,9 +3,9 @@ import { supabase } from '@/lib/supabase';
 import { SwingResult, VisualAnalysis, FrameAnalysis, SwingPhase, PoseLandmark } from '@/types';
 
 const BUCKET = 'swing-videos';
-const MEDIAPIPE_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
 
-const PHASE_TIMES: Record<SwingPhase, number> = {
+const PHASE_TIMES_MS: Record<SwingPhase, number> = {
   setup:  200,
   top:    900,
   impact: 1600,
@@ -19,36 +19,7 @@ const PHASE_LABELS: Record<SwingPhase, string> = {
   finish: 'Follow-Through',
 };
 
-function getVideoThumbnails() {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const mod = require('expo-video-thumbnails');
-    if (typeof mod?.getThumbnailAsync !== 'function') return null;
-    return mod;
-  } catch {
-    return null;
-  }
-}
-
-async function resolveLocalUri(videoUri: string, swingId: string): Promise<string> {
-  if (!videoUri.startsWith('http')) {
-    console.log('[visualAnalysis] using local URI directly');
-    return videoUri;
-  }
-  const dest = `${LegacyFS.cacheDirectory}va_src_${swingId}.mp4`;
-  try {
-    const info = await LegacyFS.getInfoAsync(dest);
-    if (info.exists) {
-      console.log('[visualAnalysis] using cached local video');
-      return dest;
-    }
-  } catch { /* proceed to download */ }
-
-  console.log('[visualAnalysis] downloading video for frame extraction...');
-  const { uri } = await LegacyFS.downloadAsync(videoUri, dest);
-  console.log('[visualAnalysis] download complete:', uri.slice(0, 60));
-  return uri;
-}
+const PHASES: SwingPhase[] = ['setup', 'top', 'impact', 'finish'];
 
 function buildCoachingNotes(result: SwingResult): Record<SwingPhase, string> {
   const r = result.scoreReasoning;
@@ -61,65 +32,119 @@ function buildCoachingNotes(result: SwingResult): Record<SwingPhase, string> {
   };
 }
 
-// Returns { publicUrl, base64 } or null on failure
-async function extractAndUploadFrame(
-  localUri: string,
-  userId: string,
-  swingId: string,
-  phase: SwingPhase
-): Promise<{ publicUrl: string; base64: string } | null> {
-  const VideoThumbnails = getVideoThumbnails();
-  if (!VideoThumbnails) return null;
+// ─── Backend path (preferred) ────────────────────────────────────────────────
+// Calls /extract-key-frames on Render — downloads the video server-side,
+// extracts 4 frames + runs MediaPipe pose detection, returns everything in one go.
+// Works in Expo Go with zero native build required.
 
+interface BackendFrameResult {
+  frame: string | null;       // base64 JPEG
+  landmarks: PoseLandmark[] | null;
+}
+
+async function extractViaBackend(
+  videoUrl: string
+): Promise<BackendFrameResult[] | null> {
   try {
-    const { uri: thumbUri } = await VideoThumbnails.getThumbnailAsync(localUri, {
-      time: PHASE_TIMES[phase],
-      quality: 0.7,
+    const res = await fetch(`${BACKEND_URL}/extract-key-frames`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        video_url: videoUrl,
+        timestamps_ms: PHASES.map((p) => PHASE_TIMES_MS[p]),
+      }),
     });
-
-    const base64 = await LegacyFS.readAsStringAsync(thumbUri, { encoding: 'base64' });
-    const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
-
-    const path = `${userId}/${swingId}_frame_${phase}.jpg`;
-    const { error } = await supabase.storage
-      .from(BUCKET)
-      .upload(path, bytes, { contentType: 'image/jpeg', upsert: true });
-
-    if (error) {
-      console.warn(`[visualAnalysis] storage upload failed for ${phase}:`, error.message);
+    if (!res.ok) {
+      console.warn('[visualAnalysis] backend /extract-key-frames error:', res.status);
       return null;
     }
-
-    const { data } = supabase.storage.from(BUCKET).getPublicUrl(path);
-    console.log(`[visualAnalysis] frame uploaded: ${phase}`);
-    return { publicUrl: data.publicUrl, base64 };
+    const json = await res.json();
+    return (json.frames ?? []) as BackendFrameResult[];
   } catch (e) {
-    console.warn(`[visualAnalysis] frame extraction failed for ${phase}:`, e);
+    console.warn('[visualAnalysis] backend call threw:', e);
     return null;
   }
 }
 
-// Calls backend /analyze-frames with base64 images, returns per-frame landmarks (or nulls)
-async function fetchLandmarks(base64Frames: (string | null)[]): Promise<(PoseLandmark[] | null)[]> {
-  if (!MEDIAPIPE_URL) return base64Frames.map(() => null);
+async function uploadFrame(
+  base64: string,
+  userId: string,
+  swingId: string,
+  phase: SwingPhase
+): Promise<string | null> {
   try {
-    const payload = base64Frames.map((f) => f ?? '');
-    const res = await fetch(`${MEDIAPIPE_URL}/analyze-frames`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ frames: payload }),
-    });
-    if (!res.ok) {
-      console.warn('[visualAnalysis] /analyze-frames error:', res.status);
-      return base64Frames.map(() => null);
+    const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+    const path = `${userId}/${swingId}_frame_${phase}.jpg`;
+    const { error } = await supabase.storage
+      .from(BUCKET)
+      .upload(path, bytes, { contentType: 'image/jpeg', upsert: true });
+    if (error) {
+      console.warn(`[visualAnalysis] upload failed for ${phase}:`, error.message);
+      return null;
     }
-    const json = await res.json();
-    return (json.frames ?? []) as (PoseLandmark[] | null)[];
+    const { data } = supabase.storage.from(BUCKET).getPublicUrl(path);
+    return data.publicUrl;
   } catch (e) {
-    console.warn('[visualAnalysis] /analyze-frames threw:', e);
-    return base64Frames.map(() => null);
+    console.warn(`[visualAnalysis] upload threw for ${phase}:`, e);
+    return null;
   }
 }
+
+// ─── Local fallback (expo-video-thumbnails) ──────────────────────────────────
+// Only used when no backend URL is configured. Requires native build.
+
+function getVideoThumbnails() {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require('expo-video-thumbnails');
+    return typeof mod?.getThumbnailAsync === 'function' ? mod : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveLocalUri(videoUri: string, swingId: string): Promise<string> {
+  if (!videoUri.startsWith('http')) return videoUri;
+  const dest = `${LegacyFS.cacheDirectory}va_src_${swingId}.mp4`;
+  try {
+    const info = await LegacyFS.getInfoAsync(dest);
+    if (info.exists) return dest;
+  } catch { /* proceed */ }
+  const { uri } = await LegacyFS.downloadAsync(videoUri, dest);
+  return uri;
+}
+
+async function extractViaLocal(
+  videoUri: string,
+  userId: string,
+  swingId: string
+): Promise<{ publicUrl: string | null; base64: string | null }[]> {
+  const VideoThumbnails = getVideoThumbnails();
+  if (!VideoThumbnails) {
+    console.warn('[visualAnalysis] expo-video-thumbnails unavailable');
+    return PHASES.map(() => ({ publicUrl: null, base64: null }));
+  }
+
+  const localUri = await resolveLocalUri(videoUri, swingId);
+  return Promise.all(
+    PHASES.map(async (phase) => {
+      try {
+        const { uri: thumbUri } = await VideoThumbnails.getThumbnailAsync(localUri, {
+          time: PHASE_TIMES_MS[phase],
+          quality: 0.7,
+        });
+        const base64 = await LegacyFS.readAsStringAsync(thumbUri, { encoding: 'base64' });
+        const publicUrl = await uploadFrame(base64, userId, swingId, phase);
+        return { publicUrl, base64 };
+      } catch (e) {
+        console.warn(`[visualAnalysis] local extraction failed for ${phase}:`, e);
+        return { publicUrl: null, base64: null };
+      }
+    })
+  );
+}
+
+// ─── Main export ─────────────────────────────────────────────────────────────
 
 export async function generateVisualAnalysis(
   videoUri: string,
@@ -127,50 +152,61 @@ export async function generateVisualAnalysis(
   swingId: string,
   result: SwingResult
 ): Promise<VisualAnalysis | null> {
-  const VideoThumbnails = getVideoThumbnails();
-  if (!VideoThumbnails) {
-    console.warn('[visualAnalysis] expo-video-thumbnails unavailable — run `npx expo run:ios`');
-    return null;
-  }
-
-  console.log('[visualAnalysis] resolving local URI from:', videoUri.slice(0, 60));
-
-  let localUri: string;
-  try {
-    localUri = await resolveLocalUri(videoUri, swingId);
-  } catch (e) {
-    console.error('[visualAnalysis] failed to get local video:', e);
-    return null;
-  }
-
   const notes = buildCoachingNotes(result);
-  const phases: SwingPhase[] = ['setup', 'top', 'impact', 'finish'];
 
-  const frameResults = await Promise.all(
-    phases.map((phase) => extractAndUploadFrame(localUri, userId, swingId, phase))
-  );
+  // Prefer backend — works in Expo Go, handles frames + landmarks in one call
+  if (BACKEND_URL && videoUri.startsWith('http')) {
+    console.log('[visualAnalysis] using backend extraction for', swingId);
+    const backendFrames = await extractViaBackend(videoUri);
 
-  const successCount = frameResults.filter(Boolean).length;
-  console.log(`[visualAnalysis] extracted ${successCount}/4 frames`);
+    if (backendFrames && backendFrames.length === 4) {
+      const successCount = backendFrames.filter((f) => f.frame).length;
+      console.log(`[visualAnalysis] backend returned ${successCount}/4 frames`);
 
-  if (successCount < 2) {
-    console.warn('[visualAnalysis] too few frames — aborting');
-    return null;
+      if (successCount < 2) {
+        console.warn('[visualAnalysis] too few frames from backend');
+        return null;
+      }
+
+      // Upload frames to Supabase storage in parallel
+      const uploadedUrls = await Promise.all(
+        PHASES.map((phase, i) => {
+          const f = backendFrames[i];
+          return f.frame ? uploadFrame(f.frame, userId, swingId, phase) : Promise.resolve(null);
+        })
+      );
+
+      const landmarkCount = backendFrames.filter((f) => f.landmarks).length;
+      console.log(`[visualAnalysis] landmarks detected: ${landmarkCount}/4`);
+
+      return {
+        setup:  buildFrame('setup',  uploadedUrls[0], notes.setup,  backendFrames[0]?.landmarks),
+        top:    buildFrame('top',    uploadedUrls[1], notes.top,    backendFrames[1]?.landmarks),
+        impact: buildFrame('impact', uploadedUrls[2], notes.impact, backendFrames[2]?.landmarks),
+        finish: buildFrame('finish', uploadedUrls[3], notes.finish, backendFrames[3]?.landmarks),
+      };
+    }
+    console.warn('[visualAnalysis] backend returned bad response — falling back to local');
   }
 
-  // Optionally fetch pose landmarks from the MediaPipe backend
-  const base64List = frameResults.map((r) => r?.base64 ?? null);
-  const landmarkSets = await fetchLandmarks(base64List);
-  console.log(`[visualAnalysis] landmarks fetched: ${landmarkSets.filter(Boolean).length}/4`);
+  // Local fallback via expo-video-thumbnails (needs native build)
+  console.log('[visualAnalysis] using local extraction for', swingId);
+  try {
+    const localFrames = await extractViaLocal(videoUri, userId, swingId);
+    const successCount = localFrames.filter((f) => f.publicUrl).length;
+    console.log(`[visualAnalysis] local extracted ${successCount}/4 frames`);
+    if (successCount < 2) return null;
 
-  const analysis: VisualAnalysis = {
-    setup:  buildFrame('setup',  frameResults[0]?.publicUrl ?? null, notes.setup,  landmarkSets[0]),
-    top:    buildFrame('top',    frameResults[1]?.publicUrl ?? null, notes.top,    landmarkSets[1]),
-    impact: buildFrame('impact', frameResults[2]?.publicUrl ?? null, notes.impact, landmarkSets[2]),
-    finish: buildFrame('finish', frameResults[3]?.publicUrl ?? null, notes.finish, landmarkSets[3]),
-  };
-
-  return analysis;
+    return {
+      setup:  buildFrame('setup',  localFrames[0].publicUrl, notes.setup),
+      top:    buildFrame('top',    localFrames[1].publicUrl, notes.top),
+      impact: buildFrame('impact', localFrames[2].publicUrl, notes.impact),
+      finish: buildFrame('finish', localFrames[3].publicUrl, notes.finish),
+    };
+  } catch (e) {
+    console.error('[visualAnalysis] local extraction threw:', e);
+    return null;
+  }
 }
 
 function buildFrame(
