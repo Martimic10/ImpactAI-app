@@ -90,6 +90,35 @@ async function uploadFrame(
   }
 }
 
+// Sends the local video file directly to the backend (for file:// URIs)
+async function extractViaBackendUpload(
+  localUri: string
+): Promise<BackendFrameResult[] | null> {
+  try {
+    const formData = new FormData();
+    formData.append('video', {
+      uri: localUri,
+      name: 'swing.mp4',
+      type: 'video/mp4',
+    } as unknown as Blob);
+    formData.append('timestamps_ms', PHASES.map((p) => PHASE_TIMES_MS[p]).join(','));
+
+    const res = await fetch(`${BACKEND_URL}/extract-key-frames-upload`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) {
+      console.warn('[visualAnalysis] backend upload error:', res.status);
+      return null;
+    }
+    const json = await res.json();
+    return (json.frames ?? []) as BackendFrameResult[];
+  } catch (e) {
+    console.warn('[visualAnalysis] backend upload threw:', e);
+    return null;
+  }
+}
+
 // ─── Local fallback (expo-video-thumbnails) ──────────────────────────────────
 // Only used when no backend URL is configured. Requires native build.
 
@@ -155,12 +184,14 @@ export async function generateVisualAnalysis(
   const notes = buildCoachingNotes(result);
 
   // Prefer backend — works in Expo Go, handles frames + landmarks in one call
-  if (BACKEND_URL && videoUri.startsWith('http')) {
+  if (BACKEND_URL) {
     console.log('[visualAnalysis] using backend extraction for', swingId);
-    const backendFrames = await extractViaBackend(videoUri);
+    const backendFrames = videoUri.startsWith('http')
+      ? await extractViaBackend(videoUri)
+      : await extractViaBackendUpload(videoUri);
 
     if (backendFrames && backendFrames.length === 4) {
-      const successCount = backendFrames.filter((f) => f.frame).length;
+      const successCount = backendFrames.filter((f: BackendFrameResult) => f.frame).length;
       console.log(`[visualAnalysis] backend returned ${successCount}/4 frames`);
 
       if (successCount < 2) {
@@ -176,7 +207,7 @@ export async function generateVisualAnalysis(
         })
       );
 
-      const landmarkCount = backendFrames.filter((f) => f.landmarks).length;
+      const landmarkCount = backendFrames.filter((f: BackendFrameResult) => f.landmarks).length;
       console.log(`[visualAnalysis] landmarks detected: ${landmarkCount}/4`);
 
       return {

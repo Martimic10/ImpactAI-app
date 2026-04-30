@@ -112,6 +112,65 @@ def extract_key_frames(req: ExtractKeyFramesRequest):
             os.remove(tmp_path)
 
 
+@app.post("/extract-key-frames-upload")
+async def extract_key_frames_upload(
+    video: UploadFile = File(...),
+    timestamps_ms: str = Form("200,900,1600,2400"),
+):
+    """
+    Same as /extract-key-frames but accepts a video file upload instead of a URL.
+    Used when the video is a local file on the device.
+    """
+    tmp_path = None
+    try:
+        ts_list = [int(t.strip()) for t in timestamps_ms.split(",")]
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp.write(await video.read())
+            tmp_path = tmp.name
+
+        cap = cv2.VideoCapture(tmp_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        results = []
+
+        with mp_pose.Pose(
+            static_image_mode=True,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+        ) as pose:
+            for ms in ts_list:
+                frame_idx = int((ms / 1000.0) * fps)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                if not ret:
+                    results.append({"frame": None, "landmarks": None})
+                    continue
+
+                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                frame_b64 = base64.b64encode(buf).decode("utf-8")
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                detection = pose.process(rgb)
+                landmarks = None
+                if detection.pose_landmarks:
+                    landmarks = [
+                        {"x": float(lm.x), "y": float(lm.y), "z": float(lm.z), "visibility": float(lm.visibility)}
+                        for lm in detection.pose_landmarks.landmark
+                    ]
+                results.append({"frame": frame_b64, "landmarks": landmarks})
+
+        cap.release()
+        return {"frames": results}
+
+    except Exception as e:
+        print(f"[extract-key-frames-upload] error: {e}")
+        return {"frames": []}
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 @app.post("/extract-frames")
 async def extract_frames(video: UploadFile = File(...), frameCount: int = Form(6)):
     """

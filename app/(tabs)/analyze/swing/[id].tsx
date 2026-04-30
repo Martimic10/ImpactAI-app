@@ -358,7 +358,13 @@ export default function SwingDetailScreen() {
   const { theme } = useTheme();
   const colors = useAppColors();
   const { id, from } = useLocalSearchParams<{ id: string; from?: string }>();
-  const goBack = () => from === 'analysis' ? router.replace('/(tabs)/analyze') : router.back();
+  const goBack = () => {
+    if (from === 'analysis') {
+      router.dismissAll();
+    } else {
+      router.back();
+    }
+  };
   const { user } = useAuth();
   const { swings } = useSwings(user?.id);
   const [directSwing, setDirectSwing] = useState<Swing | null>(null);

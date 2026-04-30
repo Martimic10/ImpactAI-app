@@ -124,8 +124,8 @@ export async function runSwingAnalysis({
     .then((url) => { if (url) saveSwingThumbnail(swingId, url); })
     .catch(() => {});
 
-  // 5. Generate visual analysis — 4 key frames + coaching labels (non-blocking)
-  generateVisualAnalysis(uri, userId, swingId, result)
+  // 5. Generate visual analysis — prefer Supabase URL so backend can download it
+  generateVisualAnalysis(videoUrl, userId, swingId, result)
     .then((va) => { if (va) saveVisualAnalysis(swingId, va); })
     .catch(() => {});
 
