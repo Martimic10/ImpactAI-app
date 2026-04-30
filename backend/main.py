@@ -1,5 +1,6 @@
 import os
 import base64
+import subprocess
 import cv2
 import numpy as np
 import tempfile
@@ -131,6 +132,38 @@ def get_phase_timestamps_ms(cap) -> List[int]:
     return [int(min(duration_ms - 80, max(0, t))) for t in times]
 
 
+def transcode_to_h264(input_path: str) -> str:
+    """Convert any video format (HEVC, MOV, etc.) to H.264 MP4 OpenCV can decode."""
+    output_path = input_path.replace(".mp4", "_h264.mp4")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", input_path,
+             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+             "-an", output_path],
+            capture_output=True, timeout=60
+        )
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(f"[ffmpeg] transcoded {os.path.getsize(output_path)} bytes")
+            return output_path
+    except Exception as e:
+        print(f"[ffmpeg] transcode failed: {e}")
+    return input_path
+
+
+def open_video(path: str):
+    """Open video with OpenCV, auto-transcoding if HEVC/unreadable."""
+    cap = cv2.VideoCapture(path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total > 0:
+        return cap, path, None
+    cap.release()
+    print(f"[ffmpeg] OpenCV couldn't read {path}, transcoding to H.264…")
+    converted = transcode_to_h264(path)
+    cap2 = cv2.VideoCapture(converted)
+    cleanup = converted if converted != path else None
+    return cap2, converted, cleanup
+
+
 def landmarks_to_json(pose_landmarks):
     return [
         {"x": float(lm.x), "y": float(lm.y), "z": float(lm.z), "visibility": float(lm.visibility)}
@@ -230,12 +263,14 @@ def extract_key_frames(req: ExtractKeyFramesRequest):
             urllib.request.urlretrieve(req.video_url, tmp.name)
             tmp_path = tmp.name
 
-        cap = cv2.VideoCapture(tmp_path)
+        cap, _, cleanup = open_video(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         ts_list = req.timestamps_ms or get_phase_timestamps_ms(cap)
         results = extract_frames_with_pose(cap, ts_list, fps)
 
         cap.release()
+        if cleanup and os.path.exists(cleanup):
+            os.remove(cleanup)
         return {"frames": results}
 
     except Exception as e:
@@ -251,17 +286,14 @@ async def extract_key_frames_upload(
     video: UploadFile = File(...),
     timestamps_ms: str = Form(""),
 ):
-    """
-    Same as /extract-key-frames but accepts a video file upload instead of a URL.
-    Used when the video is a local file on the device.
-    """
     tmp_path = None
+    cleanup = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
             tmp.write(await video.read())
             tmp_path = tmp.name
 
-        cap = cv2.VideoCapture(tmp_path)
+        cap, _, cleanup = open_video(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         ts_list = [int(t.strip()) for t in timestamps_ms.split(",") if t.strip()] if timestamps_ms.strip() else get_phase_timestamps_ms(cap)
         results = extract_frames_with_pose(cap, ts_list, fps)
@@ -273,8 +305,9 @@ async def extract_key_frames_upload(
         print(f"[extract-key-frames-upload] error: {e}")
         return {"frames": []}
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        for p in [tmp_path, cleanup]:
+            if p and os.path.exists(p):
+                os.remove(p)
 
 
 @app.post("/extract-frames")
@@ -289,9 +322,11 @@ async def extract_frames(video: UploadFile = File(...), frameCount: int = Form(6
             tmp.write(await video.read())
             tmp_path = tmp.name
 
-        cap = cv2.VideoCapture(tmp_path)
+        cap, _, cleanup_path = open_video(tmp_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"[extract-frames] total_frames={total_frames}")
         if total_frames <= 0:
+            cap.release()
             return {"frames": []}
 
         count = min(frameCount, total_frames)
@@ -303,18 +338,20 @@ async def extract_frames(video: UploadFile = File(...), frameCount: int = Form(6
             ret, frame = cap.read()
             if not ret:
                 continue
-            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             frames_b64.append(base64.b64encode(buf).decode("utf-8"))
 
         cap.release()
+        print(f"[extract-frames] returning {len(frames_b64)} frames")
         return {"frames": frames_b64}
 
     except Exception as e:
         print(f"[extract-frames] error: {e}")
         return {"frames": []}
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        for p in [tmp_path, cleanup_path if 'cleanup_path' in dir() else None]:
+            if p and os.path.exists(p):
+                os.remove(p)
 
 
 @app.post("/analyze-frames")
