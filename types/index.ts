@@ -79,6 +79,8 @@ export interface PoseLandmark {
 
 export interface FrameAnalysis {
   imageUrl: string;
+  overlayImageUrl?: string;
+  timeMs?: number;
   phase: SwingPhase;
   label: string;
   coachingNote: string;

@@ -22,7 +22,7 @@ import { supabase } from '@/lib/supabase';
 import { Swing, getSwingScore, SwingPhase, VisualAnalysis } from '@/types';
 import { useTheme } from '@/hooks/useTheme';
 import { useAppColors } from '@/lib/theme';
-import { generateVisualAnalysis, saveVisualAnalysis } from '@/lib/visualAnalysis';
+import { generateVisualAnalysis, saveVisualAnalysis, VISUAL_ANALYSIS_VERSION } from '@/lib/visualAnalysis';
 import { SwingOverlay } from '@/components/SwingOverlay';
 
 const { width: SW, height: SH } = Dimensions.get('window');
@@ -34,11 +34,11 @@ const PHASE_LABEL: Record<SwingPhase, string> = {
   finish: 'Follow-Through',
 };
 
-const CHAPTERS: { phase: SwingPhase; timeMs: number }[] = [
-  { phase: 'setup',  timeMs: 200  },
-  { phase: 'top',    timeMs: 900  },
-  { phase: 'impact', timeMs: 1600 },
-  { phase: 'finish', timeMs: 2400 },
+const CHAPTERS: { phase: SwingPhase; fallbackMs: number; ratio: number }[] = [
+  { phase: 'setup',  fallbackMs: 200,  ratio: 0.06 },
+  { phase: 'top',    fallbackMs: 1400, ratio: 0.40 },
+  { phase: 'impact', fallbackMs: 2000, ratio: 0.58 },
+  { phase: 'finish', fallbackMs: 3400, ratio: 0.90 },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,8 +57,9 @@ function FullscreenVideoViewer({
 }) {
   const [activePhase, setActivePhase]         = useState<SwingPhase | null>(null);
   const [donePhases, setDonePhases]           = useState<Set<SwingPhase>>(new Set());
-  const [isPlaying, setIsPlaying]             = useState(true);
-  const [showPose, setShowPose]               = useState(false);
+  const [isPlaying, setIsPlaying]             = useState(false);
+  const [showPose, setShowPose]               = useState(true);
+  const [frameAspect, setFrameAspect]         = useState(9 / 16);
 
   const passedRef    = useRef<Set<SwingPhase>>(new Set());
   const intervalRef  = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
@@ -67,32 +68,56 @@ function FullscreenVideoViewer({
   const player = useVideoPlayer(url || null, (p) => {
     p.loop = false;
     p.muted = false;
-    p.play();
+    p.pause();
   });
 
-  // Reset state when modal opens
-  useEffect(() => {
-    if (!visible) return;
+  function resetChapters() {
     passedRef.current = new Set();
     setActivePhase(null);
     setDonePhases(new Set());
-    setIsPlaying(true);
-    setShowPose(false);
+    setShowPose(true);
+  }
+
+  function isAtEnd() {
+    const duration = Number(player.duration);
+    return Number.isFinite(duration) && duration > 0 && player.currentTime >= duration - 0.08;
+  }
+
+  function playFromStart() {
+    resetChapters();
+    player.currentTime = 0;
     player.play();
+    setIsPlaying(true);
+  }
+
+  // Auto-play from start when modal opens
+  useEffect(() => {
+    if (!visible) return;
+    playFromStart();
 
     // Poll video time every 100ms — pause at each chapter
     intervalRef.current = setInterval(() => {
       if (!player) return;
       const timeMs = player.currentTime * 1000;
-      for (const { phase, timeMs: mark } of CHAPTERS) {
+      if (isAtEnd()) {
+        setIsPlaying(false);
+        return;
+      }
+      const durationMs = Number.isFinite(player.duration) && player.duration > 0
+        ? player.duration * 1000
+        : null;
+      for (const { phase, fallbackMs, ratio } of CHAPTERS) {
+        const detectedMark = visualAnalysis?.[phase]?.timeMs;
+        const mark = typeof detectedMark === 'number'
+          ? detectedMark
+          : durationMs ? Math.max(0, Math.min(durationMs - 80, durationMs * ratio)) : fallbackMs;
         if (!passedRef.current.has(phase) && timeMs >= mark) {
           passedRef.current.add(phase);
           player.pause();
           setIsPlaying(false);
           setActivePhase(phase);
+          setShowPose(true);
           setDonePhases(new Set(passedRef.current));
-          // Auto-resume after 4 s if user doesn't tap Continue
-          resumeTimer.current = setTimeout(() => resume(), 4000);
           break;
         }
       }
@@ -106,8 +131,25 @@ function FullscreenVideoViewer({
 
   function resume() {
     clearTimeout(resumeTimer.current);
+    // Capture chapter before clearing state
+    const chapter = CHAPTERS.find((c) => c.phase === activePhase);
     setActivePhase(null);
-    setShowPose(false);
+    setShowPose(true);
+
+    if (isAtEnd()) {
+      playFromStart();
+      return;
+    }
+
+    // Seek 300ms past the chapter mark so the interval doesn't immediately re-pause
+    if (chapter) {
+      const dMs = player.duration > 0 ? player.duration * 1000 : null;
+      const mark = dMs
+        ? Math.min(dMs - 80, dMs * chapter.ratio)
+        : chapter.fallbackMs;
+      player.currentTime = (mark + 300) / 1000;
+    }
+
     player.play();
     setIsPlaying(true);
   }
@@ -121,11 +163,16 @@ function FullscreenVideoViewer({
 
   function togglePlayPause() {
     if (isPlaying) { player.pause(); setIsPlaying(false); }
+    else if (isAtEnd()) { playFromStart(); }
     else           { player.play();  setIsPlaying(true);  }
   }
 
   const activeFrame = activePhase ? visualAnalysis?.[activePhase] : null;
   const videoH = SH * 0.56;
+  const frameW = Math.min(SW, videoH * frameAspect);
+  const frameH = frameW / frameAspect;
+  const frameLeft = (SW - frameW) / 2;
+  const frameTop = (videoH - frameH) / 2;
 
   return (
     <Modal visible={visible} animationType="slide" statusBarTranslucent>
@@ -152,7 +199,7 @@ function FullscreenVideoViewer({
             ))}
           </View>
 
-          <TouchableOpacity onPress={togglePlayPause} style={fs.topBtn}>
+          <TouchableOpacity onPress={activePhase ? resume : togglePlayPause} style={fs.topBtn}>
             <Ionicons name={isPlaying ? 'pause' : 'play'} size={20} color="#FFF" />
           </TouchableOpacity>
         </View>
@@ -170,16 +217,34 @@ function FullscreenVideoViewer({
           {activeFrame?.imageUrl ? (
             <View style={StyleSheet.absoluteFill} pointerEvents="none">
               <Image
-                source={{ uri: activeFrame.imageUrl }}
+                source={{ uri: activeFrame.imageUrl, cache: 'reload' }}
                 style={StyleSheet.absoluteFill}
                 resizeMode="contain"
+                onLoad={(event) => {
+                  const { width, height } = event.nativeEvent.source;
+                  if (width > 0 && height > 0) setFrameAspect(width / height);
+                }}
               />
-              {showPose && activeFrame.landmarks && (
-                <SwingOverlay
-                  landmarks={activeFrame.landmarks}
-                  width={SW}
-                  height={videoH}
+              {showPose && activeFrame.overlayImageUrl && (
+                <Image
+                  source={{ uri: activeFrame.overlayImageUrl, cache: 'reload' }}
+                  style={StyleSheet.absoluteFill}
+                  resizeMode="contain"
                 />
+              )}
+              {showPose && activeFrame.landmarks && activeFrame.landmarks.length >= 25 && (
+                <View
+                  style={[
+                    fs.poseOverlayFrame,
+                    { left: frameLeft, top: frameTop, width: frameW, height: frameH },
+                  ]}
+                >
+                  <SwingOverlay
+                    landmarks={activeFrame.landmarks}
+                    width={frameW}
+                    height={frameH}
+                  />
+                </View>
               )}
             </View>
           ) : null}
@@ -214,7 +279,7 @@ function FullscreenVideoViewer({
                 <Ionicons name="golf" size={15} color="#4CAF50" />
               </View>
               <Text style={fs.coachPhaseLabel}>{PHASE_LABEL[activePhase]}</Text>
-              {activeFrame?.landmarks && (
+              {(activeFrame?.overlayImageUrl || (activeFrame?.landmarks && activeFrame.landmarks.length >= 25)) && (
                 <TouchableOpacity
                   onPress={() => setShowPose((v) => !v)}
                   style={[fs.poseBtn, showPose && fs.poseBtnActive]}
@@ -286,12 +351,12 @@ function VideoPlayerInline({
 
       {/* Expand button — top right */}
       <TouchableOpacity onPress={onExpand} style={styles.expandBtn} activeOpacity={0.85}>
-        <Ionicons name="expand-outline" size={16} color="#FFFFFF" />
+        <Ionicons name={hasVisualAnalysis ? 'body-outline' : 'expand-outline'} size={15} color="#FFFFFF" />
+        {hasVisualAnalysis && !vaGenerating && (
+          <Text style={styles.expandBtnText}>Overlay</Text>
+        )}
         {vaGenerating && (
           <ActivityIndicator size="small" color="#4CAF50" style={{ position: 'absolute', top: -4, right: -4 }} />
-        )}
-        {hasVisualAnalysis && !vaGenerating && (
-          <View style={styles.overlayDot} />
         )}
       </TouchableOpacity>
 
@@ -417,7 +482,7 @@ export default function SwingDetailScreen() {
   // Auto-generate visual analysis for ANY swing that is missing it
   useEffect(() => {
     if (!swing?.id || !user?.id) return;          // wait for both to load
-    if (swing.visual_analysis) return;             // already have it
+    if (swing.visual_analysis && (swing.analysis_version ?? 0) >= VISUAL_ANALYSIS_VERSION) return;
     if (!swing.video_url) return;                  // nothing to extract from
     if (vaGenerating) return;                      // already in progress
 
@@ -430,8 +495,8 @@ export default function SwingDetailScreen() {
         if (va) {
           saveVisualAnalysis(swing.id, va);
           setLiveSwing((prev) => prev
-            ? { ...prev, visual_analysis: va }
-            : { ...(swing as Swing), visual_analysis: va });
+            ? { ...prev, visual_analysis: va, analysis_version: VISUAL_ANALYSIS_VERSION }
+            : { ...(swing as Swing), visual_analysis: va, analysis_version: VISUAL_ANALYSIS_VERSION });
         }
       })
       .catch((e) => console.error('[VA] generation threw:', e))
@@ -709,11 +774,15 @@ const styles = StyleSheet.create({
   },
   expandBtn: {
     position: 'absolute', top: 12, right: 12, zIndex: 10,
-    width: 40, height: 40, borderRadius: 20,
+    minWidth: 40, height: 40, borderRadius: 20,
     backgroundColor: 'rgba(8,12,14,0.55)',
     borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)',
+    paddingHorizontal: 12,
+    gap: 6,
+    flexDirection: 'row',
     alignItems: 'center', justifyContent: 'center',
   },
+  expandBtnText: { color: '#FFFFFF', fontSize: 12, fontWeight: '800' },
   overlayDot: {
     position: 'absolute', top: 8, right: 8,
     width: 7, height: 7, borderRadius: 4,
@@ -860,6 +929,7 @@ const fs = StyleSheet.create({
   dotActive: { backgroundColor: '#B6FF2F', width: 20, borderRadius: 4 },
   // video
   videoArea: { width: SW, backgroundColor: '#000' },
+  poseOverlayFrame: { position: 'absolute', zIndex: 4, elevation: 4 },
   phaseBadge: {
     position: 'absolute', top: 14, left: 14,
     flexDirection: 'row', alignItems: 'center', gap: 6,
@@ -894,7 +964,7 @@ const fs = StyleSheet.create({
     paddingHorizontal: 10, paddingVertical: 5,
     borderRadius: 16, borderWidth: 1, borderColor: 'rgba(255,255,255,0.15)',
   },
-  poseBtnActive: { backgroundColor: '#B6FF2F', borderColor: '#B6FF2F' },
+  poseBtnActive: { backgroundColor: '#4CAF50', borderColor: '#4CAF50' },
   poseBtnText: { fontSize: 12, fontWeight: '700', color: '#FFF' },
   poseBtnTextActive: { color: '#0D0D0D' },
   coachNote: { fontSize: 14, color: '#C8D6E0', lineHeight: 21, fontWeight: '400', flex: 1 },

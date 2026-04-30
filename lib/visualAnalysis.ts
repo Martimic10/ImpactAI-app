@@ -4,12 +4,13 @@ import { SwingResult, VisualAnalysis, FrameAnalysis, SwingPhase, PoseLandmark } 
 
 const BUCKET = 'swing-videos';
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
+export const VISUAL_ANALYSIS_VERSION = 5;
 
-const PHASE_TIMES_MS: Record<SwingPhase, number> = {
+const FALLBACK_PHASE_TIMES_MS: Record<SwingPhase, number> = {
   setup:  200,
-  top:    900,
-  impact: 1600,
-  finish: 2400,
+  top:    1400,
+  impact: 2600,
+  finish: 3400,
 };
 
 const PHASE_LABELS: Record<SwingPhase, string> = {
@@ -39,7 +40,9 @@ function buildCoachingNotes(result: SwingResult): Record<SwingPhase, string> {
 
 interface BackendFrameResult {
   frame: string | null;       // base64 JPEG
+  overlay_frame?: string | null;
   landmarks: PoseLandmark[] | null;
+  time_ms?: number;
 }
 
 async function extractViaBackend(
@@ -51,7 +54,6 @@ async function extractViaBackend(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         video_url: videoUrl,
-        timestamps_ms: PHASES.map((p) => PHASE_TIMES_MS[p]),
       }),
     });
     if (!res.ok) {
@@ -70,11 +72,11 @@ async function uploadFrame(
   base64: string,
   userId: string,
   swingId: string,
-  phase: SwingPhase
+  phase: string
 ): Promise<string | null> {
   try {
     const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
-    const path = `${userId}/${swingId}_frame_${phase}.jpg`;
+    const path = `${userId}/${swingId}_v${VISUAL_ANALYSIS_VERSION}_frame_${phase}.jpg`;
     const { error } = await supabase.storage
       .from(BUCKET)
       .upload(path, bytes, { contentType: 'image/jpeg', upsert: true });
@@ -101,7 +103,6 @@ async function extractViaBackendUpload(
       name: 'swing.mp4',
       type: 'video/mp4',
     } as unknown as Blob);
-    formData.append('timestamps_ms', PHASES.map((p) => PHASE_TIMES_MS[p]).join(','));
 
     const res = await fetch(`${BACKEND_URL}/extract-key-frames-upload`, {
       method: 'POST',
@@ -159,7 +160,7 @@ async function extractViaLocal(
     PHASES.map(async (phase) => {
       try {
         const { uri: thumbUri } = await VideoThumbnails.getThumbnailAsync(localUri, {
-          time: PHASE_TIMES_MS[phase],
+          time: FALLBACK_PHASE_TIMES_MS[phase],
           quality: 0.7,
         });
         const base64 = await LegacyFS.readAsStringAsync(thumbUri, { encoding: 'base64' });
@@ -206,15 +207,21 @@ export async function generateVisualAnalysis(
           return f.frame ? uploadFrame(f.frame, userId, swingId, phase) : Promise.resolve(null);
         })
       );
+      const uploadedOverlayUrls = await Promise.all(
+        PHASES.map((phase, i) => {
+          const f = backendFrames[i];
+          return f.overlay_frame ? uploadFrame(f.overlay_frame, userId, swingId, `${phase}_overlay`) : Promise.resolve(null);
+        })
+      );
 
       const landmarkCount = backendFrames.filter((f: BackendFrameResult) => f.landmarks).length;
       console.log(`[visualAnalysis] landmarks detected: ${landmarkCount}/4`);
 
       return {
-        setup:  buildFrame('setup',  uploadedUrls[0], notes.setup,  backendFrames[0]?.landmarks),
-        top:    buildFrame('top',    uploadedUrls[1], notes.top,    backendFrames[1]?.landmarks),
-        impact: buildFrame('impact', uploadedUrls[2], notes.impact, backendFrames[2]?.landmarks),
-        finish: buildFrame('finish', uploadedUrls[3], notes.finish, backendFrames[3]?.landmarks),
+        setup:  buildFrame('setup',  uploadedUrls[0], notes.setup,  backendFrames[0]?.landmarks, uploadedOverlayUrls[0], backendFrames[0]?.time_ms),
+        top:    buildFrame('top',    uploadedUrls[1], notes.top,    backendFrames[1]?.landmarks, uploadedOverlayUrls[1], backendFrames[1]?.time_ms),
+        impact: buildFrame('impact', uploadedUrls[2], notes.impact, backendFrames[2]?.landmarks, uploadedOverlayUrls[2], backendFrames[2]?.time_ms),
+        finish: buildFrame('finish', uploadedUrls[3], notes.finish, backendFrames[3]?.landmarks, uploadedOverlayUrls[3], backendFrames[3]?.time_ms),
       };
     }
     console.warn('[visualAnalysis] backend returned bad response — falling back to local');
@@ -244,11 +251,15 @@ function buildFrame(
   phase: SwingPhase,
   imageUrl: string | null,
   coachingNote: string,
-  landmarks?: PoseLandmark[] | null
+  landmarks?: PoseLandmark[] | null,
+  overlayImageUrl?: string | null,
+  timeMs?: number
 ): FrameAnalysis {
   return {
     phase,
     imageUrl: imageUrl ?? '',
+    ...(overlayImageUrl ? { overlayImageUrl } : {}),
+    ...(typeof timeMs === 'number' ? { timeMs } : {}),
     label: PHASE_LABELS[phase],
     coachingNote,
     ...(landmarks && landmarks.length > 0 ? { landmarks } : {}),
@@ -258,7 +269,7 @@ function buildFrame(
 export async function saveVisualAnalysis(swingId: string, analysis: VisualAnalysis): Promise<void> {
   const { error } = await supabase
     .from('swings')
-    .update({ visual_analysis: analysis })
+    .update({ visual_analysis: analysis, analysis_version: VISUAL_ANALYSIS_VERSION })
     .eq('id', swingId);
   if (error) {
     console.error('[visualAnalysis] DB save failed:', error.message);
