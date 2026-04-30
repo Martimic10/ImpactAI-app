@@ -36,8 +36,8 @@ const PHASE_LABEL: Record<SwingPhase, string> = {
 
 const CHAPTERS: { phase: SwingPhase; fallbackMs: number; ratio: number }[] = [
   { phase: 'setup',  fallbackMs: 200,  ratio: 0.06 },
-  { phase: 'top',    fallbackMs: 1400, ratio: 0.40 },
-  { phase: 'impact', fallbackMs: 2000, ratio: 0.58 },
+  { phase: 'top',    fallbackMs: 1400, ratio: 0.42 },
+  { phase: 'impact', fallbackMs: 2600, ratio: 0.72 },
   { phase: 'finish', fallbackMs: 3400, ratio: 0.90 },
 ];
 
