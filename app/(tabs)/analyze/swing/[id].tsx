@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -27,7 +27,6 @@ import { SwingOverlay } from '@/components/SwingOverlay';
 
 const { width: SW, height: SH } = Dimensions.get('window');
 
-const VA_PHASES: SwingPhase[] = ['setup', 'top', 'impact', 'finish'];
 const PHASE_LABEL: Record<SwingPhase, string> = {
   setup:  'Address',
   top:    'Top of Backswing',
@@ -35,8 +34,15 @@ const PHASE_LABEL: Record<SwingPhase, string> = {
   finish: 'Follow-Through',
 };
 
+const CHAPTERS: { phase: SwingPhase; timeMs: number }[] = [
+  { phase: 'setup',  timeMs: 200  },
+  { phase: 'top',    timeMs: 900  },
+  { phase: 'impact', timeMs: 1600 },
+  { phase: 'finish', timeMs: 2400 },
+];
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Fullscreen video viewer — video + key-frame overlay strip
+// Fullscreen guided viewer — auto-pauses at key swing moments
 // ─────────────────────────────────────────────────────────────────────────────
 function FullscreenVideoViewer({
   url,
@@ -49,57 +55,109 @@ function FullscreenVideoViewer({
   visible: boolean;
   onClose: () => void;
 }) {
-  const [playing, setPlaying] = useState(true);
-  const [selectedPhase, setSelectedPhase] = useState<SwingPhase | null>(null);
-  const [showOverlay, setShowOverlay] = useState(false);
+  const [activePhase, setActivePhase]         = useState<SwingPhase | null>(null);
+  const [donePhases, setDonePhases]           = useState<Set<SwingPhase>>(new Set());
+  const [isPlaying, setIsPlaying]             = useState(true);
+  const [showPose, setShowPose]               = useState(false);
+
+  const passedRef    = useRef<Set<SwingPhase>>(new Set());
+  const intervalRef  = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  const resumeTimer  = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const player = useVideoPlayer(url || null, (p) => {
-    p.loop = true;
+    p.loop = false;
     p.muted = false;
     p.play();
   });
 
-  function togglePlay() {
-    if (!player) return;
-    if (playing) { player.pause(); } else { player.play(); }
-    setPlaying((v) => !v);
+  // Reset state when modal opens
+  useEffect(() => {
+    if (!visible) return;
+    passedRef.current = new Set();
+    setActivePhase(null);
+    setDonePhases(new Set());
+    setIsPlaying(true);
+    setShowPose(false);
+    player.play();
+
+    // Poll video time every 100ms — pause at each chapter
+    intervalRef.current = setInterval(() => {
+      if (!player) return;
+      const timeMs = player.currentTime * 1000;
+      for (const { phase, timeMs: mark } of CHAPTERS) {
+        if (!passedRef.current.has(phase) && timeMs >= mark) {
+          passedRef.current.add(phase);
+          player.pause();
+          setIsPlaying(false);
+          setActivePhase(phase);
+          setDonePhases(new Set(passedRef.current));
+          // Auto-resume after 4 s if user doesn't tap Continue
+          resumeTimer.current = setTimeout(() => resume(), 4000);
+          break;
+        }
+      }
+    }, 100);
+
+    return () => {
+      clearInterval(intervalRef.current);
+      clearTimeout(resumeTimer.current);
+    };
+  }, [visible]);
+
+  function resume() {
+    clearTimeout(resumeTimer.current);
+    setActivePhase(null);
+    setShowPose(false);
+    player.play();
+    setIsPlaying(true);
   }
 
-  function selectFrame(phase: SwingPhase) {
-    if (selectedPhase === phase) {
-      setSelectedPhase(null);
-      player.play();
-      setPlaying(true);
-    } else {
-      setSelectedPhase(phase);
-      player.pause();
-      setPlaying(false);
-    }
+  function handleClose() {
+    clearInterval(intervalRef.current);
+    clearTimeout(resumeTimer.current);
+    player.pause();
+    onClose();
   }
 
-  const activeFrame = selectedPhase ? visualAnalysis?.[selectedPhase] : null;
-  const stripH = visualAnalysis ? 120 : 0;
-  const videoH = SH - stripH - 100; // 100 = header + safe area
+  function togglePlayPause() {
+    if (isPlaying) { player.pause(); setIsPlaying(false); }
+    else           { player.play();  setIsPlaying(true);  }
+  }
+
+  const activeFrame = activePhase ? visualAnalysis?.[activePhase] : null;
+  const videoH = SH * 0.56;
 
   return (
     <Modal visible={visible} animationType="slide" statusBarTranslucent>
       <View style={fs.container}>
         <StatusBar style="light" />
 
-        {/* Top bar */}
+        {/* ── Header ── */}
         <View style={fs.topBar}>
-          <TouchableOpacity onPress={onClose} style={fs.topBtn}>
-            <Ionicons name="close" size={20} color="#FFFFFF" />
+          <TouchableOpacity onPress={handleClose} style={fs.topBtn}>
+            <Ionicons name="close" size={20} color="#FFF" />
           </TouchableOpacity>
-          <Text style={fs.topTitle}>
-            {selectedPhase ? PHASE_LABEL[selectedPhase] : 'Swing Video'}
-          </Text>
-          <TouchableOpacity onPress={togglePlay} style={fs.topBtn}>
-            <Ionicons name={playing ? 'pause' : 'play'} size={20} color="#FFFFFF" />
+
+          {/* Chapter progress dots */}
+          <View style={fs.dots}>
+            {CHAPTERS.map(({ phase }) => (
+              <View
+                key={phase}
+                style={[
+                  fs.dot,
+                  donePhases.has(phase) && fs.dotDone,
+                  activePhase === phase && fs.dotActive,
+                ]}
+              />
+            ))}
+          </View>
+
+          <TouchableOpacity onPress={togglePlayPause} style={fs.topBtn}>
+            <Ionicons name={isPlaying ? 'pause' : 'play'} size={20} color="#FFF" />
           </TouchableOpacity>
         </View>
 
-        {/* Video + frame overlay */}
+        {/* ── Video area ── */}
         <View style={[fs.videoArea, { height: videoH }]}>
           <VideoView
             player={player}
@@ -108,107 +166,79 @@ function FullscreenVideoViewer({
             nativeControls={false}
           />
 
-          {/* Frame snapshot overlaid on video */}
-          {activeFrame && activeFrame.imageUrl ? (
-            <View style={StyleSheet.absoluteFill}>
+          {/* Frame snapshot + pose overlay when paused at a chapter */}
+          {activeFrame?.imageUrl ? (
+            <View style={StyleSheet.absoluteFill} pointerEvents="none">
               <Image
                 source={{ uri: activeFrame.imageUrl }}
                 style={StyleSheet.absoluteFill}
                 resizeMode="contain"
               />
-              {/* Pose skeleton overlay */}
-              {showOverlay && activeFrame.landmarks && (
+              {showPose && activeFrame.landmarks && (
                 <SwingOverlay
                   landmarks={activeFrame.landmarks}
                   width={SW}
                   height={videoH}
                 />
               )}
-              {/* Phase badge */}
-              <View style={fs.frameBadge}>
-                <Ionicons name="camera" size={11} color="#4CAF50" />
-                <Text style={fs.frameBadgeText}>{PHASE_LABEL[selectedPhase!]}</Text>
-              </View>
-              {/* Overlay toggle — only shown when landmarks are available */}
-              {activeFrame.landmarks && (
-                <TouchableOpacity
-                  style={[fs.overlayToggle, showOverlay && fs.overlayToggleActive]}
-                  onPress={() => setShowOverlay((v) => !v)}
-                  activeOpacity={0.85}
-                >
-                  <Ionicons name="body-outline" size={14} color={showOverlay ? '#0D0D0D' : '#FFFFFF'} />
-                  <Text style={[fs.overlayToggleText, showOverlay && fs.overlayToggleTextActive]}>
-                    {showOverlay ? 'Hide Pose' : 'Show Pose'}
-                  </Text>
-                </TouchableOpacity>
-              )}
-              {/* Coaching overlay at bottom */}
-              <View style={fs.coachingOverlay}>
-                <Text style={fs.coachingLabel}>Coaching note</Text>
-                <Text style={fs.coachingText}>{activeFrame.coachingNote}</Text>
-              </View>
-            </View>
-          ) : selectedPhase ? (
-            // Phase selected but no image yet
-            <View style={[StyleSheet.absoluteFill, fs.framePlaceholder]}>
-              <Ionicons name="image-outline" size={40} color="#333" />
-              <Text style={fs.framePlaceholderText}>Frame not available</Text>
             </View>
           ) : null}
 
-          {/* Tap to play/pause hint when no frame selected */}
-          {!selectedPhase && !playing && (
-            <View style={fs.pausedOverlay} pointerEvents="none">
-              <View style={fs.pausedCircle}>
-                <Ionicons name="play" size={32} color="#FFFFFF" />
-              </View>
+          {/* Phase label badge */}
+          {activePhase && (
+            <View style={fs.phaseBadge}>
+              <View style={fs.phaseDot} />
+              <Text style={fs.phaseBadgeText}>{PHASE_LABEL[activePhase]}</Text>
             </View>
           )}
 
-          {/* Tap video to toggle play (when no frame overlaid) */}
-          {!selectedPhase && (
-            <TouchableOpacity
-              style={StyleSheet.absoluteFill}
-              onPress={togglePlay}
-              activeOpacity={1}
-            />
+          {/* Tap video to pause/play when no chapter is active */}
+          {!activePhase && (
+            <TouchableOpacity style={StyleSheet.absoluteFill} onPress={togglePlayPause} activeOpacity={1}>
+              {!isPlaying && (
+                <View style={fs.pausedOverlay} pointerEvents="none">
+                  <View style={fs.pausedCircle}>
+                    <Ionicons name="play" size={32} color="#FFF" />
+                  </View>
+                </View>
+              )}
+            </TouchableOpacity>
           )}
         </View>
 
-        {/* Key frames strip */}
-        {visualAnalysis && (
-          <View style={fs.strip}>
-            <Text style={fs.stripHint}>Tap a frame to see coaching overlay</Text>
-            <View style={fs.stripRow}>
-              {VA_PHASES.map((phase) => {
-                const frame = visualAnalysis[phase];
-                const isActive = selectedPhase === phase;
-                return (
-                  <TouchableOpacity
-                    key={phase}
-                    onPress={() => selectFrame(phase)}
-                    style={[fs.stripCard, isActive && fs.stripCardActive]}
-                    activeOpacity={0.85}
-                  >
-                    {frame.imageUrl ? (
-                      <Image
-                        source={{ uri: frame.imageUrl }}
-                        style={fs.stripImage}
-                        resizeMode="cover"
-                      />
-                    ) : (
-                      <View style={fs.stripPlaceholder}>
-                        <Ionicons name="image-outline" size={18} color="#444" />
-                      </View>
-                    )}
-                    {isActive && <View style={fs.stripActiveRing} />}
-                    <Text style={[fs.stripLabel, isActive && { color: '#4CAF50' }]}>
-                      {PHASE_LABEL[phase].split(' ')[0]}
-                    </Text>
-                  </TouchableOpacity>
-                );
-              })}
+        {/* ── Coaching card (shown when paused at a chapter) ── */}
+        {activePhase ? (
+          <View style={fs.coachCard}>
+            <View style={fs.coachTop}>
+              <View style={fs.coachIconWrap}>
+                <Ionicons name="golf" size={15} color="#4CAF50" />
+              </View>
+              <Text style={fs.coachPhaseLabel}>{PHASE_LABEL[activePhase]}</Text>
+              {activeFrame?.landmarks && (
+                <TouchableOpacity
+                  onPress={() => setShowPose((v) => !v)}
+                  style={[fs.poseBtn, showPose && fs.poseBtnActive]}
+                >
+                  <Ionicons name="body-outline" size={13} color={showPose ? '#0D0D0D' : '#FFF'} />
+                  <Text style={[fs.poseBtnText, showPose && fs.poseBtnTextActive]}>
+                    {showPose ? 'Hide Pose' : 'Pose'}
+                  </Text>
+                </TouchableOpacity>
+              )}
             </View>
+            <Text style={fs.coachNote}>{activeFrame?.coachingNote ?? ''}</Text>
+            <TouchableOpacity onPress={() => resume()} style={fs.resumeBtn} activeOpacity={0.85}>
+              <Ionicons name="play" size={14} color="#0D0D0D" />
+              <Text style={fs.resumeText}>Continue</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <View style={fs.idleCard}>
+            <Text style={fs.idleText}>
+              {isPlaying
+                ? '⛳  Pausing at key swing moments…'
+                : 'Tap play to resume'}
+            </Text>
           </View>
         )}
       </View>
@@ -812,71 +842,72 @@ const styles = StyleSheet.create({
 // Fullscreen styles
 // ─────────────────────────────────────────────────────────────────────────────
 const fs = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#000000' },
+  container:  { flex: 1, backgroundColor: '#000' },
   topBar: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
     paddingHorizontal: 16, paddingTop: 52, paddingBottom: 12,
-    backgroundColor: 'rgba(0,0,0,0.6)',
+    backgroundColor: 'rgba(0,0,0,0.55)',
   },
-  topTitle: { fontSize: 15, fontWeight: '700', color: '#FFFFFF', flex: 1, textAlign: 'center' },
   topBtn: {
     width: 38, height: 38, borderRadius: 19,
     backgroundColor: 'rgba(255,255,255,0.12)',
     alignItems: 'center', justifyContent: 'center',
   },
+  // chapter progress dots
+  dots: { flexDirection: 'row', gap: 8, alignItems: 'center' },
+  dot: { width: 8, height: 8, borderRadius: 4, backgroundColor: 'rgba(255,255,255,0.25)' },
+  dotDone: { backgroundColor: '#4CAF50' },
+  dotActive: { backgroundColor: '#B6FF2F', width: 20, borderRadius: 4 },
+  // video
   videoArea: { width: SW, backgroundColor: '#000' },
-  frameBadge: {
+  phaseBadge: {
     position: 'absolute', top: 14, left: 14,
-    flexDirection: 'row', alignItems: 'center', gap: 5,
+    flexDirection: 'row', alignItems: 'center', gap: 6,
     backgroundColor: 'rgba(0,0,0,0.7)',
-    paddingHorizontal: 10, paddingVertical: 5,
-    borderRadius: 20, borderWidth: 1, borderColor: 'rgba(76,175,80,0.5)',
+    paddingHorizontal: 12, paddingVertical: 6,
+    borderRadius: 20, borderWidth: 1, borderColor: 'rgba(76,175,80,0.4)',
   },
-  frameBadgeText: { fontSize: 12, fontWeight: '700', color: '#FFFFFF' },
-  coachingOverlay: {
-    position: 'absolute', bottom: 0, left: 0, right: 0,
-    backgroundColor: 'rgba(0,0,0,0.75)',
-    paddingHorizontal: 18, paddingVertical: 14,
-    gap: 4,
-  },
-  coachingLabel: { fontSize: 10, fontWeight: '700', color: '#4CAF50', letterSpacing: 1, textTransform: 'uppercase' },
-  coachingText: { fontSize: 14, color: '#FFFFFF', lineHeight: 20 },
-  framePlaceholder: { alignItems: 'center', justifyContent: 'center', backgroundColor: '#0D0D0D', gap: 10 },
-  framePlaceholderText: { fontSize: 14, color: '#444', textAlign: 'center' },
+  phaseDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: '#4CAF50' },
+  phaseBadgeText: { fontSize: 13, fontWeight: '700', color: '#FFF' },
+  // paused hint
   pausedOverlay: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center' },
   pausedCircle: {
-    width: 70, height: 70, borderRadius: 35,
-    backgroundColor: 'rgba(0,0,0,0.6)',
+    width: 68, height: 68, borderRadius: 34,
+    backgroundColor: 'rgba(0,0,0,0.55)',
     borderWidth: 2, borderColor: 'rgba(255,255,255,0.3)',
     alignItems: 'center', justifyContent: 'center',
   },
-  strip: {
+  // coaching card
+  coachCard: {
     flex: 1, backgroundColor: '#0D0D0D',
-    paddingHorizontal: 16, paddingTop: 10, paddingBottom: 24, gap: 10,
+    paddingHorizontal: 20, paddingTop: 18, paddingBottom: 30, gap: 12,
   },
-  stripHint: { fontSize: 11, color: '#555', textAlign: 'center' },
-  stripRow: { flexDirection: 'row', gap: 10 },
-  stripCard: { flex: 1, alignItems: 'center', gap: 6, opacity: 0.55 },
-  stripCardActive: { opacity: 1 },
-  stripImage: { width: '100%', aspectRatio: 0.75, borderRadius: 10 },
-  stripPlaceholder: {
-    width: '100%', aspectRatio: 0.75, borderRadius: 10,
-    backgroundColor: '#1A1A1A', alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: '#2A2A2A',
+  coachTop: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  coachIconWrap: {
+    width: 30, height: 30, borderRadius: 15,
+    backgroundColor: '#1B2E1B', alignItems: 'center', justifyContent: 'center',
   },
-  stripActiveRing: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 22, borderRadius: 10, borderWidth: 2, borderColor: '#4CAF50' },
-  stripLabel: { fontSize: 10, fontWeight: '600', color: '#666' },
-  overlayToggle: {
-    position: 'absolute', top: 14, right: 14,
+  coachPhaseLabel: { flex: 1, fontSize: 16, fontWeight: '800', color: '#FFF', letterSpacing: -0.3 },
+  poseBtn: {
     flexDirection: 'row', alignItems: 'center', gap: 5,
-    backgroundColor: 'rgba(0,0,0,0.65)',
-    paddingHorizontal: 11, paddingVertical: 6,
-    borderRadius: 20, borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)',
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    paddingHorizontal: 10, paddingVertical: 5,
+    borderRadius: 16, borderWidth: 1, borderColor: 'rgba(255,255,255,0.15)',
   },
-  overlayToggleActive: {
-    backgroundColor: '#B6FF2F',
-    borderColor: '#B6FF2F',
+  poseBtnActive: { backgroundColor: '#B6FF2F', borderColor: '#B6FF2F' },
+  poseBtnText: { fontSize: 12, fontWeight: '700', color: '#FFF' },
+  poseBtnTextActive: { color: '#0D0D0D' },
+  coachNote: { fontSize: 14, color: '#C8D6E0', lineHeight: 21, fontWeight: '400', flex: 1 },
+  resumeBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7,
+    backgroundColor: '#4CAF50', borderRadius: 16,
+    paddingVertical: 13, marginTop: 4,
   },
-  overlayToggleText: { fontSize: 12, fontWeight: '700', color: '#FFFFFF' },
-  overlayToggleTextActive: { color: '#0D0D0D' },
+  resumeText: { fontSize: 15, fontWeight: '800', color: '#0D0D0D' },
+  // idle card (video playing, no chapter active)
+  idleCard: {
+    flex: 1, backgroundColor: '#0D0D0D',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  idleText: { fontSize: 13, color: '#555', textAlign: 'center' },
 });
