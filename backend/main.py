@@ -30,9 +30,9 @@ mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
-# Landmark drawing customisation — green skeleton on dark overlay
+# Landmark drawing customisation — green joints with white skeleton lines
 LANDMARK_STYLE = mp_drawing.DrawingSpec(color=(76, 175, 80), thickness=4, circle_radius=4)
-CONNECTION_STYLE = mp_drawing.DrawingSpec(color=(182, 255, 47), thickness=2)
+CONNECTION_STYLE = mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=3)
 
 
 class ProcessRequest(BaseModel):
@@ -52,7 +52,170 @@ def health():
 
 class ExtractKeyFramesRequest(BaseModel):
     video_url: str
-    timestamps_ms: List[int] = [200, 900, 1600, 2400]
+    timestamps_ms: Optional[List[int]] = None
+
+
+def get_phase_timestamps_ms(cap) -> List[int]:
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_ms = int((total_frames / fps) * 1000) if total_frames > 0 else 3000
+    duration_ms = max(duration_ms, 1200)
+    fallback = [0.06, 0.50, 0.73, 0.96]
+
+    if total_frames <= 0:
+        return [min(duration_ms - 80, max(0, int(duration_ms * ratio))) for ratio in fallback]
+
+    samples = []
+    prev_gray = None
+    sample_count = min(180, total_frames)
+    step = max(1, total_frames // sample_count)
+
+    for frame_idx in range(0, total_frames, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        roi = gray[int(h * 0.05):int(h * 0.92), int(w * 0.08):int(w * 0.92)]
+        roi = cv2.resize(roi, (96, 160))
+        score = 0.0 if prev_gray is None else float(cv2.absdiff(roi, prev_gray).mean())
+        prev_gray = roi
+        samples.append({
+            "frame": frame_idx,
+            "time_ms": int((frame_idx / fps) * 1000),
+            "score": score,
+        })
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    if len(samples) < 8:
+        return [min(duration_ms - 80, max(0, int(duration_ms * ratio))) for ratio in fallback]
+
+    scores = np.array([s["score"] for s in samples[1:]], dtype=np.float32)
+    threshold = max(float(np.percentile(scores, 68)), float(scores.mean() * 0.65), 1.2)
+    active_indices = [i for i, s in enumerate(samples) if i > 0 and s["score"] >= threshold]
+
+    if len(active_indices) < 4:
+        return [min(duration_ms - 80, max(0, int(duration_ms * ratio))) for ratio in fallback]
+
+    # Ignore tiny early camera/noise movement and find the main swing burst.
+    start_i = active_indices[0]
+    end_i = active_indices[-1]
+    max_gap = max(3, int(len(samples) * 0.08))
+    runs = []
+    run_start = active_indices[0]
+    prev = active_indices[0]
+    for idx in active_indices[1:]:
+        if idx - prev > max_gap:
+            runs.append((run_start, prev))
+            run_start = idx
+        prev = idx
+    runs.append((run_start, prev))
+
+    start_i, end_i = max(runs, key=lambda r: (r[1] - r[0], sum(samples[i]["score"] for i in range(r[0], r[1] + 1))))
+    start_ms = samples[max(0, start_i - 2)]["time_ms"]
+    end_ms = samples[min(len(samples) - 1, end_i + 3)]["time_ms"]
+    if end_ms - start_ms < 900:
+        start_ms = int(duration_ms * 0.08)
+        end_ms = int(duration_ms * 0.96)
+
+    swing_ms = max(900, end_ms - start_ms)
+    times = [
+        max(0, start_ms - 250),
+        start_ms + int(swing_ms * 0.24),
+        start_ms + int(swing_ms * 0.55),
+        min(duration_ms - 80, end_ms),
+    ]
+    return [int(min(duration_ms - 80, max(0, t))) for t in times]
+
+
+def landmarks_to_json(pose_landmarks):
+    return [
+        {"x": float(lm.x), "y": float(lm.y), "z": float(lm.z), "visibility": float(lm.visibility)}
+        for lm in pose_landmarks.landmark
+    ]
+
+
+def encode_jpg(frame, quality=80) -> str:
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return base64.b64encode(buf).decode("utf-8")
+
+
+def try_detect_pose(pose, frame):
+    """Try pose detection at multiple scales — returns (landmarks_json, overlay_b64) or (None, None)."""
+    h, w = frame.shape[:2]
+
+    # Attempt 1: original frame
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    det = pose.process(rgb)
+    if det.pose_landmarks:
+        overlay = frame.copy()
+        mp_drawing.draw_landmarks(overlay, det.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                                  landmark_drawing_spec=LANDMARK_STYLE,
+                                  connection_drawing_spec=CONNECTION_STYLE)
+        return landmarks_to_json(det.pose_landmarks), encode_jpg(overlay)
+
+    # Attempt 2: upscale small frames — MediaPipe needs at least 256px on short side
+    if min(h, w) < 480:
+        scale = 480 / min(h, w)
+        resized = cv2.resize(frame, (int(w * scale), int(h * scale)))
+        rgb2 = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        det2 = pose.process(rgb2)
+        if det2.pose_landmarks:
+            overlay = resized.copy()
+            mp_drawing.draw_landmarks(overlay, det2.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                                      landmark_drawing_spec=LANDMARK_STYLE,
+                                      connection_drawing_spec=CONNECTION_STYLE)
+            # Scale back landmark coords (they're already normalized 0-1, no change needed)
+            return landmarks_to_json(det2.pose_landmarks), encode_jpg(overlay)
+
+    # Attempt 3: slightly expand contrast to help detection in outdoor light
+    enhanced = cv2.convertScaleAbs(frame, alpha=1.2, beta=10)
+    rgb3 = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
+    det3 = pose.process(rgb3)
+    if det3.pose_landmarks:
+        overlay = frame.copy()
+        mp_drawing.draw_landmarks(overlay, det3.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                                  landmark_drawing_spec=LANDMARK_STYLE,
+                                  connection_drawing_spec=CONNECTION_STYLE)
+        return landmarks_to_json(det3.pose_landmarks), encode_jpg(overlay)
+
+    print(f"[pose] detection failed on all 3 attempts (frame size: {w}x{h})")
+    return None, None
+
+
+def extract_frames_with_pose(cap, ts_list: List[int], fps: float):
+    results = []
+    # model_complexity=0 is lighter and more robust for side-on/bent-over golf poses
+    with mp_pose.Pose(
+        static_image_mode=True,
+        model_complexity=0,
+        enable_segmentation=False,
+        min_detection_confidence=0.2,
+        min_tracking_confidence=0.2,
+    ) as pose:
+        for ms in ts_list:
+            frame_idx = int((ms / 1000.0) * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                print(f"[pose] could not read frame at {ms}ms (idx {frame_idx})")
+                results.append({"frame": None, "overlay_frame": None, "landmarks": None, "time_ms": ms})
+                continue
+
+            frame_b64 = encode_jpg(frame)
+            landmarks, overlay_b64 = try_detect_pose(pose, frame)
+            print(f"[pose] {ms}ms — landmarks: {'YES' if landmarks else 'NO'}")
+
+            results.append({
+                "frame": frame_b64,
+                "overlay_frame": overlay_b64,
+                "landmarks": landmarks,
+                "time_ms": ms,
+            })
+    return results
 
 
 @app.post("/extract-key-frames")
@@ -69,37 +232,8 @@ def extract_key_frames(req: ExtractKeyFramesRequest):
 
         cap = cv2.VideoCapture(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        results = []
-
-        with mp_pose.Pose(
-            static_image_mode=True,
-            model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-        ) as pose:
-            for ms in req.timestamps_ms:
-                frame_idx = int((ms / 1000.0) * fps)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-                if not ret:
-                    results.append({"frame": None, "landmarks": None})
-                    continue
-
-                # Encode frame as base64 JPEG
-                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                frame_b64 = base64.b64encode(buf).decode("utf-8")
-
-                # Run pose detection
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                detection = pose.process(rgb)
-                landmarks = None
-                if detection.pose_landmarks:
-                    landmarks = [
-                        {"x": float(lm.x), "y": float(lm.y), "z": float(lm.z), "visibility": float(lm.visibility)}
-                        for lm in detection.pose_landmarks.landmark
-                    ]
-
-                results.append({"frame": frame_b64, "landmarks": landmarks})
+        ts_list = req.timestamps_ms or get_phase_timestamps_ms(cap)
+        results = extract_frames_with_pose(cap, ts_list, fps)
 
         cap.release()
         return {"frames": results}
@@ -115,7 +249,7 @@ def extract_key_frames(req: ExtractKeyFramesRequest):
 @app.post("/extract-key-frames-upload")
 async def extract_key_frames_upload(
     video: UploadFile = File(...),
-    timestamps_ms: str = Form("200,900,1600,2400"),
+    timestamps_ms: str = Form(""),
 ):
     """
     Same as /extract-key-frames but accepts a video file upload instead of a URL.
@@ -123,42 +257,14 @@ async def extract_key_frames_upload(
     """
     tmp_path = None
     try:
-        ts_list = [int(t.strip()) for t in timestamps_ms.split(",")]
-
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
             tmp.write(await video.read())
             tmp_path = tmp.name
 
         cap = cv2.VideoCapture(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        results = []
-
-        with mp_pose.Pose(
-            static_image_mode=True,
-            model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-        ) as pose:
-            for ms in ts_list:
-                frame_idx = int((ms / 1000.0) * fps)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-                if not ret:
-                    results.append({"frame": None, "landmarks": None})
-                    continue
-
-                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                frame_b64 = base64.b64encode(buf).decode("utf-8")
-
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                detection = pose.process(rgb)
-                landmarks = None
-                if detection.pose_landmarks:
-                    landmarks = [
-                        {"x": float(lm.x), "y": float(lm.y), "z": float(lm.z), "visibility": float(lm.visibility)}
-                        for lm in detection.pose_landmarks.landmark
-                    ]
-                results.append({"frame": frame_b64, "landmarks": landmarks})
+        ts_list = [int(t.strip()) for t in timestamps_ms.split(",") if t.strip()] if timestamps_ms.strip() else get_phase_timestamps_ms(cap)
+        results = extract_frames_with_pose(cap, ts_list, fps)
 
         cap.release()
         return {"frames": results}
