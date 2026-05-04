@@ -2,6 +2,7 @@ import React, { useRef, useState } from 'react';
 import {
   View,
   Text,
+  Image,
   TouchableOpacity,
   Dimensions,
   FlatList,
@@ -29,43 +30,20 @@ interface OnboardingSlide {
   visual: React.ReactNode;
 }
 
-// ── Screen 1: Welcome / AI Hero ──────────────────────────────────────────────
+// ── Screen 1: Welcome — full-bleed photo ─────────────────────────────────────
 function WelcomeVisual() {
   return (
     <View style={styles.visualContainer}>
-      <View style={styles.visualCard}>
-        {/* Glow rings */}
-        <View style={v1.ring3} />
-        <View style={v1.ring2} />
-        <View style={v1.ring1} />
-
-        {/* Center icon badge */}
-        <View style={v1.centerBadge}>
-          <Ionicons name="golf" size={36} color="#4CAF50" />
-        </View>
-
-        {/* Floating metric chips */}
-        <View style={[v1.chip, v1.chipTL]}>
-          <Ionicons name="flash" size={11} color="#4CAF50" />
-          <Text style={v1.chipText}>AI Powered</Text>
-        </View>
-        <View style={[v1.chip, v1.chipTR]}>
-          <Ionicons name="trending-up" size={11} color="#4CAF50" />
-          <Text style={v1.chipText}>Score 84</Text>
-        </View>
-        <View style={[v1.chip, v1.chipBL]}>
-          <Ionicons name="analytics-outline" size={11} color="#64B5F6" />
-          <Text style={[v1.chipText, { color: '#64B5F6' }]}>Analysis</Text>
-        </View>
-        <View style={[v1.chip, v1.chipBR]}>
-          <Ionicons name="checkmark-circle" size={11} color="#FF9F0A" />
-          <Text style={[v1.chipText, { color: '#FF9F0A' }]}>Instant</Text>
-        </View>
-
-        {/* Brand label */}
-        <View style={v1.brandRow}>
-          <Text style={v1.brandText}>IMPACT</Text>
-          <Text style={[v1.brandText, { color: '#4CAF50' }]}>AI</Text>
+      <View style={v1.card}>
+        <Image
+          source={require('@/assets/onboarding-screen-1.png')}
+          style={v1.photo}
+          resizeMode="cover"
+        />
+        {/* Bottom gradient badge */}
+        <View style={v1.badge}>
+          <View style={v1.badgeDot} />
+          <Text style={v1.badgeText}>AI-Powered Swing Analysis</Text>
         </View>
       </View>
     </View>
@@ -73,71 +51,43 @@ function WelcomeVisual() {
 }
 
 const v1 = StyleSheet.create({
-  ring3: {
-    position: 'absolute',
-    width: 220,
-    height: 220,
-    borderRadius: 110,
-    borderWidth: 1,
-    borderColor: '#4CAF5015',
-    backgroundColor: '#4CAF5006',
-  },
-  ring2: {
-    position: 'absolute',
-    width: 160,
-    height: 160,
-    borderRadius: 80,
-    borderWidth: 1,
-    borderColor: '#4CAF5025',
-    backgroundColor: '#4CAF500A',
-  },
-  ring1: {
-    position: 'absolute',
-    width: 100,
-    height: 100,
-    borderRadius: 50,
-    borderWidth: 1,
-    borderColor: '#4CAF5040',
-    backgroundColor: '#4CAF5012',
-  },
-  centerBadge: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
-    backgroundColor: '#1B2E1B',
-    borderWidth: 2,
-    borderColor: '#2E7D32',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  chip: {
-    position: 'absolute',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    backgroundColor: '#1E1E1E',
+  card: {
+    width: width - 48,
+    height: 320,
+    borderRadius: 28,
+    overflow: 'hidden',
     borderWidth: 1,
     borderColor: '#2A2A2A',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 20,
   },
-  chipText: { fontSize: 11, fontWeight: '600', color: '#4CAF50' },
-  chipTL: { top: 28, left: 18 },
-  chipTR: { top: 28, right: 18 },
-  chipBL: { bottom: 28, left: 18 },
-  chipBR: { bottom: 28, right: 18 },
-  brandRow: {
+  photo: {
+    width: '100%',
+    height: '100%',
+  },
+  badge: {
     position: 'absolute',
-    bottom: 20,
+    bottom: 16,
+    left: 16,
     flexDirection: 'row',
-    gap: 4,
+    alignItems: 'center',
+    gap: 7,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(76,175,80,0.35)',
   },
-  brandText: {
+  badgeDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: '#4CAF50',
+  },
+  badgeText: {
     fontSize: 13,
-    fontWeight: '800',
+    fontWeight: '700',
     color: '#FFFFFF',
-    letterSpacing: 2,
+    letterSpacing: 0.2,
   },
 });
 
