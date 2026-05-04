@@ -124,10 +124,8 @@ export async function runSwingAnalysis({
     .then((url) => { if (url) saveSwingThumbnail(swingId, url); })
     .catch(() => {});
 
-  // 5. Generate visual analysis — prefer Supabase URL so backend can download it
-  generateVisualAnalysis(videoUrl, userId, swingId, result)
-    .then((va) => { if (va) saveVisualAnalysis(swingId, va); })
-    .catch(() => {});
+  // Visual analysis is generated in [id].tsx when the user opens the swing detail
+  // to avoid race conditions with concurrent backend calls.
 
   // 6. MediaPipe overlay (non-blocking)
   if (MEDIAPIPE_URL && videoUrl !== uri && data) {

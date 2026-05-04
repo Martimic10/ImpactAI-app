@@ -230,10 +230,13 @@ export async function generateVisualAnalysis(
         finish: buildFrame('finish', uploadedUrls[3], notes.finish, backendFrames[3]?.landmarks, uploadedOverlayUrls[3], backendFrames[3]?.time_ms),
       };
     }
-    console.warn('[visualAnalysis] backend returned bad response — falling back to local');
+    // Backend is configured but failed — return null rather than falling back to
+    // local extraction which has no landmarks and would overwrite good data.
+    console.warn('[visualAnalysis] backend failed — not falling back to local (would lose landmarks)');
+    return null;
   }
 
-  // Local fallback via expo-video-thumbnails (needs native build)
+  // Local fallback — only used when no backend URL is configured at all
   console.log('[visualAnalysis] using local extraction for', swingId);
   try {
     const localFrames = await extractViaLocal(videoUri, userId, swingId);
