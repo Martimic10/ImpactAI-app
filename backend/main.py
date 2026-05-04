@@ -144,45 +144,19 @@ def detect_phases_landmark_based(cap, fps: float) -> List[int]:
             min_wrist_y = s["wrist_y"]
             top_i = s["i"]
 
-    # ── Impact: scored selection using contact zone proximity ─────────────────
-    # Contact zone estimate = setup wrist position (x, y) — where the ball is
-    setup_wrist_x = samples[setup_i].get("wrist_x") or 0.5
-    impact_window_start = top_i + 1
-    impact_window_end   = max(top_i + 3, int(n * 0.86))
-    impact_window_size  = max(impact_window_end - impact_window_start, 1)
-
+    # ── Impact: maximum wrist Y (lowest on screen = ball contact) after top ────
+    # At impact the club reaches the ball — wrists are at their lowest point
+    # in the swing arc. This is the MAXIMUM wrist_y value after the top.
     impact_i = min(top_i + 2, n - 1)
-    best_score = float("inf")
-    for s in samples[impact_window_start : impact_window_end]:
-        if s["wrist_y"] is None:
-            continue
-
-        # Score 1 (55%): 2-D distance from contact zone (setup wrist pos)
-        dx = (s.get("wrist_x") or setup_wrist_x) - setup_wrist_x
-        dy = s["wrist_y"] - setup_wrist_y
-        dist_contact = (dx * dx + dy * dy) ** 0.5
-
-        # Score 2 (25%): pure vertical distance back to setup wrist height
-        dist_height = abs(s["wrist_y"] - setup_wrist_y)
-
-        # Score 3 (20%): timing penalty — ideal is 45–70% through downswing window
-        pos = (s["i"] - impact_window_start) / impact_window_size
-        if pos < 0.35:
-            timing_pen = (0.35 - pos) * 2.5   # penalise too-early hard
-        elif pos > 0.72:
-            timing_pen = (pos - 0.72) * 1.2   # mild penalty for late
-        else:
-            timing_pen = 0.0
-
-        score = dist_contact * 0.55 + dist_height * 0.25 + timing_pen * 0.20
-
-        if score < best_score:
-            best_score = score
+    max_wrist_y = -1.0
+    for s in samples[top_i + 1 : max(top_i + 2, int(n * 0.88))]:
+        if s["wrist_y"] is not None and s["wrist_y"] > max_wrist_y:
+            max_wrist_y = s["wrist_y"]
             impact_i = s["i"]
 
     impact_wrist_y = samples[impact_i].get("wrist_y") or setup_wrist_y
     print(f"[phases] impact_i={impact_i} wrist_y={impact_wrist_y:.3f} "
-          f"setup_y={setup_wrist_y:.3f} score={best_score:.4f}")
+          f"setup_y={setup_wrist_y:.3f} top_y={min_wrist_y:.3f}")
 
     # ── Follow-through: first frame where wrists are higher than impact ────────
     # Must be at least 3 sampled frames after impact; prefer not the last frame.
