@@ -9,6 +9,10 @@ const LM_RIGHT_SHOULDER = 12;
 const LM_LEFT_HIP       = 23;
 const LM_RIGHT_HIP      = 24;
 
+// Landmarks 0–10 are face points (nose, eyes, ears, mouth).
+// We draw a clean head box instead — skip their individual dots.
+const FACE_LANDMARKS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+
 const POSE_CONNECTIONS: [number, number][] = [
   [11, 12],
   [11, 13],
@@ -128,8 +132,6 @@ export function SwingOverlay({ landmarks, width, height }: Props) {
   const shoulderMid = hasShoulders ? mid(lsXY!, rsXY!) : null;
   const hipMid      = hasHips      ? mid(lhXY!, rhXY!) : null;
 
-  const headSize = Math.max(14, width * 0.04);
-
   return (
     <View style={[StyleSheet.absoluteFillObject, { width, height }]} pointerEvents="none">
         {POSE_CONNECTIONS.map(([start, end]) => {
@@ -142,8 +144,19 @@ export function SwingOverlay({ landmarks, width, height }: Props) {
         })}
 
         {landmarks.map((lm, index) => {
+          if (FACE_LANDMARKS.has(index)) return null;
           if (!usable(lm)) return null;
           const xy = toXY(lm, width, height);
+          // Skip dots that fall inside the head circle area
+          if (hasNose && hasShoulders) {
+            const shoulderSpan = Math.abs(rsXY!.x - lsXY!.x);
+            const headR = Math.max(10, shoulderSpan * 0.28) + 6;
+            const headCx = noseXY!.x;
+            const headCy = noseXY!.y - headR * 0.55;
+            const dx = xy.x - headCx;
+            const dy = xy.y - headCy;
+            if (dx * dx + dy * dy < headR * headR) return null;
+          }
           return <Dot key={`lm-${index}`} point={xy} size={7} color="#4CAF50" />;
         })}
 
@@ -180,20 +193,21 @@ export function SwingOverlay({ landmarks, width, height }: Props) {
           </>
         )}
 
-        {/* ── Head box (around nose landmark) ── */}
-        {hasNose && (
-          <View
-            style={[
-              styles.headBox,
-              {
-                left: noseXY!.x - headSize,
-                top: noseXY!.y - headSize * 1.6,
-                width: headSize * 2,
-                height: headSize * 2.2,
-              },
-            ]}
-          />
-        )}
+        {/* ── Head circle — sized from shoulder width, centered above nose ── */}
+        {hasNose && hasShoulders && (() => {
+          const shoulderSpan = Math.abs(rsXY!.x - lsXY!.x);
+          const r = Math.max(10, shoulderSpan * 0.28);
+          const cx = noseXY!.x;
+          const cy = noseXY!.y - r * 0.55;
+          return (
+            <View
+              style={[
+                styles.headCircle,
+                { left: cx - r, top: cy - r, width: r * 2, height: r * 2, borderRadius: r },
+              ]}
+            />
+          );
+        })()}
     </View>
   );
 }
@@ -209,10 +223,10 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: '#FFFFFF',
   },
-  headBox: {
+  headCircle: {
     position: 'absolute',
     borderWidth: 2,
     borderColor: '#FFFFFF',
-    borderRadius: 4,
+    backgroundColor: 'transparent',
   },
 });
