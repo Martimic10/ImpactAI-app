@@ -35,10 +35,10 @@ const PHASE_LABEL: Record<SwingPhase, string> = {
 };
 
 const CHAPTERS: { phase: SwingPhase; fallbackMs: number; ratio: number }[] = [
-  { phase: 'setup',  fallbackMs: 200,  ratio: 0.06 },
+  { phase: 'setup',  fallbackMs: 200,  ratio: 0.04 },  // always near start
   { phase: 'top',    fallbackMs: 1400, ratio: 0.42 },
-  { phase: 'impact', fallbackMs: 2600, ratio: 0.72 },
-  { phase: 'finish', fallbackMs: 3400, ratio: 0.90 },
+  { phase: 'impact', fallbackMs: 2200, ratio: 0.65 },
+  { phase: 'finish', fallbackMs: 3200, ratio: 0.88 },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -108,9 +108,12 @@ function FullscreenVideoViewer({
         : null;
       for (const { phase, fallbackMs, ratio } of CHAPTERS) {
         const detectedMark = visualAnalysis?.[phase]?.timeMs;
-        const mark = typeof detectedMark === 'number'
+        // For Address: never pause later than 10% into video — it's always a static setup position
+        const maxSetupMs = durationMs ? durationMs * 0.10 : 500;
+        let mark = typeof detectedMark === 'number'
           ? detectedMark
           : durationMs ? Math.max(0, Math.min(durationMs - 80, durationMs * ratio)) : fallbackMs;
+        if (phase === 'setup') mark = Math.min(mark, maxSetupMs);
         if (!passedRef.current.has(phase) && timeMs >= mark) {
           passedRef.current.add(phase);
           player.pause();

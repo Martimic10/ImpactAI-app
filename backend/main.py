@@ -123,11 +123,17 @@ def get_phase_timestamps_ms(cap) -> List[int]:
         end_ms = int(duration_ms * 0.96)
 
     swing_ms = max(900, end_ms - start_ms)
+
+    # Address is always near the very start — the golfer stands still at setup
+    # before the swing burst, so we never want start_ms - 250 (which would be
+    # mid-way through a long video). Cap it at 4% of duration or 300ms max.
+    address_ms = min(int(duration_ms * 0.04), 300)
+
     times = [
-        max(0, start_ms - 250),
-        start_ms + int(swing_ms * 0.24),
-        start_ms + int(swing_ms * 0.55),
-        min(duration_ms - 80, end_ms),
+        address_ms,
+        start_ms + int(swing_ms * 0.30),   # top of backswing
+        start_ms + int(swing_ms * 0.58),   # impact
+        min(duration_ms - 80, end_ms + int(swing_ms * 0.15)),  # follow-through
     ]
     return [int(min(duration_ms - 80, max(0, t))) for t in times]
 
