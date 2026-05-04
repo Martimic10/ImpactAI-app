@@ -9,25 +9,17 @@ const LM_RIGHT_SHOULDER = 12;
 const LM_LEFT_HIP       = 23;
 const LM_RIGHT_HIP      = 24;
 
-// Landmarks 0–10 are face points (nose, eyes, ears, mouth).
-// We draw a clean head box instead — skip their individual dots.
-const FACE_LANDMARKS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
+// Golf-relevant connections only — upper body + torso, no legs
 const POSE_CONNECTIONS: [number, number][] = [
-  [11, 12],
-  [11, 13],
-  [13, 15],
-  [12, 14],
-  [14, 16],
-  [11, 23],
-  [12, 24],
-  [23, 24],
-  [23, 25],
-  [25, 27],
-  [24, 26],
-  [26, 28],
-  [27, 31],
-  [28, 32],
+  [11, 12],  // shoulder bar
+  [11, 13],  // left upper arm
+  [13, 15],  // left forearm
+  [12, 14],  // right upper arm
+  [14, 16],  // right forearm
+  [11, 23],  // left torso
+  [12, 24],  // right torso
+  [23, 24],  // hip bar
 ];
 
 interface Props {
@@ -143,22 +135,7 @@ export function SwingOverlay({ landmarks, width, height }: Props) {
           return <Segment key={`${start}-${end}`} from={startXY} to={endXY} color="#FFFFFF" thickness={4} />;
         })}
 
-        {landmarks.map((lm, index) => {
-          if (FACE_LANDMARKS.has(index)) return null;
-          if (!usable(lm)) return null;
-          const xy = toXY(lm, width, height);
-          // Skip dots that fall inside the head circle area
-          if (hasNose && hasShoulders) {
-            const shoulderSpan = Math.abs(rsXY!.x - lsXY!.x);
-            const headR = Math.max(10, shoulderSpan * 0.28) + 6;
-            const headCx = noseXY!.x;
-            const headCy = noseXY!.y - headR * 0.55;
-            const dx = xy.x - headCx;
-            const dy = xy.y - headCy;
-            if (dx * dx + dy * dy < headR * headR) return null;
-          }
-          return <Dot key={`lm-${index}`} point={xy} size={7} color="#4CAF50" />;
-        })}
+        {/* No small per-joint dots — cleaner with only highlighted key joints */}
 
         {/* ── Shoulder line ── */}
         {hasShoulders && (

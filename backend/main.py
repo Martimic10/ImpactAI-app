@@ -56,18 +56,53 @@ class ExtractKeyFramesRequest(BaseModel):
     timestamps_ms: Optional[List[int]] = None
 
 
+def find_swing_window(cap, total_frames: int):
+    """
+    Quick motion scan (20 frames) to find where the swing burst starts and ends.
+    Returns (swing_start_frame, swing_end_frame).
+    """
+    N = min(20, total_frames)
+    step = max(1, total_frames // N)
+    scores = []
+    prev_gray = None
+
+    for i in range(0, total_frames, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        roi = cv2.resize(gray[int(h*0.05):int(h*0.92), int(w*0.08):int(w*0.92)], (80, 140))
+        score = 0.0 if prev_gray is None else float(cv2.absdiff(roi, prev_gray).mean())
+        prev_gray = roi
+        scores.append((i, score))
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    if not scores:
+        return 0, total_frames - 1
+
+    motion = np.array([s for _, s in scores], dtype=np.float32)
+    threshold = max(float(np.percentile(motion, 60)), float(motion.mean() * 0.7), 1.0)
+    active = [idx for idx, s in scores if s >= threshold]
+
+    if len(active) < 2:
+        return 0, total_frames - 1
+
+    swing_start = max(0, active[0] - step * 2)
+    swing_end   = min(total_frames - 1, active[-1] + step * 2)
+    return swing_start, swing_end
+
+
 def detect_phases_landmark_based(cap, fps: float) -> List[int]:
     """
-    Sample 24 frames across the video, run MediaPipe Pose on each, then use
-    wrist-position heuristics to detect the 4 swing phases.
+    Two-pass phase detection:
+      Pass 1 — quick motion scan to find the swing window.
+      Pass 2 — dense MediaPipe sampling (30 frames) within that window.
 
-    Phases:
-      setup          — first stable frame in first 15% (wrists low, body set)
-      topOfBackswing — frame where wrist midpoint is highest (min y) before 65%
-      impact         — earliest frame after top where wrists return to setup height
-      followThrough  — 20-25% of remaining frames after impact (NOT the last frame)
-
-    Falls back to percentage-based timestamps when landmark coverage is low.
+    This handles fast swings where a uniform 24-frame sample would place
+    only 3-4 frames inside the actual swing.
     """
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration_ms = int((total_frames / fps) * 1000) if total_frames > 0 else 3000
@@ -78,8 +113,17 @@ def detect_phases_landmark_based(cap, fps: float) -> List[int]:
     if total_frames <= 0:
         return [int(duration_ms * p) for p in FALLBACK_PCTS]
 
-    N = min(24, total_frames)
-    step = total_frames / N
+    # Pass 1: find swing window via motion
+    swing_start, swing_end = find_swing_window(cap, total_frames)
+    swing_span = max(1, swing_end - swing_start)
+    print(f"[phases] swing window: {int(swing_start/fps*1000)}ms–{int(swing_end/fps*1000)}ms")
+
+    # Pass 2: dense sample 30 frames — first 2 from before swing for setup,
+    # rest uniformly within the swing window
+    setup_frames = [max(0, int(swing_start * 0.10)),
+                    max(0, int(swing_start * 0.30))]
+    swing_indices = [swing_start + int(i * swing_span / 28) for i in range(29)]
+    frame_indices = sorted(set(setup_frames + swing_indices))
     samples = []
 
     with mp_pose.Pose(
@@ -89,8 +133,8 @@ def detect_phases_landmark_based(cap, fps: float) -> List[int]:
         min_detection_confidence=0.2,
         min_tracking_confidence=0.2,
     ) as pose:
-        for i in range(N):
-            frame_idx = int(i * step)
+        for frame_idx in frame_indices:
+            frame_idx = min(int(frame_idx), total_frames - 1)
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if not ret:
@@ -103,16 +147,14 @@ def detect_phases_landmark_based(cap, fps: float) -> List[int]:
             wrist_x = None
             if det.pose_landmarks:
                 lms = det.pose_landmarks.landmark
-                lw, rw = lms[15], lms[16]  # left/right wrist
+                lw, rw = lms[15], lms[16]
                 if lw.visibility > 0.2 and rw.visibility > 0.2:
                     wrist_y = (lw.y + rw.y) / 2.0
                     wrist_x = (lw.x + rw.x) / 2.0
                 elif lw.visibility > 0.2:
-                    wrist_y = lw.y
-                    wrist_x = lw.x
+                    wrist_y, wrist_x = lw.y, lw.x
                 elif rw.visibility > 0.2:
-                    wrist_y = rw.y
-                    wrist_x = rw.x
+                    wrist_y, wrist_x = rw.y, rw.x
 
             samples.append({"i": len(samples), "frame_idx": frame_idx,
                              "time_ms": time_ms, "wrist_y": wrist_y, "wrist_x": wrist_x})
