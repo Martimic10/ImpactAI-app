@@ -321,12 +321,14 @@ function VideoPlayerInline({
   url,
   onBack,
   onExpand,
+  onRegenerate,
   hasVisualAnalysis,
   vaGenerating,
 }: {
   url: string;
   onBack: () => void;
   onExpand: () => void;
+  onRegenerate: () => void;
   hasVisualAnalysis: boolean;
   vaGenerating: boolean;
 }) {
@@ -352,7 +354,7 @@ function VideoPlayerInline({
         <Ionicons name="arrow-back" size={20} color="#FFFFFF" />
       </TouchableOpacity>
 
-      {/* Expand button — top right */}
+      {/* Expand / Overlay button — top right */}
       <TouchableOpacity onPress={onExpand} style={[styles.expandBtn, vaGenerating && styles.expandBtnGenerating]} activeOpacity={0.85}>
         {vaGenerating ? (
           <>
@@ -366,6 +368,14 @@ function VideoPlayerInline({
           </>
         )}
       </TouchableOpacity>
+
+      {/* Regenerate button — bottom right, only when overlay exists */}
+      {hasVisualAnalysis && !vaGenerating && (
+        <TouchableOpacity onPress={onRegenerate} style={styles.regenBtn} activeOpacity={0.8}>
+          <Ionicons name="refresh-outline" size={12} color="#8E8E93" />
+          <Text style={styles.regenBtnText}>Regenerate</Text>
+        </TouchableOpacity>
+      )}
 
       {!playing && (
         <View style={styles.playOverlay} pointerEvents="none">
@@ -488,27 +498,38 @@ export default function SwingDetailScreen() {
 
   // Auto-generate visual analysis for ANY swing that is missing it
   useEffect(() => {
-    if (!swing?.id || !user?.id) return;          // wait for both to load
+    if (!swing?.id || !user?.id) return;
     if (swing.visual_analysis && (swing.analysis_version ?? 0) >= VISUAL_ANALYSIS_VERSION) return;
-    if (!swing.video_url) return;                  // nothing to extract from
-    if (vaGenerating) return;                      // already in progress
+    if (!swing.video_url) return;
+    if (vaGenerating) return;
+    runVisualAnalysis(swing);
+  }, [swing?.id, user?.id]);
 
-    console.log('[VA] starting generation for swing', swing.id, 'video:', swing.video_url.slice(0, 60));
+  function runVisualAnalysis(target: Swing) {
+    if (!user?.id || vaGenerating) return;
+    console.log('[VA] starting generation for swing', target.id, 'video:', target.video_url.slice(0, 60));
     setVaGenerating(true);
-
-    generateVisualAnalysis(swing.video_url, user.id, swing.id, swing.result_json)
+    generateVisualAnalysis(target.video_url, user.id, target.id, target.result_json)
       .then((va) => {
         console.log('[VA] generation result:', va ? 'SUCCESS' : 'NULL — check logs above');
         if (va) {
-          saveVisualAnalysis(swing.id, va);
+          saveVisualAnalysis(target.id, va);
           setLiveSwing((prev) => prev
             ? { ...prev, visual_analysis: va, analysis_version: VISUAL_ANALYSIS_VERSION }
-            : { ...(swing as Swing), visual_analysis: va, analysis_version: VISUAL_ANALYSIS_VERSION });
+            : { ...(target as Swing), visual_analysis: va, analysis_version: VISUAL_ANALYSIS_VERSION });
         }
       })
       .catch((e) => console.error('[VA] generation threw:', e))
       .finally(() => setVaGenerating(false));
-  }, [swing?.id, user?.id]);    // re-runs if either becomes available late
+  }
+
+  function regenerateVisualAnalysis() {
+    if (!swing || vaGenerating) return;
+    // Clear local visual_analysis so the viewer shows fresh data
+    const cleared = { ...(swing as Swing), visual_analysis: undefined as unknown as typeof swing.visual_analysis };
+    setLiveSwing(cleared);
+    runVisualAnalysis(cleared);
+  }
 
   // Poll for overlay completion
   useEffect(() => {
@@ -564,6 +585,7 @@ export default function SwingDetailScreen() {
               url={activeVideoUrl}
               onBack={goBack}
               onExpand={() => setShowFullscreen(true)}
+              onRegenerate={regenerateVisualAnalysis}
               hasVisualAnalysis={!!swing.visual_analysis}
               vaGenerating={vaGenerating}
             />
@@ -792,6 +814,14 @@ const styles = StyleSheet.create({
   expandBtnText: { color: '#FFFFFF', fontSize: 12, fontWeight: '800' },
   expandBtnGenerating: { width: 'auto', paddingHorizontal: 10, gap: 6, flexDirection: 'row', alignItems: 'center' },
   expandBtnGeneratingText: { color: '#4CAF50', fontSize: 11, fontWeight: '700' },
+  regenBtn: {
+    position: 'absolute', bottom: 12, right: 12,
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    backgroundColor: 'rgba(8,12,14,0.55)',
+    borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)',
+    borderRadius: 14, paddingHorizontal: 9, paddingVertical: 5,
+  },
+  regenBtnText: { color: '#8E8E93', fontSize: 11, fontWeight: '600' },
   overlayDot: {
     position: 'absolute', top: 8, right: 8,
     width: 7, height: 7, borderRadius: 4,
