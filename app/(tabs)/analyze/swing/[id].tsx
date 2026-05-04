@@ -350,13 +350,17 @@ function VideoPlayerInline({
       </TouchableOpacity>
 
       {/* Expand button — top right */}
-      <TouchableOpacity onPress={onExpand} style={styles.expandBtn} activeOpacity={0.85}>
-        <Ionicons name={hasVisualAnalysis ? 'body-outline' : 'expand-outline'} size={15} color="#FFFFFF" />
-        {hasVisualAnalysis && !vaGenerating && (
-          <Text style={styles.expandBtnText}>Overlay</Text>
-        )}
-        {vaGenerating && (
-          <ActivityIndicator size="small" color="#4CAF50" style={{ position: 'absolute', top: -4, right: -4 }} />
+      <TouchableOpacity onPress={onExpand} style={[styles.expandBtn, vaGenerating && styles.expandBtnGenerating]} activeOpacity={0.85}>
+        {vaGenerating ? (
+          <>
+            <ActivityIndicator size="small" color="#4CAF50" />
+            <Text style={styles.expandBtnGeneratingText}>Generating…</Text>
+          </>
+        ) : (
+          <>
+            <Ionicons name={hasVisualAnalysis ? 'body-outline' : 'expand-outline'} size={15} color="#FFFFFF" />
+            {hasVisualAnalysis && <Text style={styles.expandBtnText}>Overlay</Text>}
+          </>
         )}
       </TouchableOpacity>
 
@@ -783,6 +787,8 @@ const styles = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   expandBtnText: { color: '#FFFFFF', fontSize: 12, fontWeight: '800' },
+  expandBtnGenerating: { width: 'auto', paddingHorizontal: 10, gap: 6, flexDirection: 'row', alignItems: 'center' },
+  expandBtnGeneratingText: { color: '#4CAF50', fontSize: 11, fontWeight: '700' },
   overlayDot: {
     position: 'absolute', top: 8, right: 8,
     width: 7, height: 7, borderRadius: 4,

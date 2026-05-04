@@ -49,13 +49,15 @@ async function extractViaBackend(
   videoUrl: string
 ): Promise<BackendFrameResult[] | null> {
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 90000);
     const res = await fetch(`${BACKEND_URL}/extract-key-frames`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        video_url: videoUrl,
-      }),
+      body: JSON.stringify({ video_url: videoUrl }),
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
     if (!res.ok) {
       console.warn('[visualAnalysis] backend /extract-key-frames error:', res.status);
       return null;
@@ -104,10 +106,14 @@ async function extractViaBackendUpload(
       type: 'video/mp4',
     } as unknown as Blob);
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 90000);
     const res = await fetch(`${BACKEND_URL}/extract-key-frames-upload`, {
       method: 'POST',
       body: formData,
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
     if (!res.ok) {
       console.warn('[visualAnalysis] backend upload error:', res.status);
       return null;
