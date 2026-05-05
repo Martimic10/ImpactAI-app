@@ -58,7 +58,8 @@ export interface SwingResult {
 }
 
 // Helper — get the overall 1-100 score from any swing (old or new schema)
-export function getSwingScore(result: SwingResult): number {
+export function getSwingScore(result: SwingResult | null | undefined): number {
+  if (!result) return 50;
   if (result.scores?.overallScore) {
     const s = result.scores.overallScore;
     // Auto-correct if AI returned 1-10 scale instead of 1-100

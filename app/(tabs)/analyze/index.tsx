@@ -72,11 +72,11 @@ export default function AnalyzeIndexScreen() {
   const latestScore = latestSwing ? getSwingScore(latestSwing.result_json) : null;
   const avgScore =
     swings.length > 0
-      ? Math.round(swings.reduce((s, sw) => s + getSwingScore(sw.result_json), 0) / swings.length)
+      ? Math.round(swings.reduce((s, sw) => s + getSwingScore(sw.result_json ?? null), 0) / swings.length)
       : null;
   const trend =
     swings.length >= 2
-      ? Math.round(getSwingScore(swings[0].result_json) - getSwingScore(swings[1].result_json))
+      ? Math.round(getSwingScore(swings[0].result_json ?? null) - getSwingScore(swings[1].result_json ?? null))
       : null;
 
   const dailyLimit = PLAN_LIMITS[user?.plan ?? 'free'].swingsPerDay;
