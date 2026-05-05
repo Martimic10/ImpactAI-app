@@ -206,22 +206,23 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
                 if min_dist2 < 0.06:   # very close to contact zone — bias early
                     break
 
-        # Prefer 1-2 frames before peak speed (ball contact before max release)
-        # but never later than contact zone frame
-        ii = max(ti + 1, min(peak_sp_i - 1, contact_i))
+        # Impact = peak wrist speed (fastest movement = club at ball)
+        # If contact zone frame is earlier, take whichever is later of the two
+        # so we don't land in mid-downswing
+        ii = max(ti + 1, max(peak_sp_i, contact_i))
 
-        # Reject if wrists are clearly in follow-through (dist growing again)
-        imp_dist = samples[ii].get("dist") or 0
-        if imp_dist > max_dist * 0.75 and contact_i < ii:
-            ii = contact_i   # fall back to contact zone frame
+        # Safety: if impact ended up past 88%, pull back to contact zone
+        if ii >= int(n * 0.88) and contact_i < ii:
+            ii = contact_i
 
         imp_y = samples[ii]["smooth_y"] or setup_y
 
-        # ── 4d. Follow-through: first frame wrists move up/away after impact ──
-        fi2 = min(ii + 3, n - 1)
-        for s in samples[ii + 3 : n]:
-            # Wrists are rising (y decreasing) after impact
-            if s["smooth_y"] is not None and s["smooth_y"] < imp_y - 0.04:
+        # ── 4d. Follow-through: start 4 frames after impact ──────────────────
+        min_ft_gap = 4
+        fi2 = min(ii + min_ft_gap, n - 1)
+        for s in samples[ii + min_ft_gap : n]:
+            # Wrists rising (y decreasing) = body released through the ball
+            if s["smooth_y"] is not None and s["smooth_y"] < imp_y - 0.05:
                 fi2 = s["i"]
                 if fi2 < n - 2:   # avoid last frame
                     break
