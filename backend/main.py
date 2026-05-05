@@ -214,9 +214,10 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
     if use_physics:
         burst_start_idx = len(pre)
 
-        # SETUP — first frame of the burst (golfer just at address before takeaway)
-        si = burst_start_idx
-        for i in range(burst_start_idx, min(burst_start_idx + 4, n)):
+        # SETUP — last pre-burst sample (golfer static at address, just before takeaway)
+        # burst_start_idx is where swing motion begins, so pre-burst = true address
+        si = 0
+        for i in range(burst_start_idx - 1, -1, -1):
             if samples[i]["wy"] is not None:
                 si = i
                 break
@@ -240,15 +241,10 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
             if wy is not None and wy > max_wy:
                 max_wy, ii = wy, i
 
-        # FOLLOW-THROUGH — first frame after impact where wrist is higher than impact
-        imp_y = samples[ii]["sy"] or 0.7
-        fi2 = min(ii + 3, n - 1)
-        for i in range(ii + 3, n):
-            wy = samples[i].get("sy")
-            if wy is not None and wy < imp_y - 0.04:
-                fi2 = i
-                if fi2 < n - 2:
-                    break
+        # FOLLOW-THROUGH — fixed 80% of burst samples after burst start
+        # Wrist-Y based detection fails on face-on angles; percentage is reliable
+        ft_target = burst_start_idx + int((n - burst_start_idx) * 0.80)
+        fi2 = min(max(ii + 2, ft_target), n - 1)
 
         chosen_idx = [si, ti, ii, fi2]
         print(f"[phases] lm={lm_count}/{n}  "
