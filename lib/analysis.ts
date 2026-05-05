@@ -51,6 +51,7 @@ async function runFrameAnalysis(uri: string, club?: string): Promise<SwingResult
     return { ...MOCK_SWING_RESULT, selectedClub: club ?? MOCK_SWING_RESULT.selectedClub };
   }
   const frames = await extractFrames(uri);
+  console.log(`[analysis] frames extracted: ${frames.length}, sizes: ${frames.slice(0, 3).map(f => f.length).join(',')}`);
   if (frames.length === 0) {
     console.warn('[analysis] No frames — using mock result');
     return { ...MOCK_SWING_RESULT, selectedClub: club ?? MOCK_SWING_RESULT.selectedClub };
