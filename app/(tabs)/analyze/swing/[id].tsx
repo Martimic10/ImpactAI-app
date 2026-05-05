@@ -68,6 +68,7 @@ function FullscreenVideoViewer({
   const player = useVideoPlayer(url || null, (p) => {
     p.loop = false;
     p.muted = false;
+    p.playbackRate = 0.35;   // slow-mo so fast swings pause reliably
     p.pause();
   });
 
@@ -295,7 +296,7 @@ function FullscreenVideoViewer({
           <View style={fs.idleCard}>
             <Text style={fs.idleText}>
               {isPlaying
-                ? '⛳  Pausing at key swing moments…'
+                ? '⛳  Playing in slow-mo — pausing at key moments…'
                 : 'Tap play to resume'}
             </Text>
           </View>
