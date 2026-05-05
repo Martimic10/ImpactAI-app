@@ -206,14 +206,12 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
                 if min_dist2 < 0.06:   # very close to contact zone — bias early
                     break
 
-        # Impact = peak wrist speed (fastest movement = club at ball)
-        # If contact zone frame is earlier, take whichever is later of the two
-        # so we don't land in mid-downswing
-        ii = max(ti + 1, max(peak_sp_i, contact_i))
-
-        # Safety: if impact ended up past 88%, pull back to contact zone
-        if ii >= int(n * 0.88) and contact_i < ii:
-            ii = contact_i
+        # Impact = frame closest to contact zone (minimum 2D distance from setup)
+        # Peak speed used only to reject frames that are clearly too early
+        ii = contact_i
+        # If contact zone frame is surprisingly late (>80%), try peak speed instead
+        if ii >= int(n * 0.80) and peak_sp_i < ii:
+            ii = peak_sp_i
 
         imp_y = samples[ii]["smooth_y"] or setup_y
 

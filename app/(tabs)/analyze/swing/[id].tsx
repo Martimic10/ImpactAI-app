@@ -134,8 +134,6 @@ function FullscreenVideoViewer({
 
   function resume() {
     clearTimeout(resumeTimer.current);
-    // Capture chapter before clearing state
-    const chapter = CHAPTERS.find((c) => c.phase === activePhase);
     setActivePhase(null);
     setShowPose(true);
 
@@ -144,15 +142,8 @@ function FullscreenVideoViewer({
       return;
     }
 
-    // Seek 300ms past the chapter mark so the interval doesn't immediately re-pause
-    if (chapter) {
-      const dMs = player.duration > 0 ? player.duration * 1000 : null;
-      const mark = dMs
-        ? Math.min(dMs - 80, dMs * chapter.ratio)
-        : chapter.fallbackMs;
-      player.currentTime = (mark + 300) / 1000;
-    }
-
+    // Play from exactly where the video paused — no seek needed.
+    // passedRef already marks this chapter as done so the interval won't re-fire.
     player.play();
     setIsPlaying(true);
   }
