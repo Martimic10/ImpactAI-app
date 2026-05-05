@@ -56,6 +56,46 @@ class ExtractKeyFramesRequest(BaseModel):
     timestamps_ms: Optional[List[int]] = None
 
 
+def find_swing_burst(cap, total_frames: int, fps: float):
+    """
+    Fast motion scan (20 frames, no MediaPipe) to find where the swing
+    actually happens. Returns (start_frame, end_frame).
+    Without this, even-spaced sampling picks up the static address period.
+    """
+    scan_n = min(20, total_frames)
+    step = max(1, total_frames // scan_n)
+    scores, prev_gray = [], None
+
+    for i in range(0, total_frames, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        roi = cv2.resize(gray[int(h*0.05):int(h*0.92), int(w*0.08):int(w*0.92)], (80, 140))
+        score = 0.0 if prev_gray is None else float(cv2.absdiff(roi, prev_gray).mean())
+        prev_gray = roi
+        scores.append((i, score))
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    if not scores:
+        return 0, total_frames - 1
+
+    motion = np.array([s for _, s in scores], dtype=np.float32)
+    threshold = max(float(np.percentile(motion, 60)), float(motion.mean() * 0.75), 1.2)
+    active = [fi for fi, s in scores if s >= threshold]
+    if len(active) < 2:
+        return 0, total_frames - 1
+
+    pad = step * 3
+    start = max(0, active[0] - pad)
+    end   = min(total_frames - 1, active[-1] + pad)
+    print(f"[burst] swing burst: {int(start/fps*1000)}ms – {int(end/fps*1000)}ms "
+          f"(frames {start}–{end} of {total_frames})")
+    return start, end
+
+
 def detect_and_extract(cap, fps: float) -> List[dict]:
     """
     48-frame single-pass phase detection + extraction.
@@ -87,9 +127,18 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
     if total_frames <= 0:
         return [read_frame_result(p) for p in fallback_pcts]
 
-    # ── 1. Sample 48 frames ───────────────────────────────────────────────────
-    N = max(4, min(48, total_frames))
-    step = total_frames / N
+    # ── 1. Find where the swing actually is (fast, no MediaPipe) ─────────────
+    burst_start, burst_end = find_swing_burst(cap, total_frames, fps)
+    burst_span = max(1, burst_end - burst_start)
+
+    # Sample: a couple of pre-burst frames for setup, rest inside the burst
+    setup_frames = [max(0, burst_start - int(total_frames * 0.06)),
+                    max(0, burst_start - int(total_frames * 0.02))]
+    N_burst = max(4, min(44, burst_span))
+    burst_indices = [burst_start + int(i * burst_span / N_burst) for i in range(N_burst)]
+    all_indices = sorted(set(setup_frames + burst_indices))
+
+    # ── 2. Sample chosen frames with MediaPipe ────────────────────────────────
     samples = []
 
     with mp_pose.Pose(
@@ -98,8 +147,8 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
         enable_segmentation=False,
         min_detection_confidence=0.2,
     ) as pose:
-        for i in range(N):
-            fi = min(int(i * step), total_frames - 1)
+        for fi in all_indices:
+            fi = min(int(fi), total_frames - 1)
             cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
             ret, frame = cap.read()
             if not ret:
