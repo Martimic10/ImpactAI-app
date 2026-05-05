@@ -115,19 +115,24 @@ def find_swing_burst(cap, total_frames: int, fps: float):
 
 def detect_and_extract(cap, fps: float) -> List[dict]:
     """
-    Reliable phase detection:
-      1. Motion scan finds the swing burst (ignores static address period)
-      2. Fixed percentages within the burst select each phase
-      3. MediaPipe run on just those 4 frames for landmarks
+    Physics-based phase detection that works for any video:
 
-    Golf swing has consistent temporal structure within the burst:
-      setup  ≈  5% — stable address just before motion starts
-      top    ≈ 35% — transition from backswing to downswing
-      impact ≈ 62% — ball contact
-      follow ≈ 82% — early follow-through
+    1. Motion scan finds the swing burst (ignores static address period)
+    2. 36 frames sampled densely within the burst + 2 pre-burst setup frames
+    3. Wrist 2D speed computed per frame
+    4. Phases detected from physical invariants of the golf swing:
+
+       SETUP   — most stable frame just before burst (wrist at address/ball height)
+       TOP     — local speed minimum in first half of burst
+                 (wrist momentarily stops at top of backswing)
+       IMPACT  — global speed maximum in burst
+                 (peak wrist velocity = club-ball contact, any camera angle)
+       FOLLOW  — first frame after impact where speed drops below 40% of peak
+                 AND wrist has moved past impact position
+
+    Falls back to burst percentages when landmark coverage < 30%.
     """
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    PHASE_PCTS = [0.05, 0.35, 0.62, 0.82]
 
     def read_frame(fi):
         fi = max(0, min(int(fi), total_frames - 1))
@@ -135,48 +140,146 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
         ret, frame = cap.read()
         return (frame if ret else None), int(fi / fps * 1000)
 
-    if total_frames <= 0:
-        results = []
-        for p in PHASE_PCTS:
-            frame, time_ms = read_frame(int(total_frames * p))
-            b64 = encode_jpg(resize_for_ai(frame)) if frame is not None else None
-            results.append({"frame": b64, "overlay_frame": None, "landmarks": None, "time_ms": time_ms})
-        return results
+    def make_result(frame, time_ms, landmarks=None):
+        b64 = encode_jpg(resize_for_ai(frame)) if frame is not None else None
+        return {"frame": b64, "overlay_frame": None, "landmarks": landmarks, "time_ms": time_ms}
 
-    # ── 1. Find swing burst (fast motion scan, no MediaPipe) ─────────────────
+    if total_frames <= 0:
+        return [make_result(*read_frame(int(total_frames * p)))
+                for p in [0.05, 0.35, 0.62, 0.82]]
+
+    # ── 1. Burst detection ────────────────────────────────────────────────────
     burst_start, burst_end = find_swing_burst(cap, total_frames, fps)
     span = max(1, burst_end - burst_start)
 
-    # Setup comes just before the burst (stable address)
-    setup_fi  = max(0, burst_start - max(1, int(span * 0.15)))
-    top_fi    = burst_start + int(span * 0.35)
-    impact_fi = burst_start + int(span * 0.62)
-    ft_fi     = burst_start + int(span * 0.82)
-    phase_fis = [setup_fi, top_fi, impact_fi, ft_fi]
+    # 2 setup frames just before burst + 36 frames uniformly inside burst
+    pre = [max(0, burst_start - int(span * 0.25)),
+           max(0, burst_start - int(span * 0.08))]
+    n_burst = max(4, min(36, span))
+    inside  = [burst_start + int(i * span / n_burst) for i in range(n_burst)]
+    all_fi  = sorted(set(pre + inside))
 
-    print(f"[phases] burst={int(burst_start/fps*1000)}ms-{int(burst_end/fps*1000)}ms  "
-          f"setup={int(setup_fi/fps*1000)}ms  top={int(top_fi/fps*1000)}ms  "
-          f"impact={int(impact_fi/fps*1000)}ms  ft={int(ft_fi/fps*1000)}ms")
-
-    # ── 2. Run MediaPipe on the 4 chosen frames ───────────────────────────────
-    results = []
+    # ── 2. Sample with MediaPipe ──────────────────────────────────────────────
+    samples = []
     with mp_pose.Pose(static_image_mode=True, model_complexity=0,
                       enable_segmentation=False, min_detection_confidence=0.2) as pose:
-        for fi in phase_fis:
+        for fi in all_fi:
             frame, time_ms = read_frame(fi)
             if frame is None:
-                results.append({"frame": None, "overlay_frame": None,
-                                 "landmarks": None, "time_ms": time_ms})
                 continue
-            frame_b64 = encode_jpg(resize_for_ai(frame))
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             det = pose.process(rgb)
-            landmarks = landmarks_to_json(det.pose_landmarks) if det.pose_landmarks else None
-            results.append({"frame": frame_b64, "overlay_frame": None,
-                             "landmarks": landmarks, "time_ms": time_ms})
-
+            wy = wx = lm = None
+            if det.pose_landmarks:
+                lms = det.pose_landmarks.landmark
+                lw, rw = lms[15], lms[16]
+                if lw.visibility > 0.15 and rw.visibility > 0.15:
+                    wy = (lw.y + rw.y) / 2.0
+                    wx = (lw.x + rw.x) / 2.0
+                elif lw.visibility > 0.15:
+                    wy, wx = lw.y, lw.x
+                elif rw.visibility > 0.15:
+                    wy, wx = rw.y, rw.x
+                lm = landmarks_to_json(det.pose_landmarks)
+            samples.append({"fi": fi, "time_ms": time_ms, "wy": wy, "wx": wx,
+                             "lm": lm, "frame": frame, "speed": None, "sy": None, "sx": None})
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    return results
+
+    n = len(samples)
+    if n < 4:
+        results = []
+        for p in [0.05, 0.35, 0.62, 0.82]:
+            f, t = read_frame(int(total_frames * p))
+            results.append(make_result(f, t))
+        return results
+
+    lm_count = sum(1 for s in samples if s["wy"] is not None)
+    use_physics = lm_count >= int(n * 0.28)
+
+    # ── 3. Smooth wrist + compute 2D speed ───────────────────────────────────
+    if use_physics:
+        for i in range(n):
+            ys = [samples[j]["wy"] for j in range(max(0, i-1), min(n, i+2)) if samples[j]["wy"]]
+            xs = [samples[j]["wx"] for j in range(max(0, i-1), min(n, i+2)) if samples[j]["wx"]]
+            samples[i]["sy"] = sum(ys)/len(ys) if ys else None
+            samples[i]["sx"] = sum(xs)/len(xs) if xs else None
+        for i in range(1, n):
+            sy, sx = samples[i]["sy"], samples[i]["sx"]
+            py, px = samples[i-1]["sy"], samples[i-1]["sx"]
+            if sy and py:
+                dy, dx = sy - py, (sx or 0.5) - (px or 0.5)
+                samples[i]["speed"] = (dy*dy + dx*dx) ** 0.5
+
+    # ── 4. Phase detection ────────────────────────────────────────────────────
+    if use_physics:
+        # SETUP — first pre-burst sample with pose, else first sample
+        si = 0
+        pre_count = len(pre)
+        for i in range(min(pre_count + 2, n)):
+            if samples[i]["wy"] is not None:
+                si = i
+                break
+
+        # IMPACT — global speed maximum (peak wrist velocity = ball contact)
+        # Search from 20% into burst samples onward (skip setup/early backswing)
+        burst_start_idx = pre_count
+        ii = burst_start_idx + int((n - burst_start_idx) * 0.2)
+        peak_speed = -1.0
+        for i in range(burst_start_idx + int((n - burst_start_idx) * 0.15), n - 1):
+            sp = samples[i].get("speed") or 0
+            if sp > peak_speed:
+                peak_speed, ii = sp, i
+
+        # TOP — local speed minimum in first half of burst, before impact
+        # (wrist momentarily stops at transition from backswing to downswing)
+        half = burst_start_idx + (ii - burst_start_idx) // 2
+        ti = burst_start_idx + 1
+        min_speed = float("inf")
+        for i in range(burst_start_idx + 1, max(burst_start_idx + 2, half)):
+            sp = samples[i].get("speed")
+            if sp is not None and sp < min_speed:
+                min_speed, ti = sp, i
+
+        # Ensure top is before impact with a gap
+        if ti >= ii - 1:
+            ti = max(burst_start_idx + 1, ii - max(2, (ii - burst_start_idx) // 3))
+
+        # FOLLOW-THROUGH — after impact, speed drops below 40% of peak
+        # AND wrist has moved from impact position
+        imp_y = samples[ii]["sy"] or 0.7
+        fi2 = min(ii + 2, n - 1)
+        for i in range(ii + 2, n):
+            sp = samples[i].get("speed") or 0
+            moved = abs((samples[i]["sy"] or imp_y) - imp_y) > 0.03
+            if sp < peak_speed * 0.45 and moved:
+                fi2 = i
+                if fi2 < n - 2:
+                    break
+
+        chosen_idx = [si, ti, ii, fi2]
+        print(f"[phases] physics peak_speed={peak_speed:.4f} lm={lm_count}/{n}  "
+              f"setup={samples[si]['time_ms']}ms top={samples[ti]['time_ms']}ms "
+              f"impact={samples[ii]['time_ms']}ms ft={samples[fi2]['time_ms']}ms")
+    else:
+        # Fallback: fixed burst percentages
+        pcts = [0.0, 0.35, 0.62, 0.82]
+        chosen_idx = [min(int(pre_count + p * (n - pre_count)), n - 1)
+                      for p in pcts]
+        chosen_idx[0] = 0
+        print(f"[phases] fallback (lm coverage {lm_count}/{n})")
+
+    # Enforce strict ordering + minimum spacing
+    for k in range(1, 4):
+        if chosen_idx[k] <= chosen_idx[k-1]:
+            chosen_idx[k] = chosen_idx[k-1] + 1
+    if chosen_idx[2] - chosen_idx[1] < 2:
+        chosen_idx[2] = chosen_idx[1] + 2
+    if chosen_idx[3] - chosen_idx[2] < 2:
+        chosen_idx[3] = chosen_idx[2] + 2
+    chosen_idx = [min(x, n-1) for x in chosen_idx]
+
+    return [make_result(samples[i]["frame"], samples[i]["time_ms"],
+                        samples[i]["lm"]) for i in chosen_idx]
 
 
 def transcode_to_h264(input_path: str) -> str:
