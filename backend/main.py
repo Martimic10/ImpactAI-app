@@ -212,27 +212,18 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
 
     # ── 4. Phase detection ────────────────────────────────────────────────────
     if use_physics:
-        # SETUP — first pre-burst sample with pose, else first sample
-        si = 0
-        pre_count = len(pre)
-        for i in range(min(pre_count + 2, n)):
+        burst_start_idx = len(pre)
+
+        # SETUP — first frame of the burst (golfer just at address before takeaway)
+        si = burst_start_idx
+        for i in range(burst_start_idx, min(burst_start_idx + 4, n)):
             if samples[i]["wy"] is not None:
                 si = i
                 break
 
-        # IMPACT — global speed maximum (peak wrist velocity = ball contact)
-        # Search from 20% into burst samples onward (skip setup/early backswing)
-        burst_start_idx = pre_count
-        ii = burst_start_idx + int((n - burst_start_idx) * 0.2)
-        peak_speed = -1.0
-        for i in range(burst_start_idx + int((n - burst_start_idx) * 0.15), n - 1):
-            sp = samples[i].get("speed") or 0
-            if sp > peak_speed:
-                peak_speed, ii = sp, i
-
-        # TOP — local speed minimum in first half of burst, before impact
-        # (wrist momentarily stops at transition from backswing to downswing)
-        half = burst_start_idx + (ii - burst_start_idx) // 2
+        # TOP — local speed minimum in first 50% of burst samples
+        # (wrist momentarily stops at backswing-to-downswing transition)
+        half = burst_start_idx + (n - burst_start_idx) // 2
         ti = burst_start_idx + 1
         min_speed = float("inf")
         for i in range(burst_start_idx + 1, max(burst_start_idx + 2, half)):
@@ -240,32 +231,35 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
             if sp is not None and sp < min_speed:
                 min_speed, ti = sp, i
 
-        # Ensure top is before impact with a gap
-        if ti >= ii - 1:
-            ti = max(burst_start_idx + 1, ii - max(2, (ii - burst_start_idx) // 3))
+        # IMPACT — maximum wrist Y (lowest point on screen = club at ball)
+        # More reliable than peak speed which is noisy with 36-frame sampling
+        ii = min(ti + 2, n - 1)
+        max_wy = -1.0
+        for i in range(ti + 1, max(ti + 2, int(burst_start_idx + (n - burst_start_idx) * 0.88))):
+            wy = samples[i].get("sy")
+            if wy is not None and wy > max_wy:
+                max_wy, ii = wy, i
 
-        # FOLLOW-THROUGH — after impact, speed drops below 40% of peak
-        # AND wrist has moved from impact position
+        # FOLLOW-THROUGH — first frame after impact where wrist is higher than impact
         imp_y = samples[ii]["sy"] or 0.7
-        fi2 = min(ii + 2, n - 1)
-        for i in range(ii + 2, n):
-            sp = samples[i].get("speed") or 0
-            moved = abs((samples[i]["sy"] or imp_y) - imp_y) > 0.03
-            if sp < peak_speed * 0.45 and moved:
+        fi2 = min(ii + 3, n - 1)
+        for i in range(ii + 3, n):
+            wy = samples[i].get("sy")
+            if wy is not None and wy < imp_y - 0.04:
                 fi2 = i
                 if fi2 < n - 2:
                     break
 
         chosen_idx = [si, ti, ii, fi2]
-        print(f"[phases] physics peak_speed={peak_speed:.4f} lm={lm_count}/{n}  "
+        print(f"[phases] lm={lm_count}/{n}  "
               f"setup={samples[si]['time_ms']}ms top={samples[ti]['time_ms']}ms "
               f"impact={samples[ii]['time_ms']}ms ft={samples[fi2]['time_ms']}ms")
     else:
         # Fallback: fixed burst percentages
+        bsi = len(pre)
         pcts = [0.0, 0.35, 0.62, 0.82]
-        chosen_idx = [min(int(pre_count + p * (n - pre_count)), n - 1)
-                      for p in pcts]
-        chosen_idx[0] = 0
+        chosen_idx = [min(int(bsi + p * (n - bsi)), n - 1) for p in pcts]
+        chosen_idx[0] = bsi
         print(f"[phases] fallback (lm coverage {lm_count}/{n})")
 
     # Enforce strict ordering + minimum spacing

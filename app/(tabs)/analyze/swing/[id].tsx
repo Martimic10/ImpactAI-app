@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -89,6 +89,13 @@ function FullscreenVideoViewer({
   }
 
   function togglePlayPause() {
+    // If a phase is frozen, tapping play dismisses it and resumes
+    if (activePhase) {
+      setActivePhase(null);
+      player.play();
+      setIsPlaying(true);
+      return;
+    }
     if (isPlaying) { player.pause(); setIsPlaying(false); }
     else           { player.play();  setIsPlaying(true);  }
   }
