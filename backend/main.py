@@ -212,42 +212,49 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
 
     # ── 4. Phase detection ────────────────────────────────────────────────────
     if use_physics:
-        burst_start_idx = len(pre)
+        bsi = len(pre)  # index where burst samples begin
 
-        # SETUP — last pre-burst sample (golfer static at address, just before takeaway)
-        # burst_start_idx is where swing motion begins, so pre-burst = true address
-        si = 0
-        for i in range(burst_start_idx - 1, -1, -1):
-            if samples[i]["wy"] is not None:
-                si = i
-                break
-
-        # TOP — local speed minimum in first 50% of burst samples
-        # (wrist momentarily stops at backswing-to-downswing transition)
-        half = burst_start_idx + (n - burst_start_idx) // 2
-        ti = burst_start_idx + 1
-        min_speed = float("inf")
-        for i in range(burst_start_idx + 1, max(burst_start_idx + 2, half)):
-            sp = samples[i].get("speed")
-            if sp is not None and sp < min_speed:
-                min_speed, ti = sp, i
-
-        # IMPACT — maximum wrist Y (lowest point on screen = club at ball)
-        # More reliable than peak speed which is noisy with 36-frame sampling
-        ii = min(ti + 2, n - 1)
+        # ── IMPACT first — max wrist Y (lowest on screen = club at ball) ──────
+        ii = bsi
         max_wy = -1.0
-        for i in range(ti + 1, max(ti + 2, int(burst_start_idx + (n - burst_start_idx) * 0.88))):
+        for i in range(bsi, n):
             wy = samples[i].get("sy")
             if wy is not None and wy > max_wy:
                 max_wy, ii = wy, i
+        imp_wy = samples[ii]["sy"] or 0.70
 
-        # FOLLOW-THROUGH — fixed 80% of burst samples after burst start
-        # Wrist-Y based detection fails on face-on angles; percentage is reliable
-        ft_target = burst_start_idx + int((n - burst_start_idx) * 0.80)
+        # ── TOP — min wrist Y (highest on screen) anywhere BEFORE impact ──────
+        ti = bsi
+        min_wy = float("inf")
+        for i in range(bsi, ii):
+            wy = samples[i].get("sy")
+            if wy is not None and wy < min_wy:
+                min_wy, ti = wy, i
+
+        # ── SETUP — last pre-burst frame with pose; fallback = first burst
+        # frame before top where wrist Y is close to impact (near ball height) ─
+        si = bsi  # default: first burst frame
+        found = False
+        for i in range(bsi - 1, -1, -1):   # pre-burst frames, newest first
+            if samples[i]["wy"] is not None:
+                si = i
+                found = True
+                break
+        if not found:
+            # No pre-burst landmarks — find first burst frame where wrist is
+            # still near ball height (wrists haven't lifted into backswing yet)
+            for i in range(bsi, ti):
+                wy = samples[i].get("sy")
+                if wy is not None and wy > imp_wy - 0.12:
+                    si = i
+                    break
+
+        # ── FOLLOW-THROUGH — fixed 80% through burst ─────────────────────────
+        ft_target = bsi + int((n - bsi) * 0.80)
         fi2 = min(max(ii + 2, ft_target), n - 1)
 
         chosen_idx = [si, ti, ii, fi2]
-        print(f"[phases] lm={lm_count}/{n}  "
+        print(f"[phases] impact_wy={imp_wy:.3f} top_wy={min_wy:.3f} lm={lm_count}/{n}  "
               f"setup={samples[si]['time_ms']}ms top={samples[ti]['time_ms']}ms "
               f"impact={samples[ii]['time_ms']}ms ft={samples[fi2]['time_ms']}ms")
     else:
