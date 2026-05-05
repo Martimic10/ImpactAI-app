@@ -279,6 +279,15 @@ def encode_jpg(frame, quality=80) -> str:
     return base64.b64encode(buf).decode("utf-8")
 
 
+def resize_for_ai(frame, max_side=640):
+    """Resize frame so the longest side is max_side px — keeps AI request small."""
+    h, w = frame.shape[:2]
+    if max(h, w) <= max_side:
+        return frame
+    scale = max_side / max(h, w)
+    return cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+
 def try_detect_pose(pose, frame):
     """Try pose detection at multiple scales — returns (landmarks_json, overlay_b64) or (None, None)."""
     h, w = frame.shape[:2]
@@ -441,11 +450,13 @@ async def extract_frames(video: UploadFile = File(...), frameCount: int = Form(6
             ret, frame = cap.read()
             if not ret:
                 continue
-            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            small = resize_for_ai(frame, max_side=640)
+            _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 70])
             frames_b64.append(base64.b64encode(buf).decode("utf-8"))
 
         cap.release()
-        print(f"[extract-frames] returning {len(frames_b64)} frames")
+        sizes = [len(f) for f in frames_b64]
+        print(f"[extract-frames] returning {len(frames_b64)} frames, sizes: {sizes}")
         return {"frames": frames_b64}
 
     except Exception as e:
