@@ -14,6 +14,8 @@ export function useSwings(userId: string | undefined) {
       .from('swings')
       .select('*')
       .eq('user_id', userId)
+      .eq('status', 'completed')
+      .not('result_json', 'is', null)
       .order('created_at', { ascending: false })
       .limit(20);
 
