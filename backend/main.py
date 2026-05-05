@@ -58,34 +58,37 @@ class ExtractKeyFramesRequest(BaseModel):
 
 def detect_and_extract(cap, fps: float) -> List[dict]:
     """
-    Single-pass: sample 16 frames with MediaPipe, detect swing phases from
-    wrist positions, and return the 4 key frames with their data.
+    48-frame single-pass phase detection + extraction.
 
-    Previously this was 3 separate passes (motion scan + 30-frame detection +
-    4-frame extraction). Now it's one pass — ~70% fewer MediaPipe calls.
+    Uses 2D distance from contact zone (setup wrist position) to detect all
+    phases — works for both face-on and down-the-line camera angles.
+
+    Phases:
+      setup   — first stable frame in first 15%
+      top     — wrist farthest from contact zone (max 2D distance) before 65%
+      impact  — wrist closest to contact zone (min 2D distance) after top,
+                biased early using peak wrist speed
+      follow  — first frame where wrists are clearly higher/further than impact
+
+    Falls back to percentage windows when landmark coverage is < 30%.
     """
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fallback_pcts = [0.10, 0.35, 0.60, 0.75]
 
-    def fallback_result():
-        results = []
-        for pct in fallback_pcts:
-            fi = min(int(total_frames * pct), total_frames - 1)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
-            ret, frame = cap.read()
-            time_ms = int(fi / fps * 1000)
-            if not ret:
-                results.append({"frame": None, "overlay_frame": None,
-                                 "landmarks": None, "time_ms": time_ms})
-                continue
-            results.append({"frame": encode_jpg(resize_for_ai(frame)),
-                             "overlay_frame": None, "landmarks": None, "time_ms": time_ms})
-        return results
+    def read_frame_result(pct, method="fallback"):
+        fi = min(int(total_frames * pct), max(0, total_frames - 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ret, frame = cap.read()
+        time_ms = int(fi / fps * 1000)
+        b64 = encode_jpg(resize_for_ai(frame)) if ret else None
+        return {"frame": b64, "overlay_frame": None, "landmarks": None,
+                "time_ms": time_ms, "method": method}
 
     if total_frames <= 0:
-        return fallback_result()
+        return [read_frame_result(p) for p in fallback_pcts]
 
-    N = min(16, total_frames)
+    # ── 1. Sample 48 frames ───────────────────────────────────────────────────
+    N = max(4, min(48, total_frames))
     step = total_frames / N
     samples = []
 
@@ -105,71 +108,158 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             det = pose.process(rgb)
 
-            wrist_y, landmarks = None, None
+            wrist_y, wrist_x, landmarks = None, None, None
             if det.pose_landmarks:
                 lms = det.pose_landmarks.landmark
                 lw, rw = lms[15], lms[16]
                 if lw.visibility > 0.2 and rw.visibility > 0.2:
                     wrist_y = (lw.y + rw.y) / 2.0
+                    wrist_x = (lw.x + rw.x) / 2.0
                 elif lw.visibility > 0.2:
-                    wrist_y = lw.y
+                    wrist_y, wrist_x = lw.y, lw.x
                 elif rw.visibility > 0.2:
-                    wrist_y = rw.y
+                    wrist_y, wrist_x = rw.y, rw.x
                 landmarks = landmarks_to_json(det.pose_landmarks)
 
             samples.append({
                 "i": len(samples), "fi": fi, "time_ms": time_ms,
-                "wrist_y": wrist_y, "landmarks": landmarks,
+                "wy": wrist_y, "wx": wrist_x, "landmarks": landmarks,
                 "frame_b64": encode_jpg(resize_for_ai(frame)),
+                "smooth_y": None, "smooth_x": None,
+                "speed": None, "dist": None,
             })
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     n = len(samples)
     if n < 4:
-        return fallback_result()
+        return [read_frame_result(p) for p in fallback_pcts]
 
-    lm_count = sum(1 for s in samples if s["wrist_y"] is not None)
-    if lm_count < int(n * 0.3):
-        # Low coverage — pick evenly spaced frames we already have
-        chosen = [samples[int(n * p)] for p in [0.10, 0.35, 0.60, 0.75]]
-    else:
-        # ── Setup: first in first 15% with wrist data ─────────────────────────
-        si = next((s["i"] for s in samples[:max(1, int(n * 0.15))]
-                   if s["wrist_y"] is not None), 0)
-        sw_y = samples[si]["wrist_y"] or 0.70
+    lm_count = sum(1 for s in samples if s["wy"] is not None)
+    use_motion = lm_count >= int(n * 0.30)
 
-        # ── Top: min wrist_y (highest on screen) before 65% ──────────────────
-        ti = si + 1
-        min_wy = float("inf")
-        for s in samples[si + 1: max(si + 2, int(n * 0.65))]:
-            if s["wrist_y"] is not None and s["wrist_y"] < min_wy:
-                min_wy, ti = s["wrist_y"], s["i"]
+    # ── 2. Smooth wrist positions (3-frame moving average) ────────────────────
+    if use_motion:
+        for i in range(n):
+            ys = [samples[j]["wy"] for j in range(max(0, i - 1), min(n, i + 2))
+                  if samples[j]["wy"] is not None]
+            xs = [samples[j]["wx"] for j in range(max(0, i - 1), min(n, i + 2))
+                  if samples[j]["wx"] is not None]
+            samples[i]["smooth_y"] = sum(ys) / len(ys) if ys else None
+            samples[i]["smooth_x"] = sum(xs) / len(xs) if xs else None
 
-        # ── Impact: max wrist_y (lowest on screen) after top ─────────────────
-        ii = min(ti + 2, n - 1)
-        max_wy = -1.0
-        for s in samples[ti + 1: max(ti + 2, int(n * 0.88))]:
-            if s["wrist_y"] is not None and s["wrist_y"] > max_wy:
-                max_wy, ii = s["wrist_y"], s["i"]
-        imp_wy = samples[ii].get("wrist_y") or sw_y
+        # ── 3. Compute speed (2D displacement between adjacent samples) ────────
+        for i in range(1, n):
+            sy, sx = samples[i]["smooth_y"], samples[i]["smooth_x"]
+            py, px = samples[i - 1]["smooth_y"], samples[i - 1]["smooth_x"]
+            if sy is not None and py is not None:
+                dy = sy - py
+                dx = (sx or 0.5) - (px or 0.5)
+                samples[i]["speed"] = (dy * dy + dx * dx) ** 0.5
 
-        # ── Follow-through: first frame wrists higher than impact ─────────────
-        fi2 = min(ii + 2, n - 1)
-        for s in samples[ii + 2: n]:
-            if s["wrist_y"] is not None and s["wrist_y"] < imp_wy - 0.04:
-                fi2 = s["i"]
-                if fi2 < n - 2:
+    # ── 4a. Setup ─────────────────────────────────────────────────────────────
+    si = 0
+    if use_motion:
+        for s in samples[: max(1, int(n * 0.15))]:
+            if s["smooth_y"] is not None:
+                si = s["i"]
+                break
+
+    setup_y = samples[si]["smooth_y"] or samples[si]["wy"] or 0.70
+    setup_x = samples[si]["smooth_x"] or samples[si]["wx"] or 0.50
+
+    if use_motion:
+        # Compute 2D distance from contact zone for every sample
+        for s in samples:
+            sy = s["smooth_y"]
+            sx = s["smooth_x"]
+            if sy is not None:
+                dy = sy - setup_y
+                dx = (sx or setup_x) - setup_x
+                s["dist"] = (dy * dy + dx * dx) ** 0.5
+
+        # ── 4b. Top: max distance from contact zone before 65% ────────────────
+        ti = min(si + 1, n - 1)
+        max_dist = -1.0
+        for s in samples[si + 1 : max(si + 2, int(n * 0.65))]:
+            if s["dist"] is not None and s["dist"] > max_dist:
+                max_dist = s["dist"]
+                ti = s["i"]
+
+        # ── 4c. Impact: min distance from contact zone after top ─────────────
+        # Additionally bias early using peak wrist speed
+        impact_win = samples[ti + 1 : max(ti + 2, int(n * 0.88))]
+
+        # Find peak speed in the window
+        peak_sp_i = ti + 1
+        peak_sp = -1.0
+        for s in impact_win:
+            if s["speed"] is not None and s["speed"] > peak_sp:
+                peak_sp, peak_sp_i = s["speed"], s["i"]
+
+        # Find frame closest to contact zone (min dist) in window
+        contact_i = ti + 1
+        min_dist2 = float("inf")
+        for s in impact_win:
+            if s["dist"] is not None and s["dist"] < min_dist2:
+                min_dist2 = s["dist"]
+                contact_i = s["i"]
+                if min_dist2 < 0.06:   # very close to contact zone — bias early
                     break
 
-        # Enforce ordering
+        # Prefer 1-2 frames before peak speed (ball contact before max release)
+        # but never later than contact zone frame
+        ii = max(ti + 1, min(peak_sp_i - 1, contact_i))
+
+        # Reject if wrists are clearly in follow-through (dist growing again)
+        imp_dist = samples[ii].get("dist") or 0
+        if imp_dist > max_dist * 0.75 and contact_i < ii:
+            ii = contact_i   # fall back to contact zone frame
+
+        imp_y = samples[ii]["smooth_y"] or setup_y
+
+        # ── 4d. Follow-through: first frame wrists move up/away after impact ──
+        fi2 = min(ii + 3, n - 1)
+        for s in samples[ii + 3 : n]:
+            # Wrists are rising (y decreasing) after impact
+            if s["smooth_y"] is not None and s["smooth_y"] < imp_y - 0.04:
+                fi2 = s["i"]
+                if fi2 < n - 2:   # avoid last frame
+                    break
+
         idxs = [si, ti, ii, fi2]
-        for k in range(1, 4):
-            if idxs[k] <= idxs[k - 1]:
-                idxs[k] = idxs[k - 1] + 1
-        idxs = [min(x, n - 1) for x in idxs]
-        chosen = [samples[x] for x in idxs]
-        print(f"[phases] setup={chosen[0]['time_ms']}ms top={chosen[1]['time_ms']}ms "
-              f"impact={chosen[2]['time_ms']}ms ft={chosen[3]['time_ms']}ms")
+        method = "motion"
+
+    else:
+        # ── Fallback: pick best frame within percentage windows ────────────────
+        windows = [(0.05, 0.15), (0.25, 0.45), (0.50, 0.70), (0.70, 0.85)]
+        idxs = []
+        for lo, hi in windows:
+            lo_i = max(0, int(n * lo))
+            hi_i = min(n - 1, int(n * hi))
+            # Pick the frame in the window with a valid landmark, else midpoint
+            cand = next(
+                (s["i"] for s in samples[lo_i: hi_i + 1] if s["wy"] is not None),
+                (lo_i + hi_i) // 2,
+            )
+            idxs.append(cand)
+        method = "fallback"
+
+    # ── 5. Enforce strict ordering + minimum spacing ──────────────────────────
+    for k in range(1, 4):
+        if idxs[k] <= idxs[k - 1]:
+            idxs[k] = idxs[k - 1] + 1
+    # Minimum 2-sample gap between top↔impact and impact↔follow-through
+    if idxs[2] - idxs[1] < 2:
+        idxs[2] = idxs[1] + 2
+    if idxs[3] - idxs[2] < 2:
+        idxs[3] = idxs[2] + 2
+    idxs = [min(x, n - 1) for x in idxs]
+
+    chosen = [samples[x] for x in idxs]
+    labels = ["setup", "top", "impact", "ft"]
+    debug = "  ".join(f"{labels[k]}={chosen[k]['time_ms']}ms(#{idxs[k]})"
+                      for k in range(4))
+    print(f"[phases] {method} N={n} lm={lm_count}  {debug}")
 
     return [{"frame": s["frame_b64"], "overlay_frame": None,
               "landmarks": s["landmarks"], "time_ms": s["time_ms"]}
