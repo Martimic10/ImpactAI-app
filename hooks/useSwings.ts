@@ -14,12 +14,10 @@ export function useSwings(userId: string | undefined) {
       .from('swings')
       .select('*')
       .eq('user_id', userId)
-      .eq('status', 'completed')
-      .not('result_json', 'is', null)
       .order('created_at', { ascending: false })
       .limit(20);
 
-    if (data) setSwings(data as Swing[]);
+    if (data) setSwings((data as Swing[]).filter((s) => s.result_json != null));
     setLoading(false);
   }, [userId]);
 
