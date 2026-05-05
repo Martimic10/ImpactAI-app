@@ -60,6 +60,7 @@ function FullscreenVideoViewer({
   const [isPlaying, setIsPlaying]             = useState(false);
   const [showPose, setShowPose]               = useState(true);
   const [frameAspect, setFrameAspect]         = useState(9 / 16);
+  const [playbackRate, setPlaybackRate]       = useState(0.35);
 
   const passedRef    = useRef<Set<SwingPhase>>(new Set());
   const intervalRef  = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
@@ -68,9 +69,14 @@ function FullscreenVideoViewer({
   const player = useVideoPlayer(url || null, (p) => {
     p.loop = false;
     p.muted = false;
-    p.playbackRate = 0.35;   // slow-mo so fast swings pause reliably
+    p.playbackRate = 0.35;
     p.pause();
   });
+
+  // Keep player rate in sync with state
+  useEffect(() => {
+    player.playbackRate = playbackRate;
+  }, [playbackRate]);
 
   function resetChapters() {
     passedRef.current = new Set();
@@ -295,10 +301,22 @@ function FullscreenVideoViewer({
         ) : (
           <View style={fs.idleCard}>
             <Text style={fs.idleText}>
-              {isPlaying
-                ? '⛳  Playing in slow-mo — pausing at key moments…'
-                : 'Tap play to resume'}
+              {isPlaying ? '⛳  Pausing at key moments…' : 'Tap ▶ to start'}
             </Text>
+            <View style={fs.speedRow}>
+              {([0.25, 0.5, 0.75, 1.0] as const).map((rate) => (
+                <TouchableOpacity
+                  key={rate}
+                  onPress={() => setPlaybackRate(rate)}
+                  style={[fs.speedBtn, playbackRate === rate && fs.speedBtnActive]}
+                  activeOpacity={0.8}
+                >
+                  <Text style={[fs.speedText, playbackRate === rate && fs.speedTextActive]}>
+                    {rate === 1.0 ? '1×' : `${rate}×`}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
           </View>
         )}
       </View>
@@ -1008,7 +1026,15 @@ const fs = StyleSheet.create({
   // idle card (video playing, no chapter active)
   idleCard: {
     flex: 1, backgroundColor: '#0D0D0D',
-    alignItems: 'center', justifyContent: 'center',
+    alignItems: 'center', justifyContent: 'center', gap: 16,
   },
   idleText: { fontSize: 13, color: '#555', textAlign: 'center' },
+  speedRow: { flexDirection: 'row', gap: 8 },
+  speedBtn: {
+    paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20,
+    backgroundColor: '#1A1A1A', borderWidth: 1, borderColor: '#2A2A2A',
+  },
+  speedBtnActive: { backgroundColor: '#2E7D32', borderColor: '#4CAF50' },
+  speedText: { fontSize: 13, fontWeight: '700', color: '#666' },
+  speedTextActive: { color: '#FFFFFF' },
 });
