@@ -257,127 +257,104 @@ const v2 = StyleSheet.create({
   recordHint: { fontSize: 11, color: '#555555' },
 });
 
-// ── Screen 3: Coaching / Drills ──────────────────────────────────────────────
+// ── Screen 3: Coaching — mirrors the real results screen layout ───────────────
+const SCORES = [
+  { label: 'Setup',      value: 72, color: '#FFD23A' },
+  { label: 'Posture',    value: 65, color: '#FFD23A' },
+  { label: 'Swing Path', value: 42, color: '#FF453A' },
+  { label: 'Tempo',      value: 81, color: '#4CAF50' },
+  { label: 'Contact',    value: 51, color: '#FF453A' },
+];
+
 function CoachVisual() {
   return (
     <View style={styles.visualContainer}>
-      <View style={[styles.visualCard, { gap: 0, padding: 0, overflow: 'hidden' }]}>
-        {/* Header strip */}
-        <View style={v3.header}>
-          <View style={v3.headerIcon}>
-            <Ionicons name="trophy" size={18} color="#4CAF50" />
+      <View style={[styles.visualCard, { padding: 0, gap: 0, overflow: 'hidden' }]}>
+
+        {/* Score summary row — matches the real summaryCard */}
+        <View style={v3.summaryRow}>
+          <View style={v3.scoreRing}>
+            <Text style={v3.scoreNum}>63</Text>
+            <Text style={v3.scoreLabel}>SCORE</Text>
           </View>
-          <View style={{ flex: 1 }}>
-            <Text style={v3.headerTitle}>Your Coaching Plan</Text>
-            <Text style={v3.headerSub}>Based on your latest swing</Text>
-          </View>
-          <View style={v3.scorePill}>
-            <Text style={v3.scoreNum}>84</Text>
+          <View style={{ flex: 1, gap: 5 }}>
+            <Text style={v3.aiKicker}>AI SUMMARY</Text>
+            <Text style={v3.issueTitle}>Over-the-top swing path</Text>
+            <Text style={v3.issueSub} numberOfLines={2}>
+              Downswing starts with the shoulders before the hips clear, creating a pull-fade.
+            </Text>
           </View>
         </View>
 
-        {/* Drill card */}
-        <View style={v3.drillSection}>
-          <View style={v3.drillRow}>
-            <View style={v3.drillIcon}>
-              <Ionicons name="golf-outline" size={16} color="#4CAF50" />
-            </View>
-            <View style={{ flex: 1 }}>
-              <Text style={v3.drillLabel}>Today's Drill</Text>
-              <Text style={v3.drillText}>Headcover under trail arm through impact</Text>
-            </View>
-          </View>
-
-          {/* Metric bars */}
-          {[
-            { label: 'Tempo', pct: 78, color: '#4CAF50' },
-            { label: 'Balance', pct: 62, color: '#FF9F0A' },
-            { label: 'Club Path', pct: 90, color: '#64B5F6' },
-          ].map((m) => (
-            <View key={m.label} style={v3.metricRow}>
-              <Text style={v3.metricLabel}>{m.label}</Text>
-              <View style={v3.metricTrack}>
-                <View style={[v3.metricFill, { width: `${m.pct}%`, backgroundColor: m.color }]} />
+        {/* Score bars — matches real scoreRowItem */}
+        <View style={v3.scoresPanel}>
+          {SCORES.map((s) => (
+            <View key={s.label} style={v3.scoreRow}>
+              <Text style={v3.rowLabel}>{s.label}</Text>
+              <View style={v3.barTrack}>
+                <View style={[v3.barFill, { width: `${s.value}%`, backgroundColor: s.color }]} />
               </View>
-              <Text style={[v3.metricPct, { color: m.color }]}>{m.pct}</Text>
+              <Text style={[v3.rowValue, { color: s.color }]}>{s.value}</Text>
             </View>
           ))}
         </View>
 
-        {/* Footer streak */}
-        <View style={v3.footer}>
-          <Ionicons name="flame" size={15} color="#FF9F0A" />
-          <Text style={v3.footerText}>3 day practice streak</Text>
-          <View style={v3.improveBadge}>
-            <Ionicons name="trending-up" size={11} color="#4CAF50" />
-            <Text style={v3.improveText}>+16 pts this week</Text>
+        {/* Fix card — matches real panel + fixHeader */}
+        <View style={v3.fixCard}>
+          <View style={v3.fixHeader}>
+            <View style={v3.warnIcon}>
+              <Ionicons name="alert-circle-outline" size={12} color="#FF9F0A" />
+            </View>
+            <Text style={v3.fixTitle} numberOfLines={1}>Over-the-top swing path</Text>
+            <View style={v3.highPill}>
+              <Text style={v3.highPillText}>HIGH</Text>
+            </View>
           </View>
+          <Text style={v3.fixDetail}>
+            Start the downswing by bumping your lead hip toward the target before your shoulders unwind.
+          </Text>
         </View>
+
       </View>
     </View>
   );
 }
 
 const v3 = StyleSheet.create({
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    padding: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: '#242424',
-    backgroundColor: '#1B2E1B',
+  summaryRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    padding: 14, borderBottomWidth: 1, borderBottomColor: '#242424',
   },
-  headerIcon: {
-    width: 36, height: 36, borderRadius: 10,
-    backgroundColor: '#1E3A1E',
+  scoreRing: {
+    width: 64, height: 64, borderRadius: 32,
+    borderWidth: 5, borderColor: '#FFD23A',
     alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: '#2E7D32',
+    backgroundColor: '#141414',
   },
-  headerTitle: { fontSize: 13, fontWeight: '700', color: '#FFFFFF' },
-  headerSub: { fontSize: 11, color: '#A5D6A7', marginTop: 1 },
-  scorePill: {
-    width: 40, height: 40, borderRadius: 10,
-    backgroundColor: '#2E7D32',
-    alignItems: 'center', justifyContent: 'center',
+  scoreNum: { color: '#FFFFFF', fontSize: 20, fontWeight: '800', lineHeight: 22 },
+  scoreLabel: { color: '#8A98A3', fontSize: 9, letterSpacing: 1, fontWeight: '700' },
+  aiKicker: { color: '#B6FF2F', fontSize: 10, fontWeight: '700', letterSpacing: 2 },
+  issueTitle: { color: '#FFFFFF', fontSize: 13, fontWeight: '800', letterSpacing: -0.2 },
+  issueSub: { color: '#8A98A3', fontSize: 11, lineHeight: 15 },
+  scoresPanel: { paddingHorizontal: 14, paddingVertical: 10, gap: 7, borderBottomWidth: 1, borderBottomColor: '#242424' },
+  scoreRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  rowLabel: { fontSize: 11, fontWeight: '600', color: '#FFFFFF', width: 62 },
+  barTrack: { flex: 1, height: 4, backgroundColor: '#2A2A2A', borderRadius: 2, overflow: 'hidden' },
+  barFill: { height: '100%', borderRadius: 2 },
+  rowValue: { fontSize: 12, fontWeight: '800', width: 22, textAlign: 'right' },
+  fixCard: { padding: 14, gap: 6 },
+  fixHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  warnIcon: {
+    width: 22, height: 22, borderRadius: 11,
+    backgroundColor: '#3C2A17', alignItems: 'center', justifyContent: 'center',
   },
-  scoreNum: { fontSize: 17, fontWeight: '800', color: '#FFFFFF' },
-  drillSection: { padding: 16, gap: 12 },
-  drillRow: {
-    flexDirection: 'row', gap: 10, alignItems: 'flex-start',
-    backgroundColor: '#1E1E1E',
-    borderRadius: 12, padding: 12,
-    borderWidth: 1, borderColor: '#2A2A2A',
-    marginBottom: 4,
+  fixTitle: { flex: 1, color: '#F4F7FA', fontSize: 12, fontWeight: '700' },
+  highPill: {
+    borderWidth: 1, borderColor: '#FF453AAA', borderRadius: 14,
+    paddingHorizontal: 8, paddingVertical: 3,
   },
-  drillIcon: {
-    width: 30, height: 30, borderRadius: 8,
-    backgroundColor: '#1B2E1B',
-    alignItems: 'center', justifyContent: 'center',
-  },
-  drillLabel: { fontSize: 10, color: '#666666', fontWeight: '600', letterSpacing: 0.5 },
-  drillText: { fontSize: 12, color: '#CCCCCC', fontWeight: '500', marginTop: 2, lineHeight: 16 },
-  metricRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  metricLabel: { fontSize: 11, color: '#666666', width: 56 },
-  metricTrack: {
-    flex: 1, height: 5, borderRadius: 3,
-    backgroundColor: '#2A2A2A', overflow: 'hidden',
-  },
-  metricFill: { height: '100%', borderRadius: 3 },
-  metricPct: { fontSize: 11, fontWeight: '700', width: 24, textAlign: 'right' },
-  footer: {
-    flexDirection: 'row', alignItems: 'center', gap: 6,
-    paddingHorizontal: 16, paddingVertical: 12,
-    borderTopWidth: 1, borderTopColor: '#242424',
-  },
-  footerText: { fontSize: 12, color: '#888888', fontWeight: '500', flex: 1 },
-  improveBadge: {
-    flexDirection: 'row', alignItems: 'center', gap: 4,
-    backgroundColor: '#1B2E1B',
-    paddingHorizontal: 8, paddingVertical: 4,
-    borderRadius: 10,
-  },
-  improveText: { fontSize: 11, fontWeight: '700', color: '#4CAF50' },
+  highPillText: { fontSize: 10, fontWeight: '800', color: '#FF453A', letterSpacing: 1 },
+  fixDetail: { color: '#9DA8B0', fontSize: 11, lineHeight: 16 },
 });
 
 // ── Slides data ──────────────────────────────────────────────────────────────
