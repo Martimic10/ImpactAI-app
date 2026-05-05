@@ -56,74 +56,37 @@ class ExtractKeyFramesRequest(BaseModel):
     timestamps_ms: Optional[List[int]] = None
 
 
-def find_swing_window(cap, total_frames: int):
+def detect_and_extract(cap, fps: float) -> List[dict]:
     """
-    Quick motion scan (20 frames) to find where the swing burst starts and ends.
-    Returns (swing_start_frame, swing_end_frame).
-    """
-    N = min(20, total_frames)
-    step = max(1, total_frames // N)
-    scores = []
-    prev_gray = None
+    Single-pass: sample 16 frames with MediaPipe, detect swing phases from
+    wrist positions, and return the 4 key frames with their data.
 
-    for i in range(0, total_frames, step):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-        roi = cv2.resize(gray[int(h*0.05):int(h*0.92), int(w*0.08):int(w*0.92)], (80, 140))
-        score = 0.0 if prev_gray is None else float(cv2.absdiff(roi, prev_gray).mean())
-        prev_gray = roi
-        scores.append((i, score))
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-    if not scores:
-        return 0, total_frames - 1
-
-    motion = np.array([s for _, s in scores], dtype=np.float32)
-    threshold = max(float(np.percentile(motion, 60)), float(motion.mean() * 0.7), 1.0)
-    active = [idx for idx, s in scores if s >= threshold]
-
-    if len(active) < 2:
-        return 0, total_frames - 1
-
-    swing_start = max(0, active[0] - step * 2)
-    swing_end   = min(total_frames - 1, active[-1] + step * 2)
-    return swing_start, swing_end
-
-
-def detect_phases_landmark_based(cap, fps: float) -> List[int]:
-    """
-    Two-pass phase detection:
-      Pass 1 — quick motion scan to find the swing window.
-      Pass 2 — dense MediaPipe sampling (30 frames) within that window.
-
-    This handles fast swings where a uniform 24-frame sample would place
-    only 3-4 frames inside the actual swing.
+    Previously this was 3 separate passes (motion scan + 30-frame detection +
+    4-frame extraction). Now it's one pass — ~70% fewer MediaPipe calls.
     """
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration_ms = int((total_frames / fps) * 1000) if total_frames > 0 else 3000
-    duration_ms = max(duration_ms, 800)
+    fallback_pcts = [0.10, 0.35, 0.60, 0.75]
 
-    FALLBACK_PCTS = [0.10, 0.35, 0.60, 0.75]
+    def fallback_result():
+        results = []
+        for pct in fallback_pcts:
+            fi = min(int(total_frames * pct), total_frames - 1)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ret, frame = cap.read()
+            time_ms = int(fi / fps * 1000)
+            if not ret:
+                results.append({"frame": None, "overlay_frame": None,
+                                 "landmarks": None, "time_ms": time_ms})
+                continue
+            results.append({"frame": encode_jpg(resize_for_ai(frame)),
+                             "overlay_frame": None, "landmarks": None, "time_ms": time_ms})
+        return results
 
     if total_frames <= 0:
-        return [int(duration_ms * p) for p in FALLBACK_PCTS]
+        return fallback_result()
 
-    # Pass 1: find swing window via motion
-    swing_start, swing_end = find_swing_window(cap, total_frames)
-    swing_span = max(1, swing_end - swing_start)
-    print(f"[phases] swing window: {int(swing_start/fps*1000)}ms–{int(swing_end/fps*1000)}ms")
-
-    # Pass 2: dense sample 30 frames — first 2 from before swing for setup,
-    # rest uniformly within the swing window
-    setup_frames = [max(0, int(swing_start * 0.10)),
-                    max(0, int(swing_start * 0.30))]
-    swing_indices = [swing_start + int(i * swing_span / 28) for i in range(29)]
-    frame_indices = sorted(set(setup_frames + swing_indices))
+    N = min(16, total_frames)
+    step = total_frames / N
     samples = []
 
     with mp_pose.Pose(
@@ -131,108 +94,86 @@ def detect_phases_landmark_based(cap, fps: float) -> List[int]:
         model_complexity=0,
         enable_segmentation=False,
         min_detection_confidence=0.2,
-        min_tracking_confidence=0.2,
     ) as pose:
-        for frame_idx in frame_indices:
-            frame_idx = min(int(frame_idx), total_frames - 1)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        for i in range(N):
+            fi = min(int(i * step), total_frames - 1)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
             ret, frame = cap.read()
             if not ret:
                 continue
-            time_ms = int((frame_idx / fps) * 1000)
+            time_ms = int(fi / fps * 1000)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             det = pose.process(rgb)
 
-            wrist_y = None
-            wrist_x = None
+            wrist_y, landmarks = None, None
             if det.pose_landmarks:
                 lms = det.pose_landmarks.landmark
                 lw, rw = lms[15], lms[16]
                 if lw.visibility > 0.2 and rw.visibility > 0.2:
                     wrist_y = (lw.y + rw.y) / 2.0
-                    wrist_x = (lw.x + rw.x) / 2.0
                 elif lw.visibility > 0.2:
-                    wrist_y, wrist_x = lw.y, lw.x
+                    wrist_y = lw.y
                 elif rw.visibility > 0.2:
-                    wrist_y, wrist_x = rw.y, rw.x
+                    wrist_y = rw.y
+                landmarks = landmarks_to_json(det.pose_landmarks)
 
-            samples.append({"i": len(samples), "frame_idx": frame_idx,
-                             "time_ms": time_ms, "wrist_y": wrist_y, "wrist_x": wrist_x})
+            samples.append({
+                "i": len(samples), "fi": fi, "time_ms": time_ms,
+                "wrist_y": wrist_y, "landmarks": landmarks,
+                "frame_b64": encode_jpg(resize_for_ai(frame)),
+            })
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
     n = len(samples)
     if n < 4:
-        return [int(min(duration_ms - 80, max(0, duration_ms * p))) for p in FALLBACK_PCTS]
+        return fallback_result()
 
     lm_count = sum(1 for s in samples if s["wrist_y"] is not None)
-    if lm_count < int(n * 0.35):
-        print(f"[phases] low landmark coverage ({lm_count}/{n}) — using percentage fallback")
-        return [int(min(duration_ms - 80, max(0, duration_ms * p))) for p in FALLBACK_PCTS]
+    if lm_count < int(n * 0.3):
+        # Low coverage — pick evenly spaced frames we already have
+        chosen = [samples[int(n * p)] for p in [0.10, 0.35, 0.60, 0.75]]
+    else:
+        # ── Setup: first in first 15% with wrist data ─────────────────────────
+        si = next((s["i"] for s in samples[:max(1, int(n * 0.15))]
+                   if s["wrist_y"] is not None), 0)
+        sw_y = samples[si]["wrist_y"] or 0.70
 
-    # ── Setup: first sample in first 15% with wrist data ──────────────────────
-    setup_i = 0
-    for s in samples[: max(1, int(n * 0.15))]:
-        if s["wrist_y"] is not None:
-            setup_i = s["i"]
-            break
-    setup_wrist_y = samples[setup_i]["wrist_y"] or 0.70
+        # ── Top: min wrist_y (highest on screen) before 65% ──────────────────
+        ti = si + 1
+        min_wy = float("inf")
+        for s in samples[si + 1: max(si + 2, int(n * 0.65))]:
+            if s["wrist_y"] is not None and s["wrist_y"] < min_wy:
+                min_wy, ti = s["wrist_y"], s["i"]
 
-    # ── Top of Backswing: minimum wrist y (highest on screen) before 65% ──────
-    top_i = min(setup_i + 1, n - 1)
-    min_wrist_y = float("inf")
-    for s in samples[setup_i + 1 : max(setup_i + 2, int(n * 0.65))]:
-        if s["wrist_y"] is not None and s["wrist_y"] < min_wrist_y:
-            min_wrist_y = s["wrist_y"]
-            top_i = s["i"]
+        # ── Impact: max wrist_y (lowest on screen) after top ─────────────────
+        ii = min(ti + 2, n - 1)
+        max_wy = -1.0
+        for s in samples[ti + 1: max(ti + 2, int(n * 0.88))]:
+            if s["wrist_y"] is not None and s["wrist_y"] > max_wy:
+                max_wy, ii = s["wrist_y"], s["i"]
+        imp_wy = samples[ii].get("wrist_y") or sw_y
 
-    # ── Impact: maximum wrist Y (lowest on screen = ball contact) after top ────
-    # At impact the club reaches the ball — wrists are at their lowest point
-    # in the swing arc. This is the MAXIMUM wrist_y value after the top.
-    impact_i = min(top_i + 2, n - 1)
-    max_wrist_y = -1.0
-    for s in samples[top_i + 1 : max(top_i + 2, int(n * 0.88))]:
-        if s["wrist_y"] is not None and s["wrist_y"] > max_wrist_y:
-            max_wrist_y = s["wrist_y"]
-            impact_i = s["i"]
+        # ── Follow-through: first frame wrists higher than impact ─────────────
+        fi2 = min(ii + 2, n - 1)
+        for s in samples[ii + 2: n]:
+            if s["wrist_y"] is not None and s["wrist_y"] < imp_wy - 0.04:
+                fi2 = s["i"]
+                if fi2 < n - 2:
+                    break
 
-    impact_wrist_y = samples[impact_i].get("wrist_y") or setup_wrist_y
-    print(f"[phases] impact_i={impact_i} wrist_y={impact_wrist_y:.3f} "
-          f"setup_y={setup_wrist_y:.3f} top_y={min_wrist_y:.3f}")
+        # Enforce ordering
+        idxs = [si, ti, ii, fi2]
+        for k in range(1, 4):
+            if idxs[k] <= idxs[k - 1]:
+                idxs[k] = idxs[k - 1] + 1
+        idxs = [min(x, n - 1) for x in idxs]
+        chosen = [samples[x] for x in idxs]
+        print(f"[phases] setup={chosen[0]['time_ms']}ms top={chosen[1]['time_ms']}ms "
+              f"impact={chosen[2]['time_ms']}ms ft={chosen[3]['time_ms']}ms")
 
-    # ── Follow-through: first frame where wrists are higher than impact ────────
-    # Must be at least 3 sampled frames after impact; prefer not the last frame.
-    MIN_FT_GAP = 3
-    ft_i = min(impact_i + MIN_FT_GAP, n - 1)
-    found_ft = False
-    for s in samples[impact_i + MIN_FT_GAP : n]:
-        if s["wrist_y"] is not None and s["wrist_y"] < impact_wrist_y - 0.04:
-            ft_i = s["i"]
-            found_ft = True
-            if ft_i < n - 2:   # prefer not the absolute last frame
-                break
-
-    if not found_ft:
-        remaining = n - 1 - impact_i
-        ft_offset = max(MIN_FT_GAP, int(remaining * 0.25))
-        ft_i = min(impact_i + ft_offset, max(n - 2, impact_i + 1))
-
-    print(f"[phases] ft_i={ft_i} gap={ft_i - impact_i} frames after impact "
-          f"(found_by_wrist={found_ft})")
-
-    # Enforce strict ordering
-    indices = [setup_i, top_i, impact_i, ft_i]
-    for k in range(1, 4):
-        if indices[k] <= indices[k - 1]:
-            indices[k] = indices[k - 1] + 1
-    indices = [min(i, n - 1) for i in indices]
-
-    times = [int(min(duration_ms - 80, max(0, samples[i]["time_ms"]))) for i in indices]
-
-    print(f"[phases] landmark-based: setup={times[0]}ms top={times[1]}ms "
-          f"impact={times[2]}ms ft={times[3]}ms "
-          f"(lm coverage {lm_count}/{n}, indices {indices})")
-    return times
+    return [{"frame": s["frame_b64"], "overlay_frame": None,
+              "landmarks": s["landmarks"], "time_ms": s["time_ms"]}
+            for s in chosen]
 
 
 def transcode_to_h264(input_path: str) -> str:
@@ -377,8 +318,7 @@ def extract_key_frames(req: ExtractKeyFramesRequest):
 
         cap, _, cleanup = open_video(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        ts_list = req.timestamps_ms or detect_phases_landmark_based(cap, fps)
-        results = extract_frames_with_pose(cap, ts_list, fps)
+        results = detect_and_extract(cap, fps)
 
         cap.release()
         if cleanup and os.path.exists(cleanup):
@@ -394,10 +334,7 @@ def extract_key_frames(req: ExtractKeyFramesRequest):
 
 
 @app.post("/extract-key-frames-upload")
-async def extract_key_frames_upload(
-    video: UploadFile = File(...),
-    timestamps_ms: str = Form(""),
-):
+async def extract_key_frames_upload(video: UploadFile = File(...)):
     tmp_path = None
     cleanup = None
     try:
@@ -407,8 +344,7 @@ async def extract_key_frames_upload(
 
         cap, _, cleanup = open_video(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        ts_list = [int(t.strip()) for t in timestamps_ms.split(",") if t.strip()] if timestamps_ms.strip() else detect_phases_landmark_based(cap, fps)
-        results = extract_frames_with_pose(cap, ts_list, fps)
+        results = detect_and_extract(cap, fps)
 
         cap.release()
         return {"frames": results}
