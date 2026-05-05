@@ -58,11 +58,11 @@ class ExtractKeyFramesRequest(BaseModel):
 
 def find_swing_burst(cap, total_frames: int, fps: float):
     """
-    Fast motion scan (20 frames, no MediaPipe) to find where the swing
-    actually happens. Returns (start_frame, end_frame).
-    Without this, even-spaced sampling picks up the static address period.
+    Fast motion scan to find the MAIN swing burst (longest contiguous
+    high-motion window). Using first→last active frame was too wide —
+    it included setup, post-swing walking off, camera movement, etc.
     """
-    scan_n = min(20, total_frames)
+    scan_n = min(24, total_frames)
     step = max(1, total_frames // scan_n)
     scores, prev_gray = [], None
 
@@ -79,21 +79,38 @@ def find_swing_burst(cap, total_frames: int, fps: float):
         scores.append((i, score))
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    if not scores:
+    if len(scores) < 3:
         return 0, total_frames - 1
 
     motion = np.array([s for _, s in scores], dtype=np.float32)
-    threshold = max(float(np.percentile(motion, 60)), float(motion.mean() * 0.75), 1.2)
-    active = [fi for fi, s in scores if s >= threshold]
-    if len(active) < 2:
+    threshold = max(float(np.percentile(motion, 55)), float(motion.mean() * 0.7), 1.0)
+    active_flags = [s >= threshold for _, s in scores]
+
+    # Find the longest contiguous run of active frames
+    max_gap = max(1, int(len(scores) * 0.10))  # allow small gaps within a run
+    runs, run_start, prev_active = [], None, -max_gap - 1
+    for idx in range(len(scores)):
+        if active_flags[idx]:
+            if run_start is None or idx - prev_active > max_gap:
+                run_start = idx
+            prev_active = idx
+        elif run_start is not None and idx - prev_active > max_gap:
+            runs.append((run_start, prev_active))
+            run_start = None
+    if run_start is not None:
+        runs.append((run_start, prev_active))
+
+    if not runs:
         return 0, total_frames - 1
 
-    pad = step * 3
-    start = max(0, active[0] - pad)
-    end   = min(total_frames - 1, active[-1] + pad)
-    print(f"[burst] swing burst: {int(start/fps*1000)}ms – {int(end/fps*1000)}ms "
-          f"(frames {start}–{end} of {total_frames})")
-    return start, end
+    # Pick the run with the highest total motion (the actual swing)
+    best = max(runs, key=lambda r: sum(scores[i][1] for i in range(r[0], r[1] + 1)))
+    start_fi = max(0, scores[best[0]][0] - step)
+    end_fi   = min(total_frames - 1, scores[best[1]][0] + step)
+
+    print(f"[burst] swing burst: {int(start_fi/fps*1000)}ms–{int(end_fi/fps*1000)}ms "
+          f"({len(runs)} run(s), picked run {best})")
+    return start_fi, end_fi
 
 
 def detect_and_extract(cap, fps: float) -> List[dict]:
