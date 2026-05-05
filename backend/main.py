@@ -168,7 +168,14 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
     setup_x = samples[si]["smooth_x"] or samples[si]["wx"] or 0.50
 
     if use_motion:
-        # Compute 2D distance from contact zone for every sample
+        # Signed y-velocity: negative = wrist going UP, positive = going DOWN
+        for i in range(1, n):
+            sy = samples[i]["smooth_y"]
+            py = samples[i - 1]["smooth_y"]
+            if sy is not None and py is not None:
+                samples[i]["vy"] = sy - py   # signed
+
+        # Compute 2D distance from contact zone for impact detection
         for s in samples:
             sy = s["smooth_y"]
             sx = s["smooth_x"]
@@ -177,13 +184,33 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
                 dx = (sx or setup_x) - setup_x
                 s["dist"] = (dy * dy + dx * dx) ** 0.5
 
-        # ── 4b. Top: max distance from contact zone before 65% ────────────────
+        # ── 4b. Top of backswing ──────────────────────────────────────────────
+        # Primary: direction change — vy goes negative→positive (up→down = top)
+        # Fallback: minimum wrist Y (highest on screen) before 50%
+        # Cap at 50% — the top ALWAYS occurs in the first half of the swing.
+        top_end = max(si + 3, int(n * 0.50))
         ti = min(si + 1, n - 1)
-        max_dist = -1.0
-        for s in samples[si + 1 : max(si + 2, int(n * 0.65))]:
-            if s["dist"] is not None and s["dist"] > max_dist:
-                max_dist = s["dist"]
-                ti = s["i"]
+
+        found_top = False
+        for k in range(si + 1, min(top_end, n - 1)):
+            vy_curr = samples[k].get("vy")
+            vy_next = samples[k + 1].get("vy") if k + 1 < n else None
+            if vy_curr is not None and vy_next is not None:
+                if vy_curr <= 0 and vy_next > 0:   # direction reversal = top
+                    ti = samples[k]["i"]
+                    found_top = True
+                    break
+
+        if not found_top:
+            # Fallback: frame with minimum wrist Y (physically highest point)
+            min_wy = float("inf")
+            for s in samples[si + 1 : top_end]:
+                if s["smooth_y"] is not None and s["smooth_y"] < min_wy:
+                    min_wy = s["smooth_y"]
+                    ti = s["i"]
+
+        print(f"[phases] top method={'direction_change' if found_top else 'min_y'} "
+              f"top_i={ti} top_ms={samples[ti]['time_ms']}ms")
 
         # ── 4c. Impact: min distance from contact zone after top ─────────────
         # Additionally bias early using peak wrist speed
