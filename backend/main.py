@@ -152,9 +152,15 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
     burst_start, burst_end = find_swing_burst(cap, total_frames, fps)
     span = max(1, burst_end - burst_start)
 
-    # 2 setup frames just before burst + 36 frames uniformly inside burst
-    pre = [max(0, burst_start - int(span * 0.25)),
-           max(0, burst_start - int(span * 0.08))]
+    # 3 pre-burst frames with specific roles:
+    #   [0] = 5% of total video  → true address (static setup, always early)
+    #   [1] = burst_start - 25%  → mid-backswing
+    #   [2] = burst_start - 5%   → just before fast downswing = top of backswing
+    pre = [
+        max(0, int(total_frames * 0.05)),
+        max(0, burst_start - int(span * 0.25)),
+        max(0, burst_start - max(1, int(span * 0.05))),
+    ]
     n_burst = max(4, min(36, span))
     inside  = [burst_start + int(i * span / n_burst) for i in range(n_burst)]
     all_fi  = sorted(set(pre + inside))
@@ -215,13 +221,12 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
         bsi = len(pre)   # first burst sample index
         bn  = n - bsi    # burst sample count
 
-        # ADDRESS — always samples[0]: the pre-burst frame captured before any
-        # swing motion.  No wrist detection needed — it's structurally correct.
+        # ADDRESS — samples[0]: 5% into total video = static setup before swing
         si = 0
 
-        # TOP — fixed 30% through burst. Wrist-Y detection was unreliable;
-        # the backswing transition always happens around 25–35% of the burst.
-        ti = bsi + max(1, int(bn * 0.30))
+        # TOP — samples[bsi-1]: last pre-burst frame = just before the fast
+        # downswing starts = structurally the top of the backswing
+        ti = bsi - 1 if bsi > 0 else bsi
 
         # IMPACT — max wrist Y (lowest point on screen = club at ball).
         # This is reliable and already tested to work correctly.
