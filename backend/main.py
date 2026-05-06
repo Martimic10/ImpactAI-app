@@ -58,11 +58,12 @@ class ExtractKeyFramesRequest(BaseModel):
 
 def find_swing_burst(cap, total_frames: int, fps: float):
     """
-    Fast motion scan to find the MAIN swing burst (longest contiguous
-    high-motion window). Using first→last active frame was too wide —
-    it included setup, post-swing walking off, camera movement, etc.
+    Scan for the main swing burst.
+    Only considers runs that START before 75% of the video —
+    the actual swing never begins in the last quarter of the clip.
+    Picks the run with the highest total motion score among those.
     """
-    scan_n = min(24, total_frames)
+    scan_n = min(40, total_frames)
     step = max(1, total_frames // scan_n)
     scores, prev_gray = [], None
 
@@ -86,8 +87,7 @@ def find_swing_burst(cap, total_frames: int, fps: float):
     threshold = max(float(np.percentile(motion, 55)), float(motion.mean() * 0.7), 1.0)
     active_flags = [s >= threshold for _, s in scores]
 
-    # Find the longest contiguous run of active frames
-    max_gap = max(1, int(len(scores) * 0.10))  # allow small gaps within a run
+    max_gap = max(1, int(len(scores) * 0.10))
     runs, run_start, prev_active = [], None, -max_gap - 1
     for idx in range(len(scores)):
         if active_flags[idx]:
@@ -103,13 +103,17 @@ def find_swing_burst(cap, total_frames: int, fps: float):
     if not runs:
         return 0, total_frames - 1
 
-    # Pick the run with the highest total motion (the actual swing)
-    best = max(runs, key=lambda r: sum(scores[i][1] for i in range(r[0], r[1] + 1)))
-    start_fi = max(0, scores[best[0]][0] - step)
-    end_fi   = min(total_frames - 1, scores[best[1]][0] + step)
+    # Only consider runs that START before 75% of the video
+    cutoff_idx = int(len(scores) * 0.75)
+    early_runs = [r for r in runs if r[0] < cutoff_idx]
+    candidates = early_runs if early_runs else runs
 
-    print(f"[burst] swing burst: {int(start_fi/fps*1000)}ms–{int(end_fi/fps*1000)}ms "
-          f"({len(runs)} run(s), picked run {best})")
+    best = max(candidates, key=lambda r: sum(scores[i][1] for i in range(r[0], r[1] + 1)))
+    start_fi = max(0, scores[best[0]][0] - step)
+    end_fi   = min(total_frames - 1, scores[best[1]][0] + step * 2)
+
+    print(f"[burst] {int(start_fi/fps*1000)}ms–{int(end_fi/fps*1000)}ms "
+          f"({len(runs)} runs, {len(candidates)} early, picked {best})")
     return start_fi, end_fi
 
 
