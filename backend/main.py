@@ -212,51 +212,58 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
 
     # ── 4. Phase detection ────────────────────────────────────────────────────
     if use_physics:
-        bsi = len(pre)  # index where burst samples begin
+        bsi  = len(pre)          # first burst sample index
+        bn   = n - bsi           # number of burst samples
+        # Minimum gap between phases: at least 12% of burst samples
+        gap  = max(1, int(bn * 0.12))
 
-        # ── IMPACT first — max wrist Y (lowest on screen = club at ball) ──────
-        ii = bsi
+        # ── IMPACT — max wrist Y (lowest on screen) in burst ─────────────────
+        ii = bsi + int(bn * 0.62)        # default: 62% through burst
         max_wy = -1.0
         for i in range(bsi, n):
             wy = samples[i].get("sy")
             if wy is not None and wy > max_wy:
                 max_wy, ii = wy, i
-        imp_wy = samples[ii]["sy"] or 0.70
+        imp_wy = samples[ii].get("sy") or 0.70
 
-        # ── TOP — min wrist Y (highest on screen) anywhere BEFORE impact ──────
-        ti = bsi
+        # ── TOP — min wrist Y before impact ───────────────────────────────────
+        ti = bsi + int((ii - bsi) * 0.40)   # default: 40% of way to impact
         min_wy = float("inf")
         for i in range(bsi, ii):
             wy = samples[i].get("sy")
             if wy is not None and wy < min_wy:
                 min_wy, ti = wy, i
+        # If top ended up too close to impact, push it back
+        if ii - ti < gap:
+            ti = max(bsi, ii - gap)
 
-        # ── SETUP — last pre-burst frame with pose; fallback = first burst
-        # frame before top where wrist Y is close to impact (near ball height) ─
-        si = bsi  # default: first burst frame
-        found = False
-        for i in range(bsi - 1, -1, -1):   # pre-burst frames, newest first
+        # ── ADDRESS — last pre-burst frame with pose, or first burst frame
+        # where wrists are still near ball height ─────────────────────────────
+        si = bsi                           # absolute fallback
+        for i in range(bsi - 1, -1, -1):  # pre-burst, newest first
             if samples[i]["wy"] is not None:
                 si = i
-                found = True
                 break
-        if not found:
-            # No pre-burst landmarks — find first burst frame where wrist is
-            # still near ball height (wrists haven't lifted into backswing yet)
+        else:
+            # No pre-burst pose: first burst frame before top near ball height
             for i in range(bsi, ti):
                 wy = samples[i].get("sy")
-                if wy is not None and wy > imp_wy - 0.12:
+                if wy is not None and wy > imp_wy - 0.15:
                     si = i
                     break
+        # If address still too close to top, use 10% of burst before top
+        if ti - si < gap:
+            si = max(0, ti - gap)
 
         # ── FOLLOW-THROUGH — fixed 80% through burst ─────────────────────────
-        ft_target = bsi + int((n - bsi) * 0.80)
-        fi2 = min(max(ii + 2, ft_target), n - 1)
+        fi2 = min(max(ii + gap, bsi + int(bn * 0.80)), n - 1)
 
         chosen_idx = [si, ti, ii, fi2]
-        print(f"[phases] impact_wy={imp_wy:.3f} top_wy={min_wy:.3f} lm={lm_count}/{n}  "
-              f"setup={samples[si]['time_ms']}ms top={samples[ti]['time_ms']}ms "
-              f"impact={samples[ii]['time_ms']}ms ft={samples[fi2]['time_ms']}ms")
+        print(f"[phases] lm={lm_count}/{n} gap={gap}  "
+              f"setup={samples[si]['time_ms']}ms(#{si}) "
+              f"top={samples[ti]['time_ms']}ms(#{ti}) "
+              f"impact={samples[ii]['time_ms']}ms(#{ii}) "
+              f"ft={samples[fi2]['time_ms']}ms(#{fi2})")
     else:
         # Fallback: fixed burst percentages
         bsi = len(pre)
