@@ -1,6 +1,6 @@
 import * as LegacyFS from 'expo-file-system/legacy';
 import { supabase } from '@/lib/supabase';
-import { SwingResult, VisualAnalysis, FrameAnalysis, SwingPhase, PoseLandmark } from '@/types';
+import { SwingResult, VisualAnalysis, FrameAnalysis, SwingPhase, PoseLandmark, TemporalMetrics } from '@/types';
 
 const BUCKET = 'swing-videos';
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
@@ -27,10 +27,10 @@ function buildCoachingNotes(result: SwingResult): Record<SwingPhase, string> {
   const r = result.scoreReasoning;
   const issue = result.primaryIssue ?? 'swing issue';
   return {
-    setup:  r?.setup ?? `Check your ${result.selectedClub ?? 'club'} setup — stance, grip, and ball position.`,
-    top:    r?.swingPath ?? `At the top: ${issue.toLowerCase().includes('path') ? issue : 'evaluate your backswing plane and shoulder turn.'}`,
-    impact: r?.contact ?? (result.contactPrediction ?? `Impact: ${result.ballFlightPrediction ?? 'focus on solid contact.'}`),
-    finish: r?.balance ?? 'Hold a balanced finish — weight fully on lead foot, chest facing target.',
+    setup:  r?.position ?? r?.setup  ?? `Check your ${result.selectedClub ?? 'club'} setup — stance, grip, and ball position.`,
+    top:    r?.sequence ?? r?.swingPath ?? `At the top: ${issue.toLowerCase().includes('path') ? issue : 'evaluate your backswing plane and shoulder turn.'}`,
+    impact: r?.contact  ?? (result.contactPrediction ?? `Impact: ${result.ballFlightPrediction ?? 'focus on solid contact.'}`),
+    finish: r?.stability ?? r?.balance ?? 'Hold a balanced finish — weight fully on lead foot, chest facing target.',
   };
 }
 
@@ -46,9 +46,12 @@ interface BackendFrameResult {
   time_ms?: number;
 }
 
-async function extractViaBackend(
-  videoUrl: string
-): Promise<BackendFrameResult[] | null> {
+interface BackendResult {
+  frames: BackendFrameResult[];
+  metrics: TemporalMetrics | null;
+}
+
+async function extractViaBackend(videoUrl: string): Promise<BackendResult | null> {
   try {
     const res = await fetch(`${BACKEND_URL}/extract-key-frames`, {
       method: 'POST',
@@ -64,7 +67,7 @@ async function extractViaBackend(
       return null;
     }
     const json = await res.json();
-    return (json.frames ?? []) as BackendFrameResult[];
+    return { frames: (json.frames ?? []) as BackendFrameResult[], metrics: json.metrics ?? null };
   } catch (e) {
     console.warn('[visualAnalysis] backend call threw:', e);
     return null;
@@ -96,9 +99,7 @@ async function uploadFrame(
 }
 
 // Sends the local video file directly to the backend (for file:// URIs)
-async function extractViaBackendUpload(
-  localUri: string
-): Promise<BackendFrameResult[] | null> {
+async function extractViaBackendUpload(localUri: string): Promise<BackendResult | null> {
   try {
     const formData = new FormData();
     formData.append('video', {
@@ -118,7 +119,7 @@ async function extractViaBackendUpload(
       return null;
     }
     const json = await res.json();
-    return (json.frames ?? []) as BackendFrameResult[];
+    return { frames: (json.frames ?? []) as BackendFrameResult[], metrics: json.metrics ?? null };
   } catch (e) {
     console.warn('[visualAnalysis] backend upload threw:', e);
     return null;
@@ -192,12 +193,13 @@ export async function generateVisualAnalysis(
   // Prefer backend — works in Expo Go, handles frames + landmarks in one call
   if (BACKEND_URL) {
     console.log('[visualAnalysis] using backend extraction for', swingId);
-    const backendFrames = videoUri.startsWith('http')
+    const backendResult = videoUri.startsWith('http')
       ? await extractViaBackend(videoUri)
       : await extractViaBackendUpload(videoUri);
 
-    if (backendFrames && backendFrames.length === 4) {
-      const successCount = backendFrames.filter((f: BackendFrameResult) => f.frame).length;
+    if (backendResult && backendResult.frames.length === 4) {
+      const { frames: bf, metrics } = backendResult;
+      const successCount = bf.filter((f) => f.frame).length;
       console.log(`[visualAnalysis] backend returned ${successCount}/4 frames`);
 
       if (successCount < 2) {
@@ -205,25 +207,36 @@ export async function generateVisualAnalysis(
         return null;
       }
 
-      // Upload frames to Supabase storage in parallel
+      // If backend computed a deterministic tempo score, patch it onto the swing
+      if (metrics?.computedTempoScore != null) {
+        (async () => {
+          try {
+            const { data } = await supabase.from('swings').select('result_json').eq('id', swingId).single();
+            if (!data?.result_json) return;
+            const updated = {
+              ...data.result_json,
+              temporalMetrics: metrics,
+              scores: { ...data.result_json.scores, tempoScore: metrics.computedTempoScore },
+            };
+            await supabase.from('swings').update({ result_json: updated }).eq('id', swingId);
+          } catch { /* non-fatal */ }
+        })();
+      }
+
       const uploadedUrls = await Promise.all(
-        PHASES.map((phase, i) => {
-          const f = backendFrames[i];
-          return f.frame ? uploadFrame(f.frame, userId, swingId, phase) : Promise.resolve(null);
-        })
+        PHASES.map((phase, i) =>
+          bf[i].frame ? uploadFrame(bf[i].frame!, userId, swingId, phase) : Promise.resolve(null)
+        )
       );
-      const landmarkCount = backendFrames.filter((f: BackendFrameResult) => f.landmarks).length;
-      console.log(`[visualAnalysis] landmarks detected: ${landmarkCount}/4`);
+      console.log(`[visualAnalysis] landmarks: ${bf.filter((f) => f.landmarks).length}/4`);
 
       return {
-        setup:  buildFrame('setup',  uploadedUrls[0], notes.setup,  backendFrames[0]?.landmarks, undefined, backendFrames[0]?.time_ms),
-        top:    buildFrame('top',    uploadedUrls[1], notes.top,    backendFrames[1]?.landmarks, undefined, backendFrames[1]?.time_ms),
-        impact: buildFrame('impact', uploadedUrls[2], notes.impact, backendFrames[2]?.landmarks, undefined, backendFrames[2]?.time_ms),
-        finish: buildFrame('finish', uploadedUrls[3], notes.finish, backendFrames[3]?.landmarks, undefined, backendFrames[3]?.time_ms),
+        setup:  buildFrame('setup',  uploadedUrls[0], notes.setup,  bf[0]?.landmarks, undefined, bf[0]?.time_ms),
+        top:    buildFrame('top',    uploadedUrls[1], notes.top,    bf[1]?.landmarks, undefined, bf[1]?.time_ms),
+        impact: buildFrame('impact', uploadedUrls[2], notes.impact, bf[2]?.landmarks, undefined, bf[2]?.time_ms),
+        finish: buildFrame('finish', uploadedUrls[3], notes.finish, bf[3]?.landmarks, undefined, bf[3]?.time_ms),
       };
     }
-    // Backend is configured but failed — return null rather than falling back to
-    // local extraction which has no landmarks and would overwrite good data.
     console.warn('[visualAnalysis] backend failed — not falling back to local (would lose landmarks)');
     return null;
   }
@@ -261,34 +274,34 @@ export async function generateVisualAnalysisPreview(
 
   const notes = buildCoachingNotes(result);
   console.log('[visualAnalysis] using fast preview extraction for', swingId);
-  const backendFrames = videoUri.startsWith('http')
+  const backendResult = videoUri.startsWith('http')
     ? await extractViaBackend(videoUri)
     : await extractViaBackendUpload(videoUri);
 
-  if (!backendFrames || backendFrames.length !== 4) return null;
-  const successCount = backendFrames.filter((f: BackendFrameResult) => f.frame).length;
+  if (!backendResult || backendResult.frames.length !== 4) return null;
+  const { frames: bf } = backendResult;
+  const successCount = bf.filter((f) => f.frame).length;
   if (successCount < 2) return null;
 
-  const inlineUrls = backendFrames.map((f) => f.frame ? `data:image/jpeg;base64,${f.frame}` : null);
+  const inlineUrls = bf.map((f) => f.frame ? `data:image/jpeg;base64,${f.frame}` : null);
   const preview: VisualAnalysis = {
-    setup:  buildFrame('setup',  inlineUrls[0], notes.setup,  backendFrames[0]?.landmarks, undefined, backendFrames[0]?.time_ms),
-    top:    buildFrame('top',    inlineUrls[1], notes.top,    backendFrames[1]?.landmarks, undefined, backendFrames[1]?.time_ms),
-    impact: buildFrame('impact', inlineUrls[2], notes.impact, backendFrames[2]?.landmarks, undefined, backendFrames[2]?.time_ms),
-    finish: buildFrame('finish', inlineUrls[3], notes.finish, backendFrames[3]?.landmarks, undefined, backendFrames[3]?.time_ms),
+    setup:  buildFrame('setup',  inlineUrls[0], notes.setup,  bf[0]?.landmarks, undefined, bf[0]?.time_ms),
+    top:    buildFrame('top',    inlineUrls[1], notes.top,    bf[1]?.landmarks, undefined, bf[1]?.time_ms),
+    impact: buildFrame('impact', inlineUrls[2], notes.impact, bf[2]?.landmarks, undefined, bf[2]?.time_ms),
+    finish: buildFrame('finish', inlineUrls[3], notes.finish, bf[3]?.landmarks, undefined, bf[3]?.time_ms),
   };
 
   const persist = async () => {
     const uploadedUrls = await Promise.all(
-      PHASES.map((phase, i) => {
-        const f = backendFrames[i];
-        return f.frame ? uploadFrame(f.frame, userId, swingId, phase) : Promise.resolve(null);
-      })
+      PHASES.map((phase, i) =>
+        bf[i].frame ? uploadFrame(bf[i].frame!, userId, swingId, phase) : Promise.resolve(null)
+      )
     );
     return {
-      setup:  buildFrame('setup',  uploadedUrls[0], notes.setup,  backendFrames[0]?.landmarks, undefined, backendFrames[0]?.time_ms),
-      top:    buildFrame('top',    uploadedUrls[1], notes.top,    backendFrames[1]?.landmarks, undefined, backendFrames[1]?.time_ms),
-      impact: buildFrame('impact', uploadedUrls[2], notes.impact, backendFrames[2]?.landmarks, undefined, backendFrames[2]?.time_ms),
-      finish: buildFrame('finish', uploadedUrls[3], notes.finish, backendFrames[3]?.landmarks, undefined, backendFrames[3]?.time_ms),
+      setup:  buildFrame('setup',  uploadedUrls[0], notes.setup,  bf[0]?.landmarks, undefined, bf[0]?.time_ms),
+      top:    buildFrame('top',    uploadedUrls[1], notes.top,    bf[1]?.landmarks, undefined, bf[1]?.time_ms),
+      impact: buildFrame('impact', uploadedUrls[2], notes.impact, bf[2]?.landmarks, undefined, bf[2]?.time_ms),
+      finish: buildFrame('finish', uploadedUrls[3], notes.finish, bf[3]?.landmarks, undefined, bf[3]?.time_ms),
     };
   };
 

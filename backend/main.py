@@ -631,11 +631,79 @@ def detect_and_extract(cap, fps: float, include_overlays: bool = False, quality:
     phase_fis = _phase_indices_from_pose(samples, total_frames, fps)
     if phase_fis is not None:
         phase_fis = refine_phase_indices(cap, fps, total_frames, phase_fis, quality)
-        return extract_phase_frames_at_indices(cap, fps, total_frames, phase_fis, include_overlays)
+        frames = extract_phase_frames_at_indices(cap, fps, total_frames, phase_fis, include_overlays)
+        metrics = compute_temporal_metrics(phase_fis, fps, samples)
+        return frames, metrics
 
     print("[pose-phases] insufficient pose track; falling back to motion burst structure")
     burst_start, burst_end = find_swing_burst(cap, total_frames, fps)
-    return extract_phase_frames_by_structure(cap, fps, total_frames, burst_start, burst_end)
+    frames = extract_phase_frames_by_structure(cap, fps, total_frames, burst_start, burst_end)
+    # Derive fallback phase_fis from burst for metric computation
+    span = max(1, burst_end - burst_start)
+    fallback_fis = [
+        int(total_frames * 0.08),
+        burst_start,
+        burst_start + int(span * 0.25),
+        burst_start + int(span * 0.82),
+    ]
+    metrics = compute_temporal_metrics(fallback_fis, fps, samples)
+    return frames, metrics
+
+
+def compute_temporal_metrics(phase_fis: List[int], fps: float, samples: List[Dict]) -> Dict:
+    """
+    Derive timing and smoothness metrics from phase frame indices.
+    Returns deterministic values the frontend can include in the AI prompt.
+    """
+    if len(phase_fis) != 4 or fps <= 0:
+        return {"backswingDurationMs": None, "downswingDurationMs": None,
+                "tempoRatio": None, "motionSmoothness": None, "computedTempoScore": None}
+
+    addr_fi, top_fi, impact_fi, ft_fi = phase_fis
+    backswing_ms = round((top_fi    - addr_fi)   / fps * 1000)
+    downswing_ms = round((impact_fi - top_fi)    / fps * 1000)
+    ft_ms        = round((ft_fi     - impact_fi) / fps * 1000)
+
+    tempo_ratio = round(backswing_ms / max(downswing_ms, 1), 2)
+
+    # Motion smoothness: inverse of motion variance in the backswing window
+    motion_vals = [
+        s.get("motion", 0.0) for s in samples
+        if addr_fi <= s.get("fi", -1) <= top_fi
+    ]
+    if len(motion_vals) >= 3:
+        arr = np.array(motion_vals, dtype=np.float32)
+        cv = float(np.std(arr)) / max(float(np.mean(arr)), 1e-6)  # coefficient of variation
+        smoothness = round(max(0, min(100, 100 - cv * 60)), 1)
+    else:
+        smoothness = None
+
+    # Deterministic tempo score from ratio (tour pros average ~3:1)
+    # 2.5–3.5 → 85-95, 2.0–4.0 → 70-84, outside → lower
+    if tempo_ratio is not None:
+        r = tempo_ratio
+        if 2.5 <= r <= 3.5:
+            tempo_score = round(85 + min(10, (1 - abs(r - 3.0)) * 10))
+        elif 2.0 <= r < 2.5 or 3.5 < r <= 4.0:
+            tempo_score = round(70 + (1 - abs(r - 3.0) / 1.5) * 14)
+        elif 1.5 <= r < 2.0 or 4.0 < r <= 5.0:
+            tempo_score = round(55 + (1 - abs(r - 3.0) / 3.0) * 14)
+        else:
+            tempo_score = round(max(30, 55 - abs(r - 3.0) * 8))
+        tempo_score = max(30, min(98, tempo_score))
+    else:
+        tempo_score = None
+
+    print(f"[metrics] backswing={backswing_ms}ms downswing={downswing_ms}ms "
+          f"ft={ft_ms}ms ratio={tempo_ratio} smoothness={smoothness} tempoScore={tempo_score}")
+
+    return {
+        "backswingDurationMs": backswing_ms,
+        "downswingDurationMs": downswing_ms,
+        "tempoRatio": tempo_ratio,
+        "motionSmoothness": smoothness,
+        "computedTempoScore": tempo_score,
+    }
 
 
 def transcode_to_h264(input_path: str) -> str:
@@ -895,16 +963,16 @@ def extract_key_frames(req: ExtractKeyFramesRequest):
         cap, _, cleanup = open_video(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         quality = req.quality if req.quality in ["fast", "accurate"] else "fast"
-        results = (
-            extract_frames_with_pose(cap, req.timestamps_ms, fps, req.include_overlays)
-            if req.timestamps_ms
-            else detect_and_extract(cap, fps, req.include_overlays, quality)
-        )
+        if req.timestamps_ms:
+            results = extract_frames_with_pose(cap, req.timestamps_ms, fps, req.include_overlays)
+            metrics = {}
+        else:
+            results, metrics = detect_and_extract(cap, fps, req.include_overlays, quality)
 
         cap.release()
         if cleanup and os.path.exists(cleanup):
             os.remove(cleanup)
-        return {"frames": results}
+        return {"frames": results, "metrics": metrics}
 
     except Exception as e:
         print(f"[extract-key-frames] error: {e}")
@@ -930,14 +998,14 @@ async def extract_key_frames_upload(
         cap, _, cleanup = open_video(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         quality = quality if quality in ["fast", "accurate"] else "fast"
-        results = detect_and_extract(cap, fps, include_overlays, quality)
+        results, metrics = detect_and_extract(cap, fps, include_overlays, quality)
 
         cap.release()
-        return {"frames": results}
+        return {"frames": results, "metrics": metrics}
 
     except Exception as e:
         print(f"[extract-key-frames-upload] error: {e}")
-        return {"frames": []}
+        return {"frames": [], "metrics": {}}
     finally:
         for p in [tmp_path, cleanup]:
             if p and os.path.exists(p):

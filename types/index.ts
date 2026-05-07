@@ -10,23 +10,40 @@ export interface User {
 }
 
 export interface SwingScores {
-  overallScore: number;    // 1-100
-  setupScore: number;      // 1-100
-  postureScore: number;    // 1-100
-  swingPathScore: number;  // 1-100
-  tempoScore: number;      // 1-100
-  balanceScore: number;    // 1-100
-  contactScore: number;    // 1-100
+  overallScore: number;    // 1-100 — weighted formula, not AI-invented
+  // v3 categories
+  positionScore: number;   // setup + top + impact geometry
+  tempoScore: number;      // backswing/downswing ratio — deterministic
+  sequenceScore: number;   // body-arm timing, kinematic order
+  stabilityScore: number;  // head movement, posture retention, balance
+  contactScore: number;    // impact posture, low-point, delivery
   confidence: number;      // 1-10 (analysis confidence)
+  // Legacy — kept so old saved swings still render
+  setupScore?: number;
+  postureScore?: number;
+  swingPathScore?: number;
+  balanceScore?: number;
 }
 
 export interface SwingScoreReasoning {
-  setup: string;
-  posture: string;
-  swingPath: string;
+  position: string;
   tempo: string;
-  balance: string;
+  sequence: string;
+  stability: string;
   contact: string;
+  // Legacy
+  setup?: string;
+  posture?: string;
+  swingPath?: string;
+  balance?: string;
+}
+
+export interface TemporalMetrics {
+  backswingDurationMs: number | null;
+  downswingDurationMs: number | null;
+  tempoRatio: number | null;          // backswing / downswing (3:1 = ideal tour tempo)
+  motionSmoothness: number | null;    // 0-100, higher = smoother
+  computedTempoScore: number | null;  // deterministic score from ratio
 }
 
 export interface SwingResult {
@@ -35,10 +52,10 @@ export interface SwingResult {
   clubMatch: 'match' | 'possible_mismatch' | 'unclear';
   clubMatchReason: string;
   cameraAngle: 'down-the-line' | 'face-on' | 'unclear';
-  // New structured scoring (v2)
   scores?: SwingScores;
   scoreReasoning?: SwingScoreReasoning;
-  // Legacy single score — kept for backwards compat with old saved swings
+  temporalMetrics?: TemporalMetrics;
+  // Legacy
   confidence?: number;
   primaryIssue: string;
   issueCategory: string;
@@ -57,12 +74,11 @@ export interface SwingResult {
   summary: string;
 }
 
-// Helper — get the overall 1-100 score from any swing (old or new schema)
+// Helper — get the overall 1-100 score from any swing (handles all schema versions)
 export function getSwingScore(result: SwingResult | null | undefined): number {
   if (!result) return 50;
   if (result.scores?.overallScore) {
     const s = result.scores.overallScore;
-    // Auto-correct if AI returned 1-10 scale instead of 1-100
     return s <= 10 ? s * 10 : s;
   }
   if (result.confidence) return Math.round(result.confidence * 10);

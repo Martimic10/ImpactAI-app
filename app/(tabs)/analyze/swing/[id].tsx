@@ -22,8 +22,10 @@ import { supabase } from '@/lib/supabase';
 import { Swing, getSwingScore, SwingPhase, VisualAnalysis } from '@/types';
 import { useTheme } from '@/hooks/useTheme';
 import { useAppColors } from '@/lib/theme';
-import { generateVisualAnalysis, saveVisualAnalysis, VISUAL_ANALYSIS_VERSION } from '@/lib/visualAnalysis';
+import { generateVisualAnalysisPreview, saveVisualAnalysis, VISUAL_ANALYSIS_VERSION } from '@/lib/visualAnalysis';
 import { SwingOverlay } from '@/components/SwingOverlay';
+import { hasProAccess } from '@/lib/plans';
+import { PaywallModal } from '@/components/PaywallModal';
 
 const { width: SW, height: SH } = Dimensions.get('window');
 
@@ -76,7 +78,6 @@ function FullscreenVideoViewer({
 
   function togglePhase(phase: SwingPhase) {
     if (activePhase === phase) {
-      // Tap same phase again → dismiss and resume video
       setActivePhase(null);
       player.play();
       setIsPlaying(true);
@@ -85,6 +86,12 @@ function FullscreenVideoViewer({
       setShowPose(true);
       player.pause();
       setIsPlaying(false);
+      // Seek to the phase timestamp so the video freezes at the right frame
+      // even when there is no stored imageUrl
+      const timeMs = visualAnalysis?.[phase]?.timeMs;
+      if (timeMs != null) {
+        player.currentTime = timeMs / 1000;
+      }
     }
   }
 
@@ -106,8 +113,7 @@ function FullscreenVideoViewer({
   }
 
   const activeFrame = activePhase ? visualAnalysis?.[activePhase] : null;
-  const hasPose = !!(activeFrame?.landmarks && activeFrame.landmarks.length >= 25)
-               || !!activeFrame?.overlayImageUrl;
+  const hasPose = !!(activeFrame?.landmarks && activeFrame.landmarks.length >= 29);
   const videoH = SH * 0.52;
   const frameW = Math.min(SW, videoH * frameAspect);
   const frameH = frameW / frameAspect;
@@ -159,7 +165,7 @@ function FullscreenVideoViewer({
             nativeControls={false}
           />
 
-          {/* Frame freeze + skeleton when a phase is selected */}
+          {/* Frozen frame image — only when imageUrl available */}
           {activeFrame?.imageUrl ? (
             <View style={StyleSheet.absoluteFill} pointerEvents="none">
               <Image
@@ -171,26 +177,23 @@ function FullscreenVideoViewer({
                   if (width > 0 && height > 0) setFrameAspect(width / height);
                 }}
               />
-              {showPose && activeFrame.overlayImageUrl && (
-                <Image
-                  source={{ uri: activeFrame.overlayImageUrl, cache: 'reload' }}
-                  style={StyleSheet.absoluteFill}
-                  resizeMode="contain"
-                />
-              )}
-              {showPose && activeFrame.landmarks && activeFrame.landmarks.length >= 25 && (
-                <View style={[fs.poseFrame, { left: frameLeft, top: frameTop, width: frameW, height: frameH }]}>
-                  <SwingOverlay landmarks={activeFrame.landmarks} width={frameW} height={frameH} />
-                </View>
-              )}
             </View>
           ) : null}
 
-          {/* Phase badge */}
-          {activePhase && (
-            <View style={fs.phaseBadge}>
-              <View style={fs.phaseDot} />
-              <Text style={fs.phaseBadgeText}>{PHASE_LABEL[activePhase]}</Text>
+          {/* Skeleton overlay — shows on top of video OR frozen frame whenever
+              a phase is active and landmarks exist, regardless of imageUrl */}
+          {activePhase && showPose && activeFrame?.landmarks && activeFrame.landmarks.length >= 29 && (
+            <View
+              style={[fs.poseFrame, { left: frameLeft, top: frameTop, width: frameW, height: frameH }]}
+              pointerEvents="none"
+            >
+              <SwingOverlay
+                landmarks={activeFrame.landmarks}
+                width={frameW}
+                height={frameH}
+                mode="minimal"
+                showGlow
+              />
             </View>
           )}
 
@@ -220,7 +223,7 @@ function FullscreenVideoViewer({
                 >
                   <Ionicons name="body-outline" size={12} color={showPose ? '#0D0D0D' : '#FFF'} />
                   <Text style={[fs.poseBtnText, showPose && fs.poseBtnTextOn]}>
-                    {showPose ? 'Hide Pose' : 'Pose'}
+                    {showPose ? 'Hide Overlay' : 'Overlay'}
                   </Text>
                 </TouchableOpacity>
               )}
@@ -367,22 +370,33 @@ function buildScoreRows(swing: Swing): ScoreRow[] {
   const s = swing.result_json.scores;
   const r = swing.result_json.scoreReasoning;
   if (s) {
+    // v3 schema — new category names
+    if (s.positionScore != null) {
+      return [
+        { label: 'Position',  value: clampScore(s.positionScore),  reason: r?.position },
+        { label: 'Tempo',     value: clampScore(s.tempoScore),     reason: r?.tempo },
+        { label: 'Sequence',  value: clampScore(s.sequenceScore),  reason: r?.sequence },
+        { label: 'Stability', value: clampScore(s.stabilityScore), reason: r?.stability },
+        { label: 'Contact',   value: clampScore(s.contactScore),   reason: r?.contact },
+      ];
+    }
+    // Legacy v2 schema — old field names
     return [
-      { label: 'Setup',      value: clampScore(s.setupScore),     reason: r?.setup },
-      { label: 'Posture',    value: clampScore(s.postureScore),   reason: r?.posture },
-      { label: 'Swing Path', value: clampScore(s.swingPathScore), reason: r?.swingPath },
-      { label: 'Tempo',      value: clampScore(s.tempoScore),     reason: r?.tempo },
-      { label: 'Balance',    value: clampScore(s.balanceScore),   reason: r?.balance },
-      { label: 'Contact',    value: clampScore(s.contactScore),   reason: r?.contact },
+      { label: 'Setup',      value: clampScore(s.setupScore ?? 50),     reason: r?.setup },
+      { label: 'Posture',    value: clampScore(s.postureScore ?? 50),   reason: r?.posture },
+      { label: 'Swing Path', value: clampScore(s.swingPathScore ?? 50), reason: r?.swingPath },
+      { label: 'Tempo',      value: clampScore(s.tempoScore),           reason: r?.tempo },
+      { label: 'Balance',    value: clampScore(s.balanceScore ?? 50),   reason: r?.balance },
+      { label: 'Contact',    value: clampScore(s.contactScore),         reason: r?.contact },
     ];
   }
   const base = clampScore(getSwingScore(swing.result_json));
   return [
-    { label: 'Posture',    value: metricFromScore(base, 4) },
-    { label: 'Tempo',      value: metricFromScore(base, -2) },
-    { label: 'Swing Path', value: metricFromScore(base, -10) },
-    { label: 'Balance',    value: metricFromScore(base, -5) },
-    { label: 'Contact',    value: metricFromScore(base, 1) },
+    { label: 'Position',  value: metricFromScore(base, 4) },
+    { label: 'Tempo',     value: metricFromScore(base, -2) },
+    { label: 'Sequence',  value: metricFromScore(base, -10) },
+    { label: 'Stability', value: metricFromScore(base, -5) },
+    { label: 'Contact',   value: metricFromScore(base, 1) },
     { label: 'Club Path',  value: metricFromScore(base, -8) },
   ];
 }
@@ -432,12 +446,14 @@ export default function SwingDetailScreen() {
     }
   };
   const { user } = useAuth();
+  const isPro = hasProAccess(user);
   const { swings } = useSwings(user?.id);
   const [directSwing, setDirectSwing] = useState<Swing | null>(null);
   const [fetching, setFetching] = useState(false);
   const [overlayMode, setOverlayMode] = useState<'original' | 'overlay'>('original');
   const [liveSwing, setLiveSwing] = useState<Swing | null>(null);
   const [showFullscreen, setShowFullscreen] = useState(false);
+  const [showPaywall, setShowPaywall] = useState(false);
   const [vaGenerating, setVaGenerating] = useState(false);
 
   const cached = swings.find((s) => s.id === id);
@@ -463,14 +479,24 @@ export default function SwingDetailScreen() {
     if (!user?.id || vaGenerating) return;
     console.log('[VA] starting generation for swing', target.id, 'video:', target.video_url.slice(0, 60));
     setVaGenerating(true);
-    generateVisualAnalysis(target.video_url, user.id, target.id, target.result_json)
-      .then((va) => {
-        console.log('[VA] generation result:', va ? 'SUCCESS' : 'NULL — check logs above');
-        if (va) {
-          saveVisualAnalysis(target.id, va);
+    generateVisualAnalysisPreview(target.video_url, user.id, target.id, target.result_json)
+      .then((generated) => {
+        console.log('[VA] generation result:', generated ? 'SUCCESS' : 'NULL — check logs above');
+        if (generated) {
           setLiveSwing((prev) => prev
-            ? { ...prev, visual_analysis: va, analysis_version: VISUAL_ANALYSIS_VERSION }
-            : { ...(target as Swing), visual_analysis: va, analysis_version: VISUAL_ANALYSIS_VERSION });
+            ? { ...prev, visual_analysis: generated.preview, analysis_version: VISUAL_ANALYSIS_VERSION }
+            : { ...(target as Swing), visual_analysis: generated.preview, analysis_version: VISUAL_ANALYSIS_VERSION });
+
+          setVaGenerating(false);
+          generated.persist()
+            .then((savedVa) => {
+              if (!savedVa) return;
+              saveVisualAnalysis(target.id, savedVa);
+              setLiveSwing((prev) => prev
+                ? { ...prev, visual_analysis: savedVa, analysis_version: VISUAL_ANALYSIS_VERSION }
+                : prev);
+            })
+            .catch((e) => console.error('[VA] background upload/save threw:', e));
         }
       })
       .catch((e) => console.error('[VA] generation threw:', e))
@@ -538,7 +564,10 @@ export default function SwingDetailScreen() {
             <VideoPlayerInline
               url={activeVideoUrl}
               onBack={goBack}
-              onExpand={() => setShowFullscreen(true)}
+              onExpand={() => {
+                if (!isPro) { setShowPaywall(true); return; }
+                setShowFullscreen(true);
+              }}
               onRegenerate={regenerateVisualAnalysis}
               hasVisualAnalysis={!!swing.visual_analysis}
               vaGenerating={vaGenerating}
@@ -717,7 +746,7 @@ export default function SwingDetailScreen() {
         </View>
       </ScrollView>
 
-      {/* Fullscreen video + frame overlay viewer */}
+      {/* Fullscreen video + frame overlay viewer — pro only */}
       {hasVideo && (
         <FullscreenVideoViewer
           url={activeVideoUrl}
@@ -726,6 +755,8 @@ export default function SwingDetailScreen() {
           onClose={() => setShowFullscreen(false)}
         />
       )}
+
+      <PaywallModal visible={showPaywall} onClose={() => setShowPaywall(false)} />
     </SafeAreaView>
   );
 }
@@ -929,15 +960,6 @@ const fs = StyleSheet.create({
   // ── Video ──
   videoArea: { width: SW, backgroundColor: '#000', overflow: 'hidden' },
   poseFrame: { position: 'absolute', zIndex: 4 },
-  phaseBadge: {
-    position: 'absolute', top: 12, left: 12, zIndex: 5,
-    flexDirection: 'row', alignItems: 'center', gap: 6,
-    backgroundColor: 'rgba(0,0,0,0.72)',
-    paddingHorizontal: 12, paddingVertical: 6,
-    borderRadius: 20, borderWidth: 1, borderColor: 'rgba(76,175,80,0.45)',
-  },
-  phaseDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: '#4CAF50' },
-  phaseBadgeText: { fontSize: 13, fontWeight: '700', color: '#FFF' },
   pauseHint: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center' },
   pauseCircle: {
     width: 64, height: 64, borderRadius: 32,
