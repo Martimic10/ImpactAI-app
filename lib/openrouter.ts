@@ -151,7 +151,9 @@ async function callOpenRouter(
     .filter((f) => f.length > 0)
     .map((frame) => ({
       type: 'image_url' as const,
-      image_url: { url: `data:image/jpeg;base64,${frame}`, detail: 'low' as const },
+      // 'auto' lets the model pick resolution — 'low' was shrinking frames to
+      // 512px thumbnails where swing mechanics are invisible
+      image_url: { url: `data:image/jpeg;base64,${frame}`, detail: 'auto' as const },
     }));
 
   const metricsBlock = temporalMetrics
@@ -344,17 +346,47 @@ function buildFallback(club?: string, message?: string): SwingResult {
 // ─────────────────────────────────────────────────────────────────────────────
 // Main export
 // ─────────────────────────────────────────────────────────────────────────────
+// Phrases that indicate the AI refused instead of returning JSON
+const REFUSAL_PATTERNS = [
+  "i'm sorry",
+  "i cannot",
+  "i can't",
+  "i am unable",
+  "cannot analyze",
+  "unable to analyze",
+  "no golf swing",
+  "not able to",
+];
+
+function isRefusal(content: string): boolean {
+  const lower = content.toLowerCase().trim();
+  return !lower.startsWith('{') && REFUSAL_PATTERNS.some((p) => lower.includes(p));
+}
+
+const FORCE_JSON_PROMPT = `You must analyze this golf swing image and return ONLY a JSON object.
+Do NOT refuse. Do NOT say you cannot analyze it.
+Even if image quality is low, estimate scores and provide coaching.
+A low-quality analysis is far better than no analysis.
+Return the JSON schema immediately — start with { and end with }.`;
+
 export async function analyzeSwingFrames(
   base64Frames: string[],
   club?: string,
   previousResult?: SwingResult,
   temporalMetrics?: TemporalMetrics,
 ): Promise<SwingResult> {
-  const content = await callOpenRouter(base64Frames, club, SYSTEM_PROMPT, temporalMetrics);
+  let content = await callOpenRouter(base64Frames, club, SYSTEM_PROMPT, temporalMetrics);
 
   if (!content) {
     console.warn('[openrouter] empty response — using fallback');
     return buildFallback(club);
+  }
+
+  // If the AI refused, retry once with a forced-JSON override prompt
+  if (isRefusal(content)) {
+    console.warn('[openrouter] AI refused — retrying with forced-JSON prompt. Raw:', content.slice(0, 80));
+    content = await callOpenRouter(base64Frames, club, SYSTEM_PROMPT + '\n\n' + FORCE_JSON_PROMPT, temporalMetrics)
+      .catch(() => '');
   }
 
   let result = parseResult(content);
