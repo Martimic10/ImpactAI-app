@@ -4,7 +4,8 @@ import { SwingResult, VisualAnalysis, FrameAnalysis, SwingPhase, PoseLandmark } 
 
 const BUCKET = 'swing-videos';
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
-export const VISUAL_ANALYSIS_VERSION = 6;
+export const VISUAL_ANALYSIS_VERSION = 8;
+const REQUEST_OVERLAY_IMAGES = false;
 
 const FALLBACK_PHASE_TIMES_MS: Record<SwingPhase, number> = {
   setup:  200,
@@ -52,7 +53,11 @@ async function extractViaBackend(
     const res = await fetch(`${BACKEND_URL}/extract-key-frames`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ video_url: videoUrl }),
+      body: JSON.stringify({
+        video_url: videoUrl,
+        include_overlays: REQUEST_OVERLAY_IMAGES,
+        quality: 'fast',
+      }),
     });
     if (!res.ok) {
       console.warn('[visualAnalysis] backend /extract-key-frames error:', res.status);
@@ -101,6 +106,8 @@ async function extractViaBackendUpload(
       name: 'swing.mp4',
       type: 'video/mp4',
     } as unknown as Blob);
+    formData.append('include_overlays', REQUEST_OVERLAY_IMAGES ? 'true' : 'false');
+    formData.append('quality', 'fast');
 
     const res = await fetch(`${BACKEND_URL}/extract-key-frames-upload`, {
       method: 'POST',
@@ -205,21 +212,14 @@ export async function generateVisualAnalysis(
           return f.frame ? uploadFrame(f.frame, userId, swingId, phase) : Promise.resolve(null);
         })
       );
-      const uploadedOverlayUrls = await Promise.all(
-        PHASES.map((phase, i) => {
-          const f = backendFrames[i];
-          return f.overlay_frame ? uploadFrame(f.overlay_frame, userId, swingId, `${phase}_overlay`) : Promise.resolve(null);
-        })
-      );
-
       const landmarkCount = backendFrames.filter((f: BackendFrameResult) => f.landmarks).length;
       console.log(`[visualAnalysis] landmarks detected: ${landmarkCount}/4`);
 
       return {
-        setup:  buildFrame('setup',  uploadedUrls[0], notes.setup,  backendFrames[0]?.landmarks, uploadedOverlayUrls[0], backendFrames[0]?.time_ms),
-        top:    buildFrame('top',    uploadedUrls[1], notes.top,    backendFrames[1]?.landmarks, uploadedOverlayUrls[1], backendFrames[1]?.time_ms),
-        impact: buildFrame('impact', uploadedUrls[2], notes.impact, backendFrames[2]?.landmarks, uploadedOverlayUrls[2], backendFrames[2]?.time_ms),
-        finish: buildFrame('finish', uploadedUrls[3], notes.finish, backendFrames[3]?.landmarks, uploadedOverlayUrls[3], backendFrames[3]?.time_ms),
+        setup:  buildFrame('setup',  uploadedUrls[0], notes.setup,  backendFrames[0]?.landmarks, undefined, backendFrames[0]?.time_ms),
+        top:    buildFrame('top',    uploadedUrls[1], notes.top,    backendFrames[1]?.landmarks, undefined, backendFrames[1]?.time_ms),
+        impact: buildFrame('impact', uploadedUrls[2], notes.impact, backendFrames[2]?.landmarks, undefined, backendFrames[2]?.time_ms),
+        finish: buildFrame('finish', uploadedUrls[3], notes.finish, backendFrames[3]?.landmarks, undefined, backendFrames[3]?.time_ms),
       };
     }
     // Backend is configured but failed — return null rather than falling back to
@@ -246,6 +246,53 @@ export async function generateVisualAnalysis(
     console.error('[visualAnalysis] local extraction threw:', e);
     return null;
   }
+}
+
+export async function generateVisualAnalysisPreview(
+  videoUri: string,
+  userId: string,
+  swingId: string,
+  result: SwingResult
+): Promise<{ preview: VisualAnalysis; persist: () => Promise<VisualAnalysis | null> } | null> {
+  if (!BACKEND_URL) {
+    const analysis = await generateVisualAnalysis(videoUri, userId, swingId, result);
+    return analysis ? { preview: analysis, persist: async () => analysis } : null;
+  }
+
+  const notes = buildCoachingNotes(result);
+  console.log('[visualAnalysis] using fast preview extraction for', swingId);
+  const backendFrames = videoUri.startsWith('http')
+    ? await extractViaBackend(videoUri)
+    : await extractViaBackendUpload(videoUri);
+
+  if (!backendFrames || backendFrames.length !== 4) return null;
+  const successCount = backendFrames.filter((f: BackendFrameResult) => f.frame).length;
+  if (successCount < 2) return null;
+
+  const inlineUrls = backendFrames.map((f) => f.frame ? `data:image/jpeg;base64,${f.frame}` : null);
+  const preview: VisualAnalysis = {
+    setup:  buildFrame('setup',  inlineUrls[0], notes.setup,  backendFrames[0]?.landmarks, undefined, backendFrames[0]?.time_ms),
+    top:    buildFrame('top',    inlineUrls[1], notes.top,    backendFrames[1]?.landmarks, undefined, backendFrames[1]?.time_ms),
+    impact: buildFrame('impact', inlineUrls[2], notes.impact, backendFrames[2]?.landmarks, undefined, backendFrames[2]?.time_ms),
+    finish: buildFrame('finish', inlineUrls[3], notes.finish, backendFrames[3]?.landmarks, undefined, backendFrames[3]?.time_ms),
+  };
+
+  const persist = async () => {
+    const uploadedUrls = await Promise.all(
+      PHASES.map((phase, i) => {
+        const f = backendFrames[i];
+        return f.frame ? uploadFrame(f.frame, userId, swingId, phase) : Promise.resolve(null);
+      })
+    );
+    return {
+      setup:  buildFrame('setup',  uploadedUrls[0], notes.setup,  backendFrames[0]?.landmarks, undefined, backendFrames[0]?.time_ms),
+      top:    buildFrame('top',    uploadedUrls[1], notes.top,    backendFrames[1]?.landmarks, undefined, backendFrames[1]?.time_ms),
+      impact: buildFrame('impact', uploadedUrls[2], notes.impact, backendFrames[2]?.landmarks, undefined, backendFrames[2]?.time_ms),
+      finish: buildFrame('finish', uploadedUrls[3], notes.finish, backendFrames[3]?.landmarks, undefined, backendFrames[3]?.time_ms),
+    };
+  };
+
+  return { preview, persist };
 }
 
 function buildFrame(

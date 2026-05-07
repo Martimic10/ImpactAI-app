@@ -9,7 +9,7 @@ import mediapipe as mp
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 from supabase import create_client, Client
 
 app = FastAPI(title="ImpactAI MediaPipe Service")
@@ -28,12 +28,9 @@ BUCKET = "swing-videos"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
-
-# Landmark drawing customisation — green joints with white skeleton lines
-LANDMARK_STYLE = mp_drawing.DrawingSpec(color=(76, 175, 80), thickness=4, circle_radius=4)
-CONNECTION_STYLE = mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=3)
+OVERLAY_GREEN = (76, 175, 80)
+OVERLAY_WHITE = (255, 255, 255)
+OVERLAY_MIN_VISIBILITY = 0.45
 
 
 class ProcessRequest(BaseModel):
@@ -54,6 +51,8 @@ def health():
 class ExtractKeyFramesRequest(BaseModel):
     video_url: str
     timestamps_ms: Optional[List[int]] = None
+    include_overlays: bool = False
+    quality: str = "fast"
 
 
 def find_swing_burst(cap, total_frames: int, fps: float):
@@ -117,22 +116,67 @@ def find_swing_burst(cap, total_frames: int, fps: float):
     return start_fi, end_fi
 
 
-def extract_phase_frames(cap, fps: float, total_frames: int,
-                         burst_start: int, burst_end: int) -> List[dict]:
+def find_top_of_backswing(cap, fps: float, fi_address: int, burst_start: int) -> int:
+    """
+    Find the top of backswing by locating the minimum-motion frame in the
+    window between address and burst_start. The pause at the top is the
+    moment of lowest movement before the downswing explosion begins.
+    """
+    # Search from 0.4s after address up to 0.08s before burst
+    search_start = fi_address + max(2, int(fps * 0.4))
+    search_end   = max(search_start + 2, burst_start - max(2, int(fps * 0.08)))
+
+    if search_end <= search_start:
+        return max(0, burst_start - int(fps * 0.2))
+
+    sample_step = max(1, (search_end - search_start) // 20)
+    motion_samples = []
+    prev_gray = None
+
+    for fi in range(search_start, search_end, sample_step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        roi = cv2.resize(gray[int(h*0.05):int(h*0.92), int(w*0.08):int(w*0.92)], (80, 140))
+        score = 0.0 if prev_gray is None else float(cv2.absdiff(roi, prev_gray).mean())
+        prev_gray = roi
+        motion_samples.append((fi, score))
+
+    if not motion_samples:
+        return max(0, burst_start - int(fps * 0.2))
+
+    # The top of backswing is the frame CLOSEST to burst_start that has
+    # near-minimum motion — i.e. the last pause before the downswing.
+    min_score = min(s for _, s in motion_samples)
+    threshold = min_score * 1.8  # frames within 80% of minimum
+    candidates = [(fi, s) for fi, s in motion_samples if s <= threshold]
+
+    # Pick the candidate closest to burst_start (most recent pause)
+    fi_top = max(candidates, key=lambda x: x[0])[0]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    return fi_top
+
+
+def extract_phase_frames_by_structure(cap, fps: float, total_frames: int,
+                                      burst_start: int, burst_end: int) -> List[dict]:
     """
     Pick exactly 4 frame indices by structure, run MediaPipe on each.
-    No wrist tracking, no speed, no smoothing — just frame positions.
 
-      address      = 8% into total video (static setup, always early)
-      top          = burst_start - 2 frames (last moment before downswing)
-      impact       = burst_start + 55% of burst span
+      address        = 8% into total video (static setup)
+      top            = minimum-motion frame between address and burst_start
+                       (the pause at the top of the backswing)
+      impact         = burst_start + 25% of burst span
+                       (early in the downswing, just at ball contact)
       follow_through = burst_start + 82% of burst span
     """
     span = max(1, burst_end - burst_start)
 
     fi_address = max(0, int(total_frames * 0.08))
-    fi_top     = max(0, burst_start - max(2, int(fps * 0.06)))   # ~2 frames before burst
-    fi_impact  = burst_start + int(span * 0.55)
+    fi_top     = find_top_of_backswing(cap, fps, fi_address, burst_start)
+    fi_impact  = burst_start + int(span * 0.25)
     fi_ft      = burst_start + int(span * 0.82)
 
     phase_fis = [fi_address, fi_top, fi_impact, fi_ft]
@@ -161,24 +205,422 @@ def extract_phase_frames(cap, fps: float, total_frames: int,
     return results
 
 
-def detect_and_extract(cap, fps: float) -> List[dict]:
+def _smooth(values: np.ndarray, window: int = 5) -> np.ndarray:
+    if len(values) == 0 or window <= 1:
+        return values
+    pad = window // 2
+    padded = np.pad(values, (pad, pad), mode="edge")
+    kernel = np.ones(window, dtype=np.float32) / window
+    return np.convolve(padded, kernel, mode="valid").astype(np.float32)
+
+
+def _norm_signal(values: np.ndarray) -> np.ndarray:
+    if len(values) == 0:
+        return values
+    lo = float(np.nanpercentile(values, 10))
+    hi = float(np.nanpercentile(values, 90))
+    if hi - lo < 1e-6:
+        return np.zeros_like(values, dtype=np.float32)
+    return np.clip((values - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+
+def _landmark_xy(landmarks, idx: int, min_visibility: float = 0.2):
+    lm = landmarks.landmark[idx]
+    if lm.visibility < min_visibility:
+        return None
+    return np.array([float(lm.x), float(lm.y)], dtype=np.float32), float(lm.visibility)
+
+
+def _midpoint(landmarks, left_idx: int, right_idx: int, min_visibility: float = 0.2):
+    left = _landmark_xy(landmarks, left_idx, min_visibility)
+    right = _landmark_xy(landmarks, right_idx, min_visibility)
+    points = [p for p in [left, right] if p is not None]
+    if not points:
+        return None
+    total_vis = sum(v for _, v in points)
+    xy = sum(p * v for p, v in points) / max(total_vis, 1e-6)
+    return xy, total_vis / len(points)
+
+
+def _body_scale(landmarks) -> float:
+    left_shoulder = _landmark_xy(landmarks, mp_pose.PoseLandmark.LEFT_SHOULDER.value, 0.1)
+    right_shoulder = _landmark_xy(landmarks, mp_pose.PoseLandmark.RIGHT_SHOULDER.value, 0.1)
+    left_hip = _landmark_xy(landmarks, mp_pose.PoseLandmark.LEFT_HIP.value, 0.1)
+    right_hip = _landmark_xy(landmarks, mp_pose.PoseLandmark.RIGHT_HIP.value, 0.1)
+    distances = []
+    for a, b in [(left_shoulder, right_shoulder), (left_hip, right_hip)]:
+        if a is not None and b is not None:
+            distances.append(float(np.linalg.norm(a[0] - b[0])))
+    return max(distances or [0.12], 0.08)
+
+
+def _preprocess(frame):
+    """CLAHE contrast enhancement — helps in flat/outdoor/overcast lighting."""
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    lab = cv2.merge([clahe.apply(l), a, b])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def _sample_pose_track(cap, fps: float, total_frames: int, quality: str = "fast") -> List[Dict]:
     """
-    Physics-based phase detection that works for any video:
+    Sample the whole clip and track the hand/wrist center. The phase detector uses
+    normalized pose coordinates so it is much less sensitive to clip length, fps,
+    pauses, or extra motion after the swing.
+    """
+    if total_frames <= 0:
+        return []
 
-    1. Motion scan finds the swing burst (ignores static address period)
-    2. 36 frames sampled densely within the burst + 2 pre-burst setup frames
-    3. Wrist 2D speed computed per frame
-    4. Phases detected from physical invariants of the golf swing:
+    step = max(1, int(round(fps / 30.0)))
+    max_samples = 180 if quality == "accurate" else 150
+    if total_frames / step > max_samples:
+        step = int(np.ceil(total_frames / max_samples))
 
-       SETUP   — most stable frame just before burst (wrist at address/ball height)
-       TOP     — local speed minimum in first half of burst
-                 (wrist momentarily stops at top of backswing)
-       IMPACT  — global speed maximum in burst
-                 (peak wrist velocity = club-ball contact, any camera angle)
-       FOLLOW  — first frame after impact where speed drops below 40% of peak
-                 AND wrist has moved past impact position
+    samples = []
+    prev_gray = None
+    # model_complexity=1 is meaningfully more accurate for golf side/bent-over poses
+    with mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=1,
+        smooth_landmarks=True,
+        enable_segmentation=False,
+        min_detection_confidence=0.3,
+        min_tracking_confidence=0.3,
+    ) as pose:
+        for fi in range(0, total_frames, step):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ret, frame = cap.read()
+            if not ret:
+                continue
 
-    Falls back to burst percentages when landmark coverage < 30%.
+            enhanced = _preprocess(frame)
+            gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape
+            roi = cv2.resize(gray[int(h * 0.05):int(h * 0.95), int(w * 0.05):int(w * 0.95)], (96, 160))
+            motion = 0.0 if prev_gray is None else float(cv2.absdiff(roi, prev_gray).mean())
+            prev_gray = roi
+
+            rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
+            det = pose.process(rgb)
+            if not det.pose_landmarks:
+                samples.append({"fi": fi, "time": fi / fps, "hand": None, "vis": 0.0,
+                                "scale": 0.12, "motion": motion})
+                continue
+
+            hand = _midpoint(
+                det.pose_landmarks,
+                mp_pose.PoseLandmark.LEFT_WRIST.value,
+                mp_pose.PoseLandmark.RIGHT_WRIST.value,
+                0.15,
+            )
+            if hand is None:
+                hand = _midpoint(
+                    det.pose_landmarks,
+                    mp_pose.PoseLandmark.LEFT_INDEX.value,
+                    mp_pose.PoseLandmark.RIGHT_INDEX.value,
+                    0.15,
+                )
+
+            if hand is None:
+                samples.append({"fi": fi, "time": fi / fps, "hand": None, "vis": 0.0,
+                                "scale": _body_scale(det.pose_landmarks), "motion": motion})
+            else:
+                samples.append({"fi": fi, "time": fi / fps, "hand": hand[0], "vis": hand[1],
+                                "scale": _body_scale(det.pose_landmarks), "motion": motion})
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    return samples
+
+
+def _phase_indices_from_pose(samples: List[Dict], total_frames: int, fps: float):
+    """
+    Simple, physically-grounded phase detection.
+
+    ADDRESS  — lowest-motion frame in the first 18% of video
+    IMPACT   — peak total scene motion between 22% and 85% of video
+               (impact is always the highest-energy moment of the swing)
+    TOP      — minimum wrist speed between address and impact
+               (the brief pause before the downswing)
+    FT       — ~0.45s after impact
+    """
+    if not samples:
+        return None
+
+    valid = [i for i, s in enumerate(samples) if s["hand"] is not None and s["vis"] >= 0.15]
+    if len(valid) < max(6, len(samples) * 0.20):
+        print(f"[pose-phases] too few valid pose frames: {len(valid)}/{len(samples)}")
+        return None
+
+    # Build arrays
+    times  = np.array([s["time"]             for s in samples], dtype=np.float32)
+    fis    = np.array([s["fi"]               for s in samples], dtype=np.float32)
+    scales = np.array([s.get("scale", 0.12)  for s in samples], dtype=np.float32)
+    hands  = np.full((len(samples), 2), np.nan, dtype=np.float32)
+    for i in valid:
+        hands[i] = samples[i]["hand"]
+
+    # Motion signal — frame pixel difference, camera-angle independent
+    raw_motion = np.array([s.get("motion", 0.0) for s in samples], dtype=np.float32)
+    motion     = _smooth(raw_motion, 7)
+    motion_n   = _norm_signal(motion)
+
+    # Wrist speed signal
+    speed = np.zeros(len(samples), dtype=np.float32)
+    for pos, i in enumerate(valid):
+        pi = valid[max(0, pos - 1)]
+        ni = valid[min(len(valid) - 1, pos + 1)]
+        dt = max(float(times[ni] - times[pi]), 1.0 / max(fps, 1.0))
+        speed[i] = float(np.linalg.norm(hands[ni] - hands[pi])) / dt / max(float(scales[i]), 0.08)
+    speed   = _smooth(speed, 5)
+    speed_n = _norm_signal(speed)
+
+    # ── 1. ADDRESS ───────────────────────────────────────────────────────────
+    # Lowest-motion valid frame in the first 18% of the video.
+    addr_pool = [i for i in valid if fis[i] <= total_frames * 0.18]
+    if not addr_pool:
+        addr_pool = valid[:max(3, len(valid) // 5)]
+
+    setup_idx = min(addr_pool, key=lambda i: float(motion_n[i]) + float(speed_n[i]))
+    setup_t   = float(times[setup_idx])
+
+    # ── 2. IMPACT ────────────────────────────────────────────────────────────
+    # Peak TOTAL SCENE MOTION between 22% and 85% of video.
+    # Impact is physically the highest-energy moment — camera angle doesn't matter.
+    impact_lo = total_frames * 0.22
+    impact_hi = total_frames * 0.85
+    impact_pool = [i for i in valid if impact_lo <= fis[i] <= impact_hi]
+    if len(impact_pool) < 3:
+        impact_pool = [i for i in valid if fis[i] > fis[setup_idx]]
+    if not impact_pool:
+        return None
+
+    # Primary: motion_n (scene blur/movement); secondary: speed_n (wrist velocity)
+    impact_idx = max(impact_pool, key=lambda i: float(motion_n[i]) * 0.65 + float(speed_n[i]) * 0.35)
+    impact_t   = float(times[impact_idx])
+
+    print(f"[pose-phases] addr={int(setup_t*1000)}ms  impact={int(impact_t*1000)}ms  "
+          f"(impact_motion={motion_n[impact_idx]:.2f}  impact_speed={speed_n[impact_idx]:.2f})")
+
+    # ── 3. TOP OF BACKSWING ──────────────────────────────────────────────────
+    # Minimum WRIST SPEED between address and impact.
+    # The pause at the top is always the slowest wrist moment before the downswing.
+    gap = impact_t - setup_t
+    top_pool = [
+        i for i in valid
+        if times[i] > setup_t + max(0.15, gap * 0.20)   # at least 20% into backswing
+        and times[i] < impact_t - 0.06                   # safely before impact
+    ]
+    if len(top_pool) < 2:
+        # Fallback: 55% of the way from address to impact
+        target_fi = int(fis[setup_idx] + (fis[impact_idx] - fis[setup_idx]) * 0.55)
+        top_idx = min(valid, key=lambda i: abs(fis[i] - target_fi))
+    else:
+        # Search the LATTER 50% of the pre-impact window.
+        # The true top is the LAST slow moment before the downswing begins —
+        # not the early takeaway (which is also slow).
+        split    = max(0, len(top_pool) * 1 // 2)
+        top_srch = top_pool[split:] if len(top_pool[split:]) >= 2 else top_pool
+        top_idx  = min(top_srch, key=lambda i: float(speed_n[i]))
+
+    top_t = float(times[top_idx])
+    print(f"[pose-phases] top={int(top_t*1000)}ms  (top_speed={speed_n[top_idx]:.2f})")
+
+    # ── 4. FOLLOW-THROUGH ────────────────────────────────────────────────────
+    ft_pool = [i for i in valid if times[i] >= impact_t + 0.35]
+    if ft_pool:
+        finish_idx = ft_pool[min(2, len(ft_pool) - 1)]
+    else:
+        target_fi  = min(int(total_frames) - 1, int(fis[impact_idx]) + int(fps * 0.55))
+        finish_idx = min(valid, key=lambda i: abs(fis[i] - target_fi))
+
+    phase_fis = [int(fis[i]) for i in [setup_idx, top_idx, impact_idx, finish_idx]]
+
+    if not (phase_fis[0] < phase_fis[1] < phase_fis[2] < phase_fis[3]):
+        print(f"[pose-phases] REJECTED out-of-order: {[int(f/fps*1000) for f in phase_fis]}ms")
+        return None
+
+    print(f"[pose-phases] FINAL "
+          f"addr={int(phase_fis[0]/fps*1000)}ms  top={int(phase_fis[1]/fps*1000)}ms  "
+          f"impact={int(phase_fis[2]/fps*1000)}ms  ft={int(phase_fis[3]/fps*1000)}ms  "
+          f"valid={len(valid)}/{len(samples)}")
+    return phase_fis
+
+
+def _read_pose_point(pose, cap, fi: int, fps: float):
+    cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+    ret, frame = cap.read()
+    if not ret:
+        return None
+
+    enhanced = _preprocess(frame)
+    gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    roi = cv2.resize(gray[int(h * 0.05):int(h * 0.95), int(w * 0.05):int(w * 0.95)], (96, 160))
+
+    rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
+    det = pose.process(rgb)
+    if not det.pose_landmarks:
+        return {"fi": fi, "time": fi / fps, "hand": None, "vis": 0.0, "scale": 0.12, "roi": roi}
+
+    hand = _midpoint(
+        det.pose_landmarks,
+        mp_pose.PoseLandmark.LEFT_WRIST.value,
+        mp_pose.PoseLandmark.RIGHT_WRIST.value,
+        0.15,
+    )
+    if hand is None:
+        hand = _midpoint(
+            det.pose_landmarks,
+            mp_pose.PoseLandmark.LEFT_INDEX.value,
+            mp_pose.PoseLandmark.RIGHT_INDEX.value,
+            0.15,
+        )
+
+    if hand is None:
+        return {"fi": fi, "time": fi / fps, "hand": None, "vis": 0.0,
+                "scale": _body_scale(det.pose_landmarks), "roi": roi}
+
+    return {"fi": fi, "time": fi / fps, "hand": hand[0], "vis": hand[1],
+            "scale": _body_scale(det.pose_landmarks), "roi": roi}
+
+
+def _window_track(cap, fps: float, total_frames: int, center_fi: int, radius_s: float, stride: int = 1) -> List[Dict]:
+    start = max(0, int(center_fi - fps * radius_s))
+    end = min(total_frames - 1, int(center_fi + fps * radius_s))
+    points = []
+    with mp_pose.Pose(
+        static_image_mode=True,
+        model_complexity=0,
+        enable_segmentation=False,
+        min_detection_confidence=0.2,
+    ) as pose:
+        for fi in range(start, end + 1, max(1, stride)):
+            point = _read_pose_point(pose, cap, fi, fps)
+            if point is not None:
+                points.append(point)
+
+    prev_roi = None
+    for point in points:
+        point["motion"] = 0.0 if prev_roi is None else float(cv2.absdiff(point["roi"], prev_roi).mean())
+        prev_roi = point["roi"]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    return points
+
+
+def refine_phase_indices(cap, fps: float, total_frames: int, phase_fis: List[int], quality: str = "fast") -> List[int]:
+    """
+    Coarse pose sampling gets the swing in the right neighborhood. This pass checks
+    nearby actual frames so top/impact can move by single-frame increments.
+    """
+    if len(phase_fis) != 4:
+        return phase_fis
+
+    setup_fi, top_fi, impact_fi, finish_fi = phase_fis
+    stride = max(1, int(round(fps / (60 if quality == "accurate" else 24))))
+    setup_track = _window_track(cap, fps, total_frames, setup_fi, 0.14 if quality == "fast" else 0.18, stride)
+    setup_valid = [p for p in setup_track if p["hand"] is not None and p["vis"] >= 0.15]
+    if not setup_valid:
+        return phase_fis
+
+    setup_hand = np.median(np.array([p["hand"] for p in setup_valid], dtype=np.float32), axis=0)
+    setup_scale = max(float(np.median([p["scale"] for p in setup_valid])), 0.08)
+
+    top_track = _window_track(cap, fps, total_frames, top_fi, 0.22 if quality == "fast" else 0.28, stride)
+    top_valid = [p for p in top_track if p["hand"] is not None and p["vis"] >= 0.15]
+    refined_top = top_fi
+    if top_valid:
+        motions = _norm_signal(_smooth(np.array([p["motion"] for p in top_valid], dtype=np.float32), 5))
+
+        def local_top_score(item):
+            idx, point = item
+            high = (setup_hand[1] - point["hand"][1]) / setup_scale
+            away = float(np.linalg.norm(point["hand"] - setup_hand)) / setup_scale
+            calm = 1.0 - float(motions[idx])
+            return high * 1.65 + away * 0.85 + calm * 0.20
+
+        refined_top = max(enumerate(top_valid), key=local_top_score)[1]["fi"]
+
+    impact_track = _window_track(cap, fps, total_frames, impact_fi, 0.18 if quality == "fast" else 0.24, stride)
+    impact_valid = [
+        p for p in impact_track
+        if p["hand"] is not None and p["vis"] >= 0.15 and p["fi"] > refined_top
+    ]
+    refined_impact = impact_fi
+    if impact_valid:
+        motions = _norm_signal(_smooth(np.array([p["motion"] for p in impact_valid], dtype=np.float32), 5))
+
+        def local_impact_score(item):
+            idx, point = item
+            return_dist = float(np.linalg.norm(point["hand"] - setup_hand)) / setup_scale
+            y_error = abs(float(point["hand"][1] - setup_hand[1])) / setup_scale
+            motion_bonus = float(motions[idx])
+            return return_dist * 0.45 + y_error * 1.55 - motion_bonus * 0.55
+
+        refined_impact = min(enumerate(impact_valid), key=local_impact_score)[1]["fi"]
+
+    refined = [setup_fi, refined_top, refined_impact, finish_fi]
+    if not (refined[0] <= refined[1] <= refined[2] <= refined[3]):
+        return phase_fis
+
+    if refined != phase_fis:
+        print("[pose-refine] "
+              f"top {int(top_fi/fps*1000)}ms->{int(refined_top/fps*1000)}ms  "
+              f"impact {int(impact_fi/fps*1000)}ms->{int(refined_impact/fps*1000)}ms")
+    return refined
+
+
+def detect_pose_landmarks(pose, frame):
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    det = pose.process(rgb)
+    return landmarks_to_json(det.pose_landmarks) if det.pose_landmarks else None
+
+
+def extract_phase_frames_at_indices(
+    cap,
+    fps: float,
+    total_frames: int,
+    phase_fis: List[int],
+    include_overlays: bool = False,
+) -> List[dict]:
+    results = []
+    with mp_pose.Pose(static_image_mode=True, model_complexity=0,
+                      enable_segmentation=False, min_detection_confidence=0.2) as pose:
+        for fi in phase_fis:
+            fi = max(0, min(int(fi), total_frames - 1))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ret, frame = cap.read()
+            time_ms = int(fi / fps * 1000)
+            if not ret:
+                results.append({"frame": None, "overlay_frame": None,
+                                "landmarks": None, "time_ms": time_ms})
+                continue
+
+            small = resize_for_ai(frame)
+            frame_b64 = encode_jpg(small)
+            if include_overlays:
+                landmarks, overlay_b64 = try_detect_pose(pose, frame)
+            else:
+                landmarks = detect_pose_landmarks(pose, frame)
+                overlay_b64 = None
+            results.append({"frame": frame_b64, "overlay_frame": overlay_b64,
+                            "landmarks": landmarks, "time_ms": time_ms})
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    return results
+
+
+def detect_and_extract(cap, fps: float, include_overlays: bool = False, quality: str = "fast") -> List[dict]:
+    """
+    Pose-based phase detection:
+
+       SETUP   — stable early hand position near address
+       TOP     — high, far hand position before the fast downswing
+       IMPACT  — fast post-top return near the setup hand position
+       FOLLOW  — first post-impact slowdown, or a short time after impact
+
+    Falls back to the older motion-burst percentages when landmark coverage is
+    too sparse or noisy to produce ordered phase frames.
     """
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total_frames <= 0:
@@ -186,8 +628,15 @@ def detect_and_extract(cap, fps: float) -> List[dict]:
                  "time_ms": int(total_frames * p / fps * 1000)}
                 for p in [0.08, 0.40, 0.62, 0.82]]
 
+    samples = _sample_pose_track(cap, fps, total_frames, quality)
+    phase_fis = _phase_indices_from_pose(samples, total_frames, fps)
+    if phase_fis is not None:
+        phase_fis = refine_phase_indices(cap, fps, total_frames, phase_fis, quality)
+        return extract_phase_frames_at_indices(cap, fps, total_frames, phase_fis, include_overlays)
+
+    print("[pose-phases] insufficient pose track; falling back to motion burst structure")
     burst_start, burst_end = find_swing_burst(cap, total_frames, fps)
-    return extract_phase_frames(cap, fps, total_frames, burst_start, burst_end)
+    return extract_phase_frames_by_structure(cap, fps, total_frames, burst_start, burst_end)
 
 
 def transcode_to_h264(input_path: str) -> str:
@@ -229,6 +678,113 @@ def landmarks_to_json(pose_landmarks):
     ]
 
 
+def _cv_point(pose_landmarks, idx: int, width: int, height: int, min_visibility: float = OVERLAY_MIN_VISIBILITY):
+    lm = pose_landmarks.landmark[idx]
+    if lm.visibility < min_visibility:
+        return None
+    return (
+        int(max(0.0, min(1.0, lm.x)) * width),
+        int(max(0.0, min(1.0, lm.y)) * height),
+    )
+
+
+def _draw_polyline(frame, points, color, thickness=3, glow=True, dotted=False):
+    clean = [p for p in points if p is not None]
+    if len(clean) != len(points) or len(clean) < 2:
+        return
+
+    if glow:
+        glow_layer = frame.copy()
+        for start, end in zip(clean, clean[1:]):
+            cv2.line(glow_layer, start, end, color, thickness + 7, cv2.LINE_AA)
+        cv2.addWeighted(glow_layer, 0.22, frame, 0.78, 0, frame)
+
+    for start, end in zip(clean, clean[1:]):
+        if dotted:
+            distance = max(1.0, float(np.linalg.norm(np.array(end) - np.array(start))))
+            steps = max(2, int(distance // 14))
+            for i in range(0, steps, 2):
+                a = i / steps
+                b = min((i + 1) / steps, 1.0)
+                p1 = (int(start[0] + (end[0] - start[0]) * a), int(start[1] + (end[1] - start[1]) * a))
+                p2 = (int(start[0] + (end[0] - start[0]) * b), int(start[1] + (end[1] - start[1]) * b))
+                cv2.line(frame, p1, p2, color, thickness, cv2.LINE_AA)
+        else:
+            cv2.line(frame, start, end, color, thickness, cv2.LINE_AA)
+
+
+def _draw_dot(frame, point, color=OVERLAY_GREEN, radius=4):
+    if point is None:
+        return
+    cv2.circle(frame, point, radius + 2, OVERLAY_WHITE, -1, cv2.LINE_AA)
+    cv2.circle(frame, point, radius, color, -1, cv2.LINE_AA)
+
+
+def draw_golf_overlay(frame, pose_landmarks, handedness: str = "right", show_head_ring: bool = False):
+    """
+    Minimal ImpactAI biomech overlay. Draws only golf-relevant structure lines,
+    not the full MediaPipe skeleton.
+    """
+    h, w = frame.shape[:2]
+    lm = mp_pose.PoseLandmark
+
+    ls = _cv_point(pose_landmarks, lm.LEFT_SHOULDER.value, w, h)
+    rs = _cv_point(pose_landmarks, lm.RIGHT_SHOULDER.value, w, h)
+    lh = _cv_point(pose_landmarks, lm.LEFT_HIP.value, w, h)
+    rh = _cv_point(pose_landmarks, lm.RIGHT_HIP.value, w, h)
+    nose = _cv_point(pose_landmarks, lm.NOSE.value, w, h, 0.35)
+
+    lead = "right" if handedness == "left" else "left"
+    side_map = {
+        "left": {
+            "shoulder": lm.LEFT_SHOULDER.value,
+            "elbow": lm.LEFT_ELBOW.value,
+            "wrist": lm.LEFT_WRIST.value,
+            "hip": lm.LEFT_HIP.value,
+            "knee": lm.LEFT_KNEE.value,
+            "ankle": lm.LEFT_ANKLE.value,
+        },
+        "right": {
+            "shoulder": lm.RIGHT_SHOULDER.value,
+            "elbow": lm.RIGHT_ELBOW.value,
+            "wrist": lm.RIGHT_WRIST.value,
+            "hip": lm.RIGHT_HIP.value,
+            "knee": lm.RIGHT_KNEE.value,
+            "ankle": lm.RIGHT_ANKLE.value,
+        },
+    }
+    lead_shoulder = _cv_point(pose_landmarks, side_map[lead]["shoulder"], w, h)
+    lead_elbow = _cv_point(pose_landmarks, side_map[lead]["elbow"], w, h)
+    lead_wrist = _cv_point(pose_landmarks, side_map[lead]["wrist"], w, h)
+    lead_hip = _cv_point(pose_landmarks, side_map[lead]["hip"], w, h)
+    lead_knee = _cv_point(pose_landmarks, side_map[lead]["knee"], w, h)
+    lead_ankle = _cv_point(pose_landmarks, side_map[lead]["ankle"], w, h)
+
+    shoulder_mid = None
+    hip_mid = None
+    if ls and rs:
+        shoulder_mid = ((ls[0] + rs[0]) // 2, (ls[1] + rs[1]) // 2)
+        _draw_polyline(frame, [ls, rs], OVERLAY_GREEN, 3, glow=True)
+    if lh and rh:
+        hip_mid = ((lh[0] + rh[0]) // 2, (lh[1] + rh[1]) // 2)
+        _draw_polyline(frame, [lh, rh], OVERLAY_GREEN, 3, glow=True)
+    if shoulder_mid and hip_mid:
+        _draw_polyline(frame, [shoulder_mid, hip_mid], OVERLAY_WHITE, 3, glow=False, dotted=True)
+
+    _draw_polyline(frame, [lead_shoulder, lead_elbow, lead_wrist], OVERLAY_GREEN, 3, glow=True)
+    _draw_polyline(frame, [lead_hip, lead_knee, lead_ankle], OVERLAY_GREEN, 3, glow=True)
+
+    for point in [ls, rs, lh, rh, lead_elbow, lead_wrist, lead_knee, lead_ankle]:
+        _draw_dot(frame, point)
+
+    if show_head_ring and nose and ls and rs:
+        span = max(24, abs(rs[0] - ls[0]))
+        size = int(max(22, min(58, span * 0.42)))
+        x = int(nose[0] - size / 2)
+        y = int(nose[1] - size * 0.8)
+        cv2.rectangle(frame, (x, y), (x + size, y + size), OVERLAY_WHITE, 2, cv2.LINE_AA)
+
+
 def encode_jpg(frame, quality=80) -> str:
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return base64.b64encode(buf).decode("utf-8")
@@ -244,49 +800,52 @@ def resize_for_ai(frame, max_side=640):
 
 
 def try_detect_pose(pose, frame):
-    """Try pose detection at multiple scales — returns (landmarks_json, overlay_b64) or (None, None)."""
+    """Try pose detection with multiple preprocessing passes — returns (landmarks_json, overlay_b64)."""
     h, w = frame.shape[:2]
 
-    # Attempt 1: original frame
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    det = pose.process(rgb)
+    def _run(f):
+        rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+        return pose.process(rgb)
+
+    # Attempt 1: CLAHE-enhanced frame (helps outdoor / flat lighting)
+    enhanced = _preprocess(frame)
+    det = _run(enhanced)
     if det.pose_landmarks:
         overlay = frame.copy()
-        mp_drawing.draw_landmarks(overlay, det.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                                  landmark_drawing_spec=LANDMARK_STYLE,
-                                  connection_drawing_spec=CONNECTION_STYLE)
+        draw_golf_overlay(overlay, det.pose_landmarks)
         return landmarks_to_json(det.pose_landmarks), encode_jpg(overlay)
 
-    # Attempt 2: upscale small frames — MediaPipe needs at least 256px on short side
+    # Attempt 2: upscale small frames — MediaPipe needs ≥256px on short side
     if min(h, w) < 480:
         scale = 480 / min(h, w)
-        resized = cv2.resize(frame, (int(w * scale), int(h * scale)))
-        rgb2 = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        det2 = pose.process(rgb2)
+        upscaled = cv2.resize(enhanced, (int(w * scale), int(h * scale)))
+        det2 = _run(upscaled)
         if det2.pose_landmarks:
-            overlay = resized.copy()
-            mp_drawing.draw_landmarks(overlay, det2.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                                      landmark_drawing_spec=LANDMARK_STYLE,
-                                      connection_drawing_spec=CONNECTION_STYLE)
-            # Scale back landmark coords (they're already normalized 0-1, no change needed)
+            overlay = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            draw_golf_overlay(overlay, det2.pose_landmarks)
             return landmarks_to_json(det2.pose_landmarks), encode_jpg(overlay)
 
-    # Attempt 3: slightly expand contrast to help detection in outdoor light
-    enhanced = cv2.convertScaleAbs(frame, alpha=1.2, beta=10)
-    rgb3 = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
-    det3 = pose.process(rgb3)
+    # Attempt 3: stronger contrast boost for very flat / overcast footage
+    boosted = cv2.convertScaleAbs(enhanced, alpha=1.35, beta=15)
+    det3 = _run(boosted)
     if det3.pose_landmarks:
         overlay = frame.copy()
-        mp_drawing.draw_landmarks(overlay, det3.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                                  landmark_drawing_spec=LANDMARK_STYLE,
-                                  connection_drawing_spec=CONNECTION_STYLE)
+        draw_golf_overlay(overlay, det3.pose_landmarks)
         return landmarks_to_json(det3.pose_landmarks), encode_jpg(overlay)
 
-    print(f"[pose] detection failed on all 3 attempts (frame size: {w}x{h})")
+    # Attempt 4: large upscale regardless of size
+    big = cv2.resize(enhanced, (int(w * 1.5), int(h * 1.5)))
+    det4 = _run(big)
+    if det4.pose_landmarks:
+        overlay = frame.copy()
+        draw_golf_overlay(overlay, det4.pose_landmarks)
+        return landmarks_to_json(det4.pose_landmarks), encode_jpg(overlay)
+
+    print(f"[pose] detection failed on all 4 attempts ({w}x{h})")
     return None, None
 
 
-def extract_frames_with_pose(cap, ts_list: List[int], fps: float):
+def extract_frames_with_pose(cap, ts_list: List[int], fps: float, include_overlays: bool = False):
     results = []
     # model_complexity=0 is lighter and more robust for side-on/bent-over golf poses
     with mp_pose.Pose(
@@ -305,8 +864,12 @@ def extract_frames_with_pose(cap, ts_list: List[int], fps: float):
                 results.append({"frame": None, "overlay_frame": None, "landmarks": None, "time_ms": ms})
                 continue
 
-            frame_b64 = encode_jpg(frame)
-            landmarks, overlay_b64 = try_detect_pose(pose, frame)
+            frame_b64 = encode_jpg(resize_for_ai(frame))
+            if include_overlays:
+                landmarks, overlay_b64 = try_detect_pose(pose, frame)
+            else:
+                landmarks = detect_pose_landmarks(pose, frame)
+                overlay_b64 = None
             print(f"[pose] {ms}ms — landmarks: {'YES' if landmarks else 'NO'}")
 
             results.append({
@@ -332,7 +895,12 @@ def extract_key_frames(req: ExtractKeyFramesRequest):
 
         cap, _, cleanup = open_video(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        results = detect_and_extract(cap, fps)
+        quality = req.quality if req.quality in ["fast", "accurate"] else "fast"
+        results = (
+            extract_frames_with_pose(cap, req.timestamps_ms, fps, req.include_overlays)
+            if req.timestamps_ms
+            else detect_and_extract(cap, fps, req.include_overlays, quality)
+        )
 
         cap.release()
         if cleanup and os.path.exists(cleanup):
@@ -348,7 +916,11 @@ def extract_key_frames(req: ExtractKeyFramesRequest):
 
 
 @app.post("/extract-key-frames-upload")
-async def extract_key_frames_upload(video: UploadFile = File(...)):
+async def extract_key_frames_upload(
+    video: UploadFile = File(...),
+    include_overlays: bool = Form(False),
+    quality: str = Form("fast"),
+):
     tmp_path = None
     cleanup = None
     try:
@@ -358,7 +930,8 @@ async def extract_key_frames_upload(video: UploadFile = File(...)):
 
         cap, _, cleanup = open_video(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        results = detect_and_extract(cap, fps)
+        quality = quality if quality in ["fast", "accurate"] else "fast"
+        results = detect_and_extract(cap, fps, include_overlays, quality)
 
         cap.release()
         return {"frames": results}
@@ -504,13 +1077,7 @@ def run_mediapipe(swing_id: str, video_url: str, user_id: str):
                 results = pose.process(rgb)
 
                 if results.pose_landmarks:
-                    mp_drawing.draw_landmarks(
-                        frame,
-                        results.pose_landmarks,
-                        mp_pose.POSE_CONNECTIONS,
-                        landmark_drawing_spec=LANDMARK_STYLE,
-                        connection_drawing_spec=CONNECTION_STYLE,
-                    )
+                    draw_golf_overlay(frame, results.pose_landmarks)
 
                 writer.write(frame)
 
