@@ -272,21 +272,20 @@ def _sample_pose_track(cap, fps: float, total_frames: int, quality: str = "fast"
     if total_frames <= 0:
         return []
 
-    step = max(1, int(round(fps / 30.0)))
-    max_samples = 180 if quality == "accurate" else 150
-    if total_frames / step > max_samples:
-        step = int(np.ceil(total_frames / max_samples))
+    # Keep max_samples low — this loop runs on every frame and must finish fast
+    max_samples = 80
+    step = max(1, int(np.ceil(total_frames / max_samples)))
 
     samples = []
     prev_gray = None
-    # model_complexity=1 is meaningfully more accurate for golf side/bent-over poses
+    # model_complexity=0 for speed — we process up to 80 frames here
     with mp_pose.Pose(
         static_image_mode=False,
-        model_complexity=1,
+        model_complexity=0,
         smooth_landmarks=True,
         enable_segmentation=False,
-        min_detection_confidence=0.3,
-        min_tracking_confidence=0.3,
+        min_detection_confidence=0.25,
+        min_tracking_confidence=0.25,
     ) as pose:
         for fi in range(0, total_frames, step):
             cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
