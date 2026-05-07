@@ -272,8 +272,8 @@ def _sample_pose_track(cap, fps: float, total_frames: int, quality: str = "fast"
     if total_frames <= 0:
         return []
 
-    # 60 samples gives enough resolution for fast swings without timing out
-    max_samples = 60
+    # 50 samples: enough resolution for fast swings, stays well under Render timeout
+    max_samples = 50
     step = max(1, int(np.ceil(total_frames / max_samples)))
 
     samples = []
@@ -463,7 +463,7 @@ def detect_swing_events(samples: List[Dict], total_frames: int, fps: float):
     ]
 
     if len(top_pool) < 3:
-        target_fi = int(fis[setup_idx] + (est_impact_idx * 0 or total_frames * 0.38))
+        target_fi = int(total_frames * 0.38)
         top_idx   = min(valid, key=lambda i: abs(fis[i] - target_fi))
         top_conf  = 0.30
         top_meth  = "fallback"
@@ -779,18 +779,21 @@ def detect_and_extract(cap, fps: float, include_overlays: bool = False, quality:
                  "time_ms": int(total_frames * p / fps * 1000)}
                 for p in [0.08, 0.40, 0.62, 0.82]]
 
-    samples = _sample_pose_track(cap, fps, total_frames, quality)
-    detection = detect_swing_events(samples, total_frames, fps)
-    if detection is not None:
-        phase_fis, confidence, methods = detection
-        phase_fis = refine_phase_indices(cap, fps, total_frames, phase_fis, quality)
-        frames  = extract_phase_frames_at_indices(cap, fps, total_frames, phase_fis, include_overlays)
-        metrics = compute_temporal_metrics(phase_fis, fps, samples)
-        metrics["eventConfidence"] = confidence
-        metrics["detectionMethods"] = methods
-        return frames, metrics
-
-    print("[events] insufficient pose track; falling back to motion burst structure")
+    try:
+        samples = _sample_pose_track(cap, fps, total_frames, quality)
+        detection = detect_swing_events(samples, total_frames, fps)
+        if detection is not None:
+            phase_fis, confidence, methods = detection
+            phase_fis = refine_phase_indices(cap, fps, total_frames, phase_fis, quality)
+            frames  = extract_phase_frames_at_indices(cap, fps, total_frames, phase_fis, include_overlays)
+            metrics = compute_temporal_metrics(phase_fis, fps, samples)
+            metrics["eventConfidence"] = confidence
+            metrics["detectionMethods"] = methods
+            return frames, metrics
+        print("[events] insufficient pose track; falling back to motion burst structure")
+    except Exception as exc:
+        print(f"[events] detection threw: {exc} — falling back to motion burst")
+        samples = []
     burst_start, burst_end = find_swing_burst(cap, total_frames, fps)
     frames = extract_phase_frames_by_structure(cap, fps, total_frames, burst_start, burst_end)
     # Derive fallback phase_fis from burst for metric computation
