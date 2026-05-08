@@ -332,6 +332,55 @@ def _sample_pose_track(cap, fps: float, total_frames: int, quality: str = "fast"
     return samples
 
 
+def _select_top(top_pool, hands, speed_n, times, fis, setup_wrist_y,
+                total_frames, valid):
+    """
+    Select the top-of-backswing frame.
+
+    Primary signal: minimum wrist Y in the backswing window (highest in frame).
+    Hard constraint: wrist must be meaningfully ABOVE address wrist Y.
+
+    Falls back gracefully if pose is sparse or constraint can't be met.
+    """
+    if not top_pool:
+        target_fi = int(total_frames * 0.40)
+        idx = min(valid, key=lambda i: abs(fis[i] - target_fi))
+        return idx, 0.25, "fallback"
+
+    # Try increasingly relaxed height thresholds until we find candidates
+    for threshold in [0.10, 0.06, 0.03, 0.0]:
+        candidates = [
+            i for i in top_pool
+            if float(hands[i][1]) < setup_wrist_y - threshold
+        ]
+        if len(candidates) >= 2:
+            break
+    else:
+        # No constraint met — use full pool
+        candidates = top_pool
+
+    # Among candidates, score by:
+    # 1. Height above address (primary — the higher the wrist, the better)
+    # 2. Low wrist speed (the pause at the top)
+    def top_score(i: int) -> float:
+        height = setup_wrist_y - float(hands[i][1])   # positive = above address
+        slow   = 1.0 - float(speed_n[i])
+        return height * 1.8 + slow * 0.7
+
+    # Search the LATTER 55% of candidates to avoid early takeaway stillness
+    split    = max(0, int(len(candidates) * 0.45))
+    search   = candidates[split:] if len(candidates[split:]) >= 2 else candidates
+    top_idx  = max(search, key=top_score)
+
+    height_diff = setup_wrist_y - float(hands[top_idx][1])
+    conf = min(1.0, max(0.0, height_diff / 0.18))   # 18% above address = full confidence
+    meth = "trajectory_extremum" if height_diff > 0.03 else "fallback"
+
+    print(f"[events] top wrist_y={hands[top_idx][1]:.3f} addr_y={setup_wrist_y:.3f} "
+          f"delta={height_diff:.3f} conf={conf:.2f}")
+    return top_idx, conf, meth
+
+
 def detect_swing_events(samples: List[Dict], total_frames: int, fps: float):
     """
     Temporal event detection for 4 golf swing phases.
@@ -379,16 +428,6 @@ def detect_swing_events(samples: List[Dict], total_frames: int, fps: float):
     speed   = _smooth(speed, 5)
     speed_n = _norm_signal(speed)
 
-    # X-velocity: tracks left/right wrist movement for direction-reversal detection
-    vel_x = np.zeros(n, dtype=np.float32)
-    for pos, i in enumerate(valid):
-        pi = valid[max(0, pos - 2)]
-        ni = valid[min(len(valid) - 1, pos + 2)]
-        dt = max(float(times[ni] - times[pi]), 1.0 / max(fps, 1.0))
-        if not (np.isnan(hands[ni]).any() or np.isnan(hands[pi]).any()):
-            vel_x[i] = float(hands[ni][0] - hands[pi][0]) / dt
-    vel_x = _smooth(vel_x, 3)
-
     # ── 1. ADDRESS: Stability window ──────────────────────────────────────────
     # Find best window of consecutive low-motion frames in first 22% of video.
     addr_cutoff = total_frames * 0.22
@@ -427,109 +466,73 @@ def detect_swing_events(samples: List[Dict], total_frames: int, fps: float):
         setup_hand  = np.array([0.5, 0.7], dtype=np.float32)
         setup_scale = 0.12
 
-    # Displacement from address (camera-angle independent; peaks at top of backswing)
-    disp = np.zeros(n, dtype=np.float32)
-    for i in valid:
-        if not np.isnan(hands[i]).any():
-            disp[i] = float(np.linalg.norm(hands[i] - setup_hand)) / setup_scale
-    disp = _smooth(disp, 3)
+    setup_wrist_y = float(setup_hand[1])  # wrist Y at address (image coords: 0=top, 1=bottom)
 
-    # ── 2. TOP OF BACKSWING: Trajectory extremum ──────────────────────────────
-    # Three signals that all peak/trough at the top:
-    #   a) displacement from address is at MAXIMUM (wrist has traveled furthest)
-    #   b) wrist speed is at LOCAL MINIMUM (the pause before direction reversal)
-    #   c) X-velocity changes sign (actual direction reversal)
-    # Search the LATTER 45% of the address→impact window so we don't pick the takeaway.
+    # ── 2. TOP OF BACKSWING ────────────────────────────────────────────────────
+    # Physical law that holds for BOTH DTL and face-on cameras:
+    # During the backswing, wrists travel UPWARD → Y decreases in image space.
+    # The top of backswing = minimum wrist Y (highest in frame).
+    #
+    # Hard constraint: top wrist Y must be meaningfully ABOVE address wrist Y.
+    # This prevents address/takeaway frames from being selected as "top".
+    #
+    # Search window: after address + minimum gap, before 72% of video.
 
-    # First estimate where impact is (we'll refine it next)
-    est_impact_lo = total_frames * 0.30
-    est_impact_hi = total_frames * 0.82
-    est_impact_pool = [i for i in valid if est_impact_lo <= fis[i] <= est_impact_hi]
-    if est_impact_pool:
-        est_impact_idx = max(est_impact_pool, key=lambda i: float(motion_n[i]) * 0.65 + float(speed_n[i]) * 0.35)
-        est_impact_t   = float(times[est_impact_idx])
-    else:
-        est_impact_t = float(times[valid[-1]]) if valid else float(times[-1])
-
-    gap = est_impact_t - setup_t
-    top_lo_t = setup_t + max(0.18, gap * 0.18)
-    top_hi_t = est_impact_t - max(0.06, gap * 0.05)
-    top_hi_fi = total_frames * 0.72  # top can't be in the last 28%
+    top_lo_fi = int(fis[setup_idx]) + max(2, int(total_frames * 0.10))
+    top_hi_fi = total_frames * 0.72
+    top_lo_t  = setup_t + 0.20
 
     top_pool = [
         i for i in valid
-        if times[i] > top_lo_t and times[i] < top_hi_t and fis[i] < top_hi_fi
+        if fis[i] >= top_lo_fi and fis[i] <= top_hi_fi
+        and times[i] > top_lo_t
         and not np.isnan(hands[i]).any()
     ]
 
-    if len(top_pool) < 3:
-        target_fi = int(total_frames * 0.38)
-        top_idx   = min(valid, key=lambda i: abs(fis[i] - target_fi))
-        top_conf  = 0.30
-        top_meth  = "fallback"
-    else:
-        # Search the LATTER 45% of top_pool (avoids picking early takeaway stillness)
-        split_pt  = max(0, int(len(top_pool) * 0.50))
-        top_srch  = top_pool[split_pt:] if len(top_pool[split_pt:]) >= 2 else top_pool
-        max_disp  = max(float(disp[i]) for i in top_pool) + 1e-6
-
-        def top_event_score(i: int) -> float:
-            d     = float(disp[i]) / max_disp          # 0-1, higher = more displaced
-            s_low = 1.0 - float(speed_n[i])            # 0-1, higher = slower wrist
-            # Direction reversal: look for sign change in vel_x within ±3 samples
-            reversal = 0.0
-            for j in top_srch:
-                if 0 < j - i <= 3 and vel_x[i] != 0 and vel_x[j] != 0:
-                    if vel_x[i] * vel_x[j] < 0:
-                        reversal = 0.35
-                        break
-            return d * 0.85 + s_low * 1.40 + reversal
-
-        top_idx  = max(top_srch, key=top_event_score)
-        disp_pct = float(disp[top_idx]) / max_disp
-        top_conf = min(1.0, disp_pct * 0.55 + (1.0 - float(speed_n[top_idx])) * 0.45)
-        top_meth = "trajectory_extremum"
-
+    top_idx, top_conf, top_meth = _select_top(
+        top_pool, hands, speed_n, times, fis, setup_wrist_y, total_frames, valid
+    )
     top_t = float(times[top_idx])
 
-    # ── 3. IMPACT: Contact zone + velocity ────────────────────────────────────
-    # The impact is when the wrists return to near-address HEIGHT during the
-    # fast downswing. We require HIGH speed AND wrist near address Y coordinate.
-    # Bias slightly early: prefer frames before the hands overtake the body.
-
-    impact_lo_t = top_t + 0.05
-    impact_hi_t = top_t + 1.4   # downswing never takes > 1.4s
-    impact_hi_fi = total_frames * 0.88
+    # ── 3. IMPACT: Wrist returns to address height + high speed ───────────────
+    # At impact the wrist Y returns to near-address Y (club back at ball level).
+    # Combined signal: wrist Y close to address Y AND high motion/speed.
+    # Search only after top, within the downswing window (≤ 1.4s after top).
 
     impact_pool = [
         i for i in valid
-        if times[i] > impact_lo_t and times[i] <= impact_hi_t
-        and fis[i] <= impact_hi_fi
+        if times[i] > top_t + 0.05
+        and times[i] <= top_t + 1.4
+        and fis[i] > int(fis[top_idx])
+        and fis[i] <= total_frames * 0.88
         and not np.isnan(hands[i]).any()
     ]
     if len(impact_pool) < 2:
-        impact_pool = [i for i in valid if fis[i] > int(fis[top_idx]) and fis[i] <= impact_hi_fi]
+        impact_pool = [
+            i for i in valid
+            if fis[i] > int(fis[top_idx]) and fis[i] <= total_frames * 0.88
+        ]
 
     if not impact_pool:
-        target_fi   = int(fis[top_idx] + (total_frames - fis[top_idx]) * 0.30)
+        target_fi   = int(total_frames * 0.62)
         impact_idx  = min(valid, key=lambda i: abs(fis[i] - target_fi))
         impact_conf = 0.25
         impact_meth = "fallback"
     else:
-        # Combined score: high motion × high speed, penalise Y-distance from address,
-        # penalise very late frames (follow-through territory)
+        # Score = high energy AND wrist Y close to address Y
+        # Prefer earlier frames (contact before release/follow-through)
         time_span = max(float(times[impact_pool[-1]] - times[impact_pool[0]]), 1e-6)
 
         def impact_event_score(i: int) -> float:
-            energy    = float(motion_n[i]) * 0.55 + float(speed_n[i]) * 0.45
-            y_err     = abs(float(hands[i][1] - setup_hand[1])) / setup_scale
-            lateness  = max(0.0, float(times[i] - top_t - 0.15) / time_span)
-            return energy - y_err * 0.55 - lateness * 0.30
+            energy   = float(motion_n[i]) * 0.50 + float(speed_n[i]) * 0.50
+            # How close is this wrist Y to address Y? (0 = perfect, 1 = far away)
+            y_return = 1.0 - min(abs(float(hands[i][1]) - setup_wrist_y) / 0.20, 1.0)
+            lateness = max(0.0, float(times[i] - top_t - 0.10) / time_span)
+            return energy * 0.45 + y_return * 0.40 - lateness * 0.15
 
         impact_idx  = max(impact_pool, key=impact_event_score)
-        peak_e      = max(float(motion_n[i]) * 0.55 + float(speed_n[i]) * 0.45 for i in impact_pool)
-        impact_e    = float(motion_n[impact_idx]) * 0.55 + float(speed_n[impact_idx]) * 0.45
-        impact_conf = min(1.0, (impact_e / max(peak_e, 1e-6)) * 0.7 + float(motion_n[impact_idx]) * 0.3)
+        y_err       = abs(float(hands[impact_idx][1]) - setup_wrist_y)
+        impact_conf = min(1.0, float(motion_n[impact_idx]) * 0.5 + (1.0 - min(y_err / 0.15, 1.0)) * 0.5)
         impact_meth = "contact_zone"
 
     impact_t = float(times[impact_idx])
