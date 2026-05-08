@@ -1,10 +1,12 @@
 import os
+import json
 import base64
 import subprocess
 import cv2
 import numpy as np
 import tempfile
 import urllib.request
+import urllib.error
 import mediapipe as mp
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +26,23 @@ app.add_middleware(
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 BUCKET = "swing-videos"
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+
+# Prompt for vision-assisted event selection
+_EVENT_PROMPT = (
+    "You are a golf swing video analyst. Your ONLY task is to identify the correct "
+    "event frames — do NOT analyze swing quality.\n\n"
+    "TOP OF BACKSWING: club/hands at maximum backswing position, immediately before "
+    "the downswing starts. NOT address. NOT early takeaway. NOT mid-downswing.\n\n"
+    "IMPACT: clubhead at or closest to the golf ball / contact point. "
+    "If exact contact is between frames, choose the frame immediately BEFORE contact. "
+    "Do NOT choose follow-through. Do NOT choose a frame after the club has clearly passed.\n\n"
+    "Rules: use visible club position if possible; use hand/wrist as backup. "
+    "Bias impact slightly early rather than late. If unsure, lower confidence.\n\n"
+    "Return ONLY valid JSON — no markdown, no explanation:\n"
+    '{"topOfBackswing":{"candidateId":"top_NN","confidence":0.0},'
+    '"impact":{"candidateId":"impact_NN","confidence":0.0}}'
+)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -53,6 +72,7 @@ class ExtractKeyFramesRequest(BaseModel):
     timestamps_ms: Optional[List[int]] = None
     include_overlays: bool = False
     quality: str = "fast"
+    club: Optional[str] = None
 
 
 def find_swing_burst(cap, total_frames: int, fps: float):
@@ -764,7 +784,130 @@ def extract_phase_frames_at_indices(
     return results
 
 
-def detect_and_extract(cap, fps: float, include_overlays: bool = False, quality: str = "fast") -> List[dict]:
+def extract_candidate_window(cap, fps: float, total_frames: int,
+                             lo_fi: int, hi_fi: int,
+                             n: int, prefix: str) -> List[Dict]:
+    """
+    Extract n evenly-spaced thumbnail frames between lo_fi and hi_fi.
+    Returns list of {id, fi, time_ms, frame} dicts (frame = base64 JPEG).
+    """
+    lo_fi = max(0, lo_fi)
+    hi_fi = min(total_frames - 1, hi_fi)
+    if hi_fi <= lo_fi or n < 1:
+        return []
+    step = max(1, (hi_fi - lo_fi) // max(n - 1, 1))
+    fis  = []
+    fi   = lo_fi
+    while fi <= hi_fi and len(fis) < n:
+        fis.append(fi)
+        fi += step
+
+    results = []
+    for idx, fi in enumerate(fis):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        # Small thumbnails — 320px max is enough for vision selection
+        small = resize_for_ai(frame, max_side=320)
+        b64   = encode_jpg(small, quality=65)
+        results.append({
+            "id":      f"{prefix}_{idx+1:02d}",
+            "fi":      fi,
+            "time_ms": int(fi / fps * 1000),
+            "frame":   b64,
+        })
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    return results
+
+
+def select_events_with_vision(top_cands: List[Dict], impact_cands: List[Dict],
+                               club: str = "unknown") -> Optional[Dict]:
+    """
+    Send candidate thumbnails to OpenRouter vision and get the best top/impact frame.
+    Returns {"top_fi", "top_ms", "top_conf", "impact_fi", "impact_ms", "impact_conf"} or None.
+    Falls back silently if the API key is missing or the call fails.
+    """
+    if not OPENROUTER_KEY or not top_cands or not impact_cands:
+        return None
+
+    # Build the multimodal message — label each candidate clearly
+    content = []
+    content.append({"type": "text",
+                    "text": f"Club: {club}\n\nTOP OF BACKSWING CANDIDATES ({len(top_cands)} frames):"})
+    for c in top_cands:
+        content.append({"type": "text", "text": f"[{c['id']}] t={c['time_ms']}ms"})
+        content.append({"type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{c['frame']}",
+                                      "detail": "low"}})
+
+    content.append({"type": "text",
+                    "text": f"\nIMPACT CANDIDATES ({len(impact_cands)} frames):"})
+    for c in impact_cands:
+        content.append({"type": "text", "text": f"[{c['id']}] t={c['time_ms']}ms"})
+        content.append({"type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{c['frame']}",
+                                      "detail": "low"}})
+
+    content.append({"type": "text", "text": "\nReturn JSON only."})
+
+    body = json.dumps({
+        "model": "openai/gpt-4o",
+        "messages": [
+            {"role": "system", "content": _EVENT_PROMPT},
+            {"role": "user",   "content": content},
+        ],
+        "max_tokens": 120,
+        "temperature": 0.05,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_KEY}",
+            "Content-Type":  "application/json",
+            "HTTP-Referer":  "https://impactai.app",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=22) as resp:
+            raw = json.loads(resp.read())["choices"][0]["message"]["content"]
+        start = raw.index("{")
+        end   = raw.rindex("}") + 1
+        sel   = json.loads(raw[start:end])
+
+        top_id     = sel.get("topOfBackswing", {}).get("candidateId", "")
+        impact_id  = sel.get("impact",         {}).get("candidateId", "")
+        top_conf   = float(sel.get("topOfBackswing", {}).get("confidence", 0.5))
+        impact_conf = float(sel.get("impact",        {}).get("confidence", 0.5))
+
+        top_c    = next((c for c in top_cands    if c["id"] == top_id),    None)
+        impact_c = next((c for c in impact_cands if c["id"] == impact_id), None)
+
+        if not top_c or not impact_c:
+            print(f"[vision] candidate lookup failed: top={top_id} impact={impact_id}")
+            return None
+
+        print(f"[vision] top={top_c['time_ms']}ms(conf={top_conf:.2f}) "
+              f"impact={impact_c['time_ms']}ms(conf={impact_conf:.2f})")
+        return {
+            "top_fi":      top_c["fi"],
+            "top_ms":      top_c["time_ms"],
+            "top_conf":    top_conf,
+            "impact_fi":   impact_c["fi"],
+            "impact_ms":   impact_c["time_ms"],
+            "impact_conf": impact_conf,
+        }
+    except Exception as exc:
+        print(f"[vision] selection failed: {exc}")
+        return None
+
+
+def detect_and_extract(cap, fps: float, include_overlays: bool = False,
+                       quality: str = "fast", club: str = "unknown") -> List[dict]:
     """
     Pose-based phase detection:
 
@@ -783,24 +926,59 @@ def detect_and_extract(cap, fps: float, include_overlays: bool = False, quality:
                 for p in [0.08, 0.40, 0.62, 0.82]]
 
     try:
-        samples = _sample_pose_track(cap, fps, total_frames, quality)
+        samples   = _sample_pose_track(cap, fps, total_frames, quality)
         detection = detect_swing_events(samples, total_frames, fps)
+
         if detection is not None:
             phase_fis, confidence, methods = detection
-            phase_fis = refine_phase_indices(cap, fps, total_frames, phase_fis, quality)
-            frames  = extract_phase_frames_at_indices(cap, fps, total_frames, phase_fis, include_overlays)
+            addr_fi, top_fi_h, impact_fi_h, ft_fi = phase_fis
+
+            # ── Vision-assisted top + impact selection ──────────────────────
+            # Build candidate windows around the heuristic estimates
+            top_lo    = addr_fi + max(3, int(total_frames * 0.08))
+            top_hi    = min(int(total_frames * 0.62), top_fi_h + int(fps * 1.5))
+            impact_lo = top_fi_h + max(2, int(fps * 0.05))
+            impact_hi = min(int(total_frames * 0.88), impact_fi_h + int(fps * 1.2))
+
+            top_cands    = extract_candidate_window(cap, fps, total_frames,
+                                                    top_lo, top_hi, 7, "top")
+            impact_cands = extract_candidate_window(cap, fps, total_frames,
+                                                    impact_lo, impact_hi, 7, "impact")
+
+            vision = select_events_with_vision(top_cands, impact_cands, club)
+
+            if vision and vision["top_fi"] < vision["impact_fi"]:
+                phase_fis = [addr_fi, vision["top_fi"], vision["impact_fi"], ft_fi]
+                confidence["top"]    = vision["top_conf"]
+                confidence["impact"] = vision["impact_conf"]
+                methods["top"]    = "vision_assisted"
+                methods["impact"] = "vision_assisted"
+                print("[events] using vision-selected top+impact")
+            else:
+                if vision:
+                    print("[events] vision result invalid (out of order) — using heuristic")
+                phase_fis = refine_phase_indices(cap, fps, total_frames, phase_fis, quality)
+
+            # Validate final ordering
+            if not (phase_fis[0] < phase_fis[1] < phase_fis[2] < phase_fis[3]):
+                print("[events] final phase_fis out of order — fallback")
+                raise ValueError("out of order")
+
+            frames  = extract_phase_frames_at_indices(
+                cap, fps, total_frames, phase_fis, include_overlays)
             metrics = compute_temporal_metrics(phase_fis, fps, samples)
-            metrics["eventConfidence"] = confidence
+            metrics["eventConfidence"]  = confidence
             metrics["detectionMethods"] = methods
             return frames, metrics
+
         print("[events] insufficient pose track; falling back to motion burst structure")
     except Exception as exc:
         print(f"[events] detection threw: {exc} — falling back to motion burst")
         samples = []
+
     burst_start, burst_end = find_swing_burst(cap, total_frames, fps)
     frames = extract_phase_frames_by_structure(cap, fps, total_frames, burst_start, burst_end)
-    # Derive fallback phase_fis from burst for metric computation
-    span = max(1, burst_end - burst_start)
+    span   = max(1, burst_end - burst_start)
     fallback_fis = [
         int(total_frames * 0.08),
         burst_start,
@@ -1128,7 +1306,9 @@ def extract_key_frames(req: ExtractKeyFramesRequest):
             results = extract_frames_with_pose(cap, req.timestamps_ms, fps, req.include_overlays)
             metrics = {}
         else:
-            results, metrics = detect_and_extract(cap, fps, req.include_overlays, quality)
+            results, metrics = detect_and_extract(
+                cap, fps, req.include_overlays, quality, club=req.club or "unknown"
+            )
 
         cap.release()
         if cleanup and os.path.exists(cleanup):

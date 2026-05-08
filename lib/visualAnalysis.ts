@@ -4,7 +4,7 @@ import { SwingResult, VisualAnalysis, FrameAnalysis, SwingPhase, PoseLandmark, T
 
 const BUCKET = 'swing-videos';
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
-export const VISUAL_ANALYSIS_VERSION = 10;
+export const VISUAL_ANALYSIS_VERSION = 11;
 const REQUEST_OVERLAY_IMAGES = false;
 
 const FALLBACK_PHASE_TIMES_MS: Record<SwingPhase, number> = {
@@ -51,7 +51,7 @@ interface BackendResult {
   metrics: TemporalMetrics | null;
 }
 
-async function extractViaBackend(videoUrl: string): Promise<BackendResult | null> {
+async function extractViaBackend(videoUrl: string, club?: string): Promise<BackendResult | null> {
   try {
     const res = await fetch(`${BACKEND_URL}/extract-key-frames`, {
       method: 'POST',
@@ -60,6 +60,7 @@ async function extractViaBackend(videoUrl: string): Promise<BackendResult | null
         video_url: videoUrl,
         include_overlays: REQUEST_OVERLAY_IMAGES,
         quality: 'fast',
+        club: club ?? 'unknown',
       }),
     });
     if (!res.ok) {
@@ -189,12 +190,13 @@ export async function generateVisualAnalysis(
   result: SwingResult
 ): Promise<VisualAnalysis | null> {
   const notes = buildCoachingNotes(result);
+  const club  = result.selectedClub;
 
   // Prefer backend — works in Expo Go, handles frames + landmarks in one call
   if (BACKEND_URL) {
     console.log('[visualAnalysis] using backend extraction for', swingId);
     const backendResult = videoUri.startsWith('http')
-      ? await extractViaBackend(videoUri)
+      ? await extractViaBackend(videoUri, club)
       : await extractViaBackendUpload(videoUri);
 
     if (backendResult && backendResult.frames.length === 4) {
