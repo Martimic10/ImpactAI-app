@@ -16,6 +16,18 @@ export function calculateOverallScore(scores: SwingScores): number {
   );
 }
 
+// Maps issueCategory → which SwingScores key should be the lowest
+const ISSUE_TO_SCORE_KEY: Record<string, 'positionScore' | 'tempoScore' | 'sequenceScore' | 'stabilityScore' | 'contactScore'> = {
+  setup:    'positionScore',
+  posture:  'stabilityScore',
+  path:     'sequenceScore',
+  clubface: 'contactScore',
+  tempo:    'tempoScore',
+  contact:  'contactScore',
+  balance:  'stabilityScore',
+  rotation: 'sequenceScore',
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Generic / duplicate detection
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,9 +40,23 @@ function isGenericAnalysis(result: SwingResult): boolean {
   if (result.scores) {
     const s = result.scores;
     const vals = [s.positionScore, s.tempoScore, s.sequenceScore, s.stabilityScore, s.contactScore];
-    if (Math.max(...vals) - Math.min(...vals) < 8) {
-      console.warn('[openrouter] generic: scores too clustered');
+    const spread = Math.max(...vals) - Math.min(...vals);
+    if (spread < 8) {
+      console.warn('[openrouter] generic: scores too clustered (spread=' + spread + ')');
       return true;
+    }
+    // The issue category should be clearly below the others
+    const issueKey = ISSUE_TO_SCORE_KEY[result.issueCategory ?? ''];
+    if (issueKey && s[issueKey] != null) {
+      const issueScore = s[issueKey] as number;
+      const others = vals.filter((_, i) =>
+        (['positionScore','tempoScore','sequenceScore','stabilityScore','contactScore'] as const)[i] !== issueKey
+      );
+      const avgOthers = others.reduce((a, b) => a + b, 0) / others.length;
+      if (avgOthers - issueScore < 8) {
+        console.warn(`[openrouter] generic: issue category (${issueKey}=${issueScore}) not clearly below others (avg=${avgOthers.toFixed(0)})`);
+        return true;
+      }
     }
   }
   if (!result.evidence || result.evidence.length < 3) {
@@ -74,10 +100,24 @@ contactScore   — Impact posture, shaft lean at contact, low-point control, fac
 
 SCORING RULES:
 - Base every score on observable evidence in the frames + provided metrics.
-- Use the FULL range. Most amateur swings have a MIX of strong and weak categories.
-- 90-100: excellent  80-89: good  70-79: decent but needs work  60-69: clear issue  <60: major problem
-- Do NOT cluster all scores near 70 without evidence.
-- If tempoRatio is provided in metrics, use it to set tempoScore (3:1 ratio = ~88, 2:1 or 4:1 = ~72, outside = lower).
+- Use the FULL range — 90-100: excellent · 80-89: good · 70-79: decent · 60-69: clear issue · <60: major problem
+- If tempoRatio is provided in metrics, use it to set tempoScore (3:1 = ~88, 2:1 or 4:1 = ~72, outside = lower).
+
+PRIMARY ISSUE RULE (critical):
+- The category that matches the primaryIssue MUST score at least 15 points BELOW the average of the other 4.
+- If tempo is the only problem: positionScore, sequenceScore, stabilityScore, contactScore should each score 72–88 based on what you actually see — NOT all identical.
+- Two swings with the same primaryIssue WILL receive different overall scores when their non-issue mechanics differ.
+- Do NOT drag down all 5 categories just because one has an issue.
+
+SINGLE-ISSUE vs MULTI-ISSUE:
+- One clear issue: overall 70-84. The other 4 categories are strong (72+).
+- Two issues: overall 60-72. Two categories clearly below 65.
+- Three+ issues: overall 45-62. Multiple categories below 60.
+
+DIFFERENTIATION (important):
+- No two swings should receive identical category scores unless mechanics are genuinely identical.
+- A swing with good posture but bad tempo scores differently from one with bad posture AND bad tempo.
+- Score each category independently from the others.
 
 CLUB-SPECIFIC RULES:
 - Driver: launch angle, path, face control, rotation, balance
@@ -254,6 +294,26 @@ function validateAndFix(result: SwingResult, club?: string, temporalMetrics?: Te
   // Tempo: prefer the deterministic computed score from pose metrics
   const computedTempo = temporalMetrics?.computedTempoScore;
   s.tempoScore = computedTempo != null ? computedTempo : clamp(s.tempoScore);
+
+  // ── Enforce: issue category must score meaningfully lower than others ──────
+  // If the AI ignored the PRIMARY ISSUE RULE, correct it here so the overall
+  // score reflects the actual severity rather than a generic 65-70 across all.
+  const issueKey = ISSUE_TO_SCORE_KEY[result.issueCategory ?? ''];
+  if (issueKey && s[issueKey] != null) {
+    const allKeys = ['positionScore', 'tempoScore', 'sequenceScore', 'stabilityScore', 'contactScore'] as const;
+    const otherScores = allKeys
+      .filter((k) => k !== issueKey)
+      .map((k) => s[k] as number);
+    const avgOthers = otherScores.reduce((a, b) => a + b, 0) / otherScores.length;
+    const currentIssue = s[issueKey] as number;
+
+    if (avgOthers - currentIssue < 12) {
+      // Issue score isn't clearly enough below the others — pull it down
+      const corrected = Math.round(Math.max(30, Math.min(currentIssue, avgOthers - 15)));
+      console.log(`[openrouter] enforcing issue gap: ${issueKey} ${currentIssue}→${corrected} (others avg=${avgOthers.toFixed(1)})`);
+      (s as unknown as Record<string, number>)[issueKey] = corrected;
+    }
+  }
 
   // Always recalculate overall from the weighted formula
   const calculated = calculateOverallScore(s);
