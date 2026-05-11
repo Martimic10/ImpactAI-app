@@ -329,6 +329,31 @@ function buildFrame(
   };
 }
 
+export async function saveManualFrameOverride(
+  swingId: string,
+  phase: SwingPhase,
+  timeMs: number
+): Promise<void> {
+  try {
+    const { data } = await supabase
+      .from('swings')
+      .select('visual_analysis')
+      .eq('id', swingId)
+      .single();
+
+    if (!data?.visual_analysis) return;
+
+    const updated: VisualAnalysis = {
+      ...data.visual_analysis,
+      [phase]: { ...data.visual_analysis[phase], manualTimeMs: timeMs },
+    };
+    await supabase.from('swings').update({ visual_analysis: updated }).eq('id', swingId);
+    console.log(`[visualAnalysis] manual override saved: ${phase} → ${timeMs}ms`);
+  } catch (e) {
+    console.warn('[visualAnalysis] manual override failed:', e);
+  }
+}
+
 export async function saveVisualAnalysis(swingId: string, analysis: VisualAnalysis): Promise<void> {
   const { error } = await supabase
     .from('swings')

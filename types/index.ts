@@ -99,6 +99,7 @@ export interface FrameAnalysis {
   imageUrl: string;
   overlayImageUrl?: string;
   timeMs?: number;
+  manualTimeMs?: number; // user-set timestamp — overrides timeMs for video seeking
   phase: SwingPhase;
   label: string;
   coachingNote: string;

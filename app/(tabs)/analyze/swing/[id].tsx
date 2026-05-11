@@ -22,7 +22,7 @@ import { supabase } from '@/lib/supabase';
 import { Swing, getSwingScore, SwingPhase, VisualAnalysis } from '@/types';
 import { useTheme } from '@/hooks/useTheme';
 import { useAppColors } from '@/lib/theme';
-import { generateVisualAnalysisPreview, saveVisualAnalysis, VISUAL_ANALYSIS_VERSION } from '@/lib/visualAnalysis';
+import { generateVisualAnalysisPreview, saveVisualAnalysis, saveManualFrameOverride, VISUAL_ANALYSIS_VERSION } from '@/lib/visualAnalysis';
 import { SwingOverlay } from '@/components/SwingOverlay';
 import { hasProAccess } from '@/lib/plans';
 import { PaywallModal } from '@/components/PaywallModal';
@@ -41,22 +41,31 @@ const VA_PHASES: SwingPhase[] = ['setup', 'top', 'impact', 'finish'];
 // ─────────────────────────────────────────────────────────────────────────────
 // Fullscreen viewer — user-controlled thumbnail strip, no auto-pause
 // ─────────────────────────────────────────────────────────────────────────────
+// Phases the user can manually correct (address and FT are usually fine)
+const ADJUSTABLE_PHASES: SwingPhase[] = ['top', 'impact'];
+
 function FullscreenVideoViewer({
   url,
+  swingId,
   visualAnalysis,
   visible,
   onClose,
+  onPhaseAdjusted,
 }: {
   url: string;
+  swingId: string;
   visualAnalysis?: VisualAnalysis;
   visible: boolean;
   onClose: () => void;
+  onPhaseAdjusted?: (phase: SwingPhase, timeMs: number) => void;
 }) {
-  const [activePhase, setActivePhase] = useState<SwingPhase | null>(null);
-  const [isPlaying, setIsPlaying]     = useState(false);
-  const [showPose, setShowPose]       = useState(true);
+  const [activePhase, setActivePhase]   = useState<SwingPhase | null>(null);
+  const [isPlaying, setIsPlaying]       = useState(false);
+  const [showPose, setShowPose]         = useState(true);
   const [playbackRate, setPlaybackRate] = useState(0.35);
-  const [frameAspect, setFrameAspect] = useState(9 / 16);
+  const [frameAspect, setFrameAspect]   = useState(9 / 16);
+  const [adjustMode, setAdjustMode]     = useState(false);
+  const [savedPhase, setSavedPhase]     = useState<SwingPhase | null>(null);
 
   const player = useVideoPlayer(url || null, (p) => {
     p.loop = true;
@@ -70,6 +79,8 @@ function FullscreenVideoViewer({
   useEffect(() => {
     if (!visible) return;
     setActivePhase(null);
+    setAdjustMode(false);
+    setSavedPhase(null);
     setShowPose(true);
     setIsPlaying(true);
     player.currentTime = 0;
@@ -77,6 +88,8 @@ function FullscreenVideoViewer({
   }, [visible]);
 
   function togglePhase(phase: SwingPhase) {
+    setAdjustMode(false);
+    setSavedPhase(null);
     if (activePhase === phase) {
       setActivePhase(null);
       player.play();
@@ -86,13 +99,23 @@ function FullscreenVideoViewer({
       setShowPose(true);
       player.pause();
       setIsPlaying(false);
-      // Seek to the phase timestamp so the video freezes at the right frame
-      // even when there is no stored imageUrl
-      const timeMs = visualAnalysis?.[phase]?.timeMs;
-      if (timeMs != null) {
-        player.currentTime = timeMs / 1000;
+      // Prefer manual override timestamp if set, then stored timeMs
+      const frame = visualAnalysis?.[phase];
+      const seekMs = frame?.manualTimeMs ?? frame?.timeMs;
+      if (seekMs != null) {
+        player.currentTime = seekMs / 1000;
       }
     }
+  }
+
+  async function markCurrentFrame() {
+    if (!activePhase) return;
+    const timeMs = Math.round(player.currentTime * 1000);
+    setSavedPhase(activePhase);
+    setAdjustMode(false);
+    await saveManualFrameOverride(swingId, activePhase, timeMs);
+    onPhaseAdjusted?.(activePhase, timeMs);
+    setTimeout(() => setSavedPhase(null), 2000);
   }
 
   function togglePlayPause() {
@@ -215,25 +238,58 @@ function FullscreenVideoViewer({
                 <Ionicons name="golf" size={14} color="#4CAF50" />
               </View>
               <Text style={fs.coachPhase}>{PHASE_LABEL[activePhase]}</Text>
-              {hasPose && (
-                <TouchableOpacity
-                  onPress={() => setShowPose((v) => !v)}
-                  style={[fs.poseBtn, showPose && fs.poseBtnOn]}
-                  activeOpacity={0.8}
-                >
-                  <Ionicons name="body-outline" size={12} color={showPose ? '#0D0D0D' : '#FFF'} />
-                  <Text style={[fs.poseBtnText, showPose && fs.poseBtnTextOn]}>
-                    {showPose ? 'Hide Overlay' : 'Overlay'}
-                  </Text>
-                </TouchableOpacity>
-              )}
+              <View style={{ flexDirection: 'row', gap: 6 }}>
+                {hasPose && !adjustMode && (
+                  <TouchableOpacity
+                    onPress={() => setShowPose((v) => !v)}
+                    style={[fs.poseBtn, showPose && fs.poseBtnOn]}
+                    activeOpacity={0.8}
+                  >
+                    <Ionicons name="body-outline" size={12} color={showPose ? '#0D0D0D' : '#FFF'} />
+                    <Text style={[fs.poseBtnText, showPose && fs.poseBtnTextOn]}>
+                      {showPose ? 'Hide' : 'Overlay'}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+                {ADJUSTABLE_PHASES.includes(activePhase) && !adjustMode && (
+                  <TouchableOpacity
+                    onPress={() => { setAdjustMode(true); player.play(); setIsPlaying(true); }}
+                    style={fs.adjustBtn}
+                    activeOpacity={0.8}
+                  >
+                    <Ionicons name="pencil-outline" size={12} color="#FF9F0A" />
+                    <Text style={fs.adjustBtnText}>Adjust</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
             </View>
-            <Text style={fs.coachNote} numberOfLines={3}>{activeFrame?.coachingNote ?? ''}</Text>
+
+            {adjustMode ? (
+              <View style={fs.adjustArea}>
+                <Text style={fs.adjustHint}>
+                  Play to the correct {PHASE_LABEL[activePhase]} moment, then tap Mark.
+                </Text>
+                <TouchableOpacity onPress={markCurrentFrame} style={fs.markBtn} activeOpacity={0.85}>
+                  <Ionicons name="bookmark" size={13} color="#0D0D0D" />
+                  <Text style={fs.markBtnText}>Mark as {PHASE_LABEL[activePhase].split(' ')[0]}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => setAdjustMode(false)} style={fs.cancelAdjust}>
+                  <Text style={fs.cancelAdjustText}>Cancel</Text>
+                </TouchableOpacity>
+              </View>
+            ) : savedPhase === activePhase ? (
+              <View style={fs.savedRow}>
+                <Ionicons name="checkmark-circle" size={16} color="#4CAF50" />
+                <Text style={fs.savedText}>Frame saved!</Text>
+              </View>
+            ) : (
+              <Text style={fs.coachNote} numberOfLines={3}>{activeFrame?.coachingNote ?? ''}</Text>
+            )}
           </View>
         ) : (
           <View style={fs.hintCard}>
             <Ionicons name="hand-left-outline" size={16} color="#555" />
-            <Text style={fs.hintText}>Tap a phase below to freeze the frame</Text>
+            <Text style={fs.hintText}>Tap a phase · long-press Top or Impact to adjust</Text>
           </View>
         )}
 
@@ -752,9 +808,24 @@ export default function SwingDetailScreen() {
       {hasVideo && (
         <FullscreenVideoViewer
           url={activeVideoUrl}
+          swingId={id}
           visualAnalysis={swing.visual_analysis}
           visible={showFullscreen}
           onClose={() => setShowFullscreen(false)}
+          onPhaseAdjusted={(phase, timeMs) => {
+            // Patch the live swing state so the corrected frame is used immediately
+            setLiveSwing((prev) => {
+              const base = prev ?? swing;
+              if (!base?.visual_analysis) return prev;
+              return {
+                ...base,
+                visual_analysis: {
+                  ...base.visual_analysis,
+                  [phase]: { ...base.visual_analysis[phase], manualTimeMs: timeMs },
+                },
+              };
+            });
+          }}
         />
       )}
 
@@ -992,6 +1063,27 @@ const fs = StyleSheet.create({
   poseBtnText: { fontSize: 11, fontWeight: '700', color: '#FFF' },
   poseBtnTextOn: { color: '#0D0D0D' },
   coachNote: { fontSize: 13, color: '#B0BEC5', lineHeight: 19 },
+
+  // ── Adjust mode ──
+  adjustBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    backgroundColor: 'rgba(255,159,10,0.15)',
+    paddingHorizontal: 9, paddingVertical: 5,
+    borderRadius: 14, borderWidth: 1, borderColor: 'rgba(255,159,10,0.4)',
+  },
+  adjustBtnText: { fontSize: 11, fontWeight: '700', color: '#FF9F0A' },
+  adjustArea: { gap: 8, paddingTop: 4 },
+  adjustHint: { fontSize: 12, color: '#8E8E93', lineHeight: 17 },
+  markBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6,
+    backgroundColor: '#FF9F0A', borderRadius: 12,
+    paddingVertical: 10,
+  },
+  markBtnText: { fontSize: 13, fontWeight: '800', color: '#0D0D0D' },
+  cancelAdjust: { alignItems: 'center', paddingVertical: 4 },
+  cancelAdjustText: { fontSize: 12, color: '#555', fontWeight: '600' },
+  savedRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  savedText: { fontSize: 13, color: '#4CAF50', fontWeight: '600' },
 
   // ── Hint (no phase selected) ──
   hintCard: {
