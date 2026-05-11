@@ -4,7 +4,7 @@ import { SwingResult, VisualAnalysis, FrameAnalysis, SwingPhase, PoseLandmark, T
 
 const BUCKET = 'swing-videos';
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
-export const VISUAL_ANALYSIS_VERSION = 11;
+export const VISUAL_ANALYSIS_VERSION = 12;
 const REQUEST_OVERLAY_IMAGES = false;
 
 const FALLBACK_PHASE_TIMES_MS: Record<SwingPhase, number> = {
