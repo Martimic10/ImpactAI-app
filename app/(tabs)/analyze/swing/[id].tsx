@@ -441,8 +441,10 @@ export default function SwingDetailScreen() {
   const goBack = () => {
     if (from === 'analysis') {
       router.dismissAll();
-    } else {
+    } else if (router.canGoBack()) {
       router.back();
+    } else {
+      router.replace('/(tabs)/analyze');
     }
   };
   const { user } = useAuth();
@@ -737,7 +739,7 @@ export default function SwingDetailScreen() {
           </View>
           <TouchableOpacity
             style={styles.compareBtn}
-            onPress={() => router.push({ pathname: '/(tabs)/compare', params: { swingId: id } })}
+            onPress={() => router.navigate({ pathname: '/(tabs)/compare', params: { swingId: id } })}
             activeOpacity={0.85}
           >
             <Ionicons name="trending-up" size={12} color="#0D0D0D" />
