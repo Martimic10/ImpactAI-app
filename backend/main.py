@@ -28,21 +28,24 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 BUCKET = "swing-videos"
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
-# Prompt for vision-assisted event selection
-_EVENT_PROMPT = (
-    "You are a golf swing video analyst. Your ONLY task is to identify the correct "
-    "event frames — do NOT analyze swing quality.\n\n"
-    "TOP OF BACKSWING: club/hands at maximum backswing position, immediately before "
-    "the downswing starts. NOT address. NOT early takeaway. NOT mid-downswing.\n\n"
-    "IMPACT: clubhead at or closest to the golf ball / contact point. "
-    "If exact contact is between frames, choose the frame immediately BEFORE contact. "
-    "Do NOT choose follow-through. Do NOT choose a frame after the club has clearly passed.\n\n"
-    "Rules: use visible club position if possible; use hand/wrist as backup. "
-    "Bias impact slightly early rather than late. If unsure, lower confidence.\n\n"
-    "Return ONLY valid JSON — no markdown, no explanation:\n"
-    '{"topOfBackswing":{"candidateId":"top_NN","confidence":0.0},'
-    '"impact":{"candidateId":"impact_NN","confidence":0.0}}'
-)
+# Prompt for contact-sheet vision selection
+# Two labeled strips are sent: TOP STRIP and IMPACT STRIP, each showing frames
+# in chronological order. GPT-4o sees the full temporal progression.
+_SHEET_PROMPT = """\
+You are a golf swing phase analyst. You will see TWO contact sheets.
+Each sheet is a row of numbered frames in time order (left = earlier, right = later).
+Each frame is labeled "N: Xms" showing its number and timestamp.
+
+SHEET 1 — TOP OF BACKSWING candidates.
+SHEET 2 — IMPACT candidates.
+
+Definitions:
+• TOP OF BACKSWING: The frame where the golfer's hands/wrists are at their HIGHEST point in the image (maximum backswing height, body fully turned away, club at the top). Do NOT pick address or early takeaway.
+• IMPACT: The frame where the club is at or just before contact with the ball. The hands have returned to roughly hip height. The body has rotated toward the target. Choose the frame just BEFORE the club passes — do NOT choose follow-through.
+
+For each sheet, pick the single best frame number.
+Return ONLY valid JSON — no markdown, no text:
+{"top":{"frame":N,"confidence":0.0},"impact":{"frame":N,"confidence":0.0}}"""
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -665,80 +668,121 @@ def extract_phase_frames_at_indices(
     return results
 
 
-def extract_candidate_window(cap, fps: float, total_frames: int,
-                             lo_fi: int, hi_fi: int,
-                             n: int, prefix: str) -> List[Dict]:
-    """
-    Extract n evenly-spaced thumbnail frames between lo_fi and hi_fi.
-    Returns list of {id, fi, time_ms, frame} dicts (frame = base64 JPEG).
-    """
-    lo_fi = max(0, lo_fi)
-    hi_fi = min(total_frames - 1, hi_fi)
-    if hi_fi <= lo_fi or n < 1:
-        return []
-    step = max(1, (hi_fi - lo_fi) // max(n - 1, 1))
-    fis  = []
-    fi   = lo_fi
-    while fi <= hi_fi and len(fis) < n:
-        fis.append(fi)
-        fi += step
-
-    results = []
-    for idx, fi in enumerate(fis):
+def _find_quietest_frame(cap, lo_fi: int, hi_fi: int) -> int:
+    """Return the frame index with the least inter-frame motion in [lo_fi, hi_fi]."""
+    lo_fi = max(0, int(lo_fi))
+    hi_fi = max(lo_fi + 1, int(hi_fi))
+    step  = max(1, (hi_fi - lo_fi) // 24)
+    samples, prev_roi = [], None
+    for fi in range(lo_fi, hi_fi + 1, step):
         cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
         ret, frame = cap.read()
         if not ret:
             continue
-        # Small thumbnails — 320px max is enough for vision selection
-        small = resize_for_ai(frame, max_side=320)
-        b64   = encode_jpg(small, quality=65)
+        gray = cv2.cvtColor(_preprocess(frame), cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        roi  = cv2.resize(gray[int(h*0.05):int(h*0.92), int(w*0.08):int(w*0.92)], (80, 120))
+        motion = 0.0 if prev_roi is None else float(cv2.absdiff(roi, prev_roi).mean())
+        prev_roi = roi
+        samples.append((fi, motion))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    if not samples:
+        return lo_fi
+    # Skip the very first sample (motion=0 by definition); pick quietest of the rest
+    rest = samples[1:] if len(samples) > 1 else samples
+    return min(rest, key=lambda x: x[1])[0]
+
+
+def _extract_strip_frames(cap, fps: float, total_frames: int,
+                           lo_fi: int, hi_fi: int, n: int) -> List[Dict]:
+    """
+    Extract n evenly-spaced frames between lo_fi and hi_fi.
+    Returns list of {fi, time_ms, frame_bgr} dicts.
+    """
+    lo_fi = max(0, int(lo_fi))
+    hi_fi = min(int(total_frames) - 1, int(hi_fi))
+    if hi_fi <= lo_fi or n < 1:
+        return []
+    fis = [int(lo_fi + (hi_fi - lo_fi) * i / max(n - 1, 1)) for i in range(n)]
+    fis = list(dict.fromkeys(fis))  # deduplicate while preserving order
+
+    results = []
+    for fi in fis:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ret, frame = cap.read()
+        if not ret:
+            continue
         results.append({
-            "id":      f"{prefix}_{idx+1:02d}",
-            "fi":      fi,
-            "time_ms": int(fi / fps * 1000),
-            "frame":   b64,
+            "fi":       fi,
+            "time_ms":  int(fi / fps * 1000),
+            "frame_bgr": _preprocess(frame),
         })
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     return results
 
 
-def select_events_with_vision(top_cands: List[Dict], impact_cands: List[Dict],
-                               club: str = "unknown") -> Optional[Dict]:
+def _compose_contact_sheet(strip_frames: List[Dict], cell_h: int = 200) -> Optional[str]:
     """
-    Send candidate thumbnails to OpenRouter vision and get the best top/impact frame.
+    Compose a horizontal contact sheet from strip frames.
+    Each cell is resized to cell_h, labeled with its 1-based index and timestamp.
+    Returns base64 JPEG or None.
+    """
+    if not strip_frames:
+        return None
+    cells = []
+    for idx, info in enumerate(strip_frames):
+        frame = info["frame_bgr"]
+        h, w  = frame.shape[:2]
+        scale = cell_h / max(h, 1)
+        cw    = max(1, int(w * scale))
+        cell  = cv2.resize(frame, (cw, cell_h), interpolation=cv2.INTER_AREA)
+        # Label bar
+        bar = np.zeros((26, cw, 3), dtype=np.uint8)
+        cv2.putText(bar, f"{idx+1}: {info['time_ms']}ms",
+                    (2, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 230, 100), 1, cv2.LINE_AA)
+        cells.append(np.vstack([cell, bar]))
+    sheet = np.hstack(cells)
+    _, buf = cv2.imencode(".jpg", sheet, [cv2.IMWRITE_JPEG_QUALITY, 72])
+    return base64.b64encode(buf).decode("utf-8")
+
+
+def select_phases_with_vision(top_strip: List[Dict], impact_strip: List[Dict],
+                              club: str = "unknown") -> Optional[Dict]:
+    """
+    Send two contact-sheet images to OpenRouter vision (one API call).
+    Each sheet shows frames in time order with numbered labels.
     Returns {"top_fi", "top_ms", "top_conf", "impact_fi", "impact_ms", "impact_conf"} or None.
-    Falls back silently if the API key is missing or the call fails.
     """
-    if not OPENROUTER_KEY or not top_cands or not impact_cands:
+    if not OPENROUTER_KEY or not top_strip or not impact_strip:
         return None
 
-    # Build the multimodal message — label each candidate clearly
-    content = []
-    content.append({"type": "text",
-                    "text": f"Club: {club}\n\nTOP OF BACKSWING CANDIDATES ({len(top_cands)} frames):"})
-    for c in top_cands:
-        content.append({"type": "text", "text": f"[{c['id']}] t={c['time_ms']}ms"})
-        content.append({"type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{c['frame']}",
-                                      "detail": "low"}})
+    top_sheet    = _compose_contact_sheet(top_strip)
+    impact_sheet = _compose_contact_sheet(impact_strip)
+    if not top_sheet or not impact_sheet:
+        return None
 
-    content.append({"type": "text",
-                    "text": f"\nIMPACT CANDIDATES ({len(impact_cands)} frames):"})
-    for c in impact_cands:
-        content.append({"type": "text", "text": f"[{c['id']}] t={c['time_ms']}ms"})
-        content.append({"type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{c['frame']}",
-                                      "detail": "low"}})
+    n_top    = len(top_strip)
+    n_impact = len(impact_strip)
 
-    content.append({"type": "text", "text": "\nReturn JSON only."})
+    content = [
+        {"type": "text",
+         "text": f"Club: {club}\nSHEET 1 — TOP OF BACKSWING candidates ({n_top} frames, left=earlier):"},
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/jpeg;base64,{top_sheet}", "detail": "auto"}},
+        {"type": "text",
+         "text": f"SHEET 2 — IMPACT candidates ({n_impact} frames, left=earlier):"},
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/jpeg;base64,{impact_sheet}", "detail": "auto"}},
+        {"type": "text", "text": "Return ONLY the JSON."},
+    ]
 
     body = json.dumps({
         "model": "openai/gpt-4o",
         "messages": [
-            {"role": "system", "content": _EVENT_PROMPT},
+            {"role": "system", "content": _SHEET_PROMPT},
             {"role": "user",   "content": content},
         ],
-        "max_tokens": 120,
+        "max_tokens": 80,
         "temperature": 0.05,
     }).encode("utf-8")
 
@@ -754,119 +798,162 @@ def select_events_with_vision(top_cands: List[Dict], impact_cands: List[Dict],
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=22) as resp:
+        with urllib.request.urlopen(req, timeout=28) as resp:
             raw = json.loads(resp.read())["choices"][0]["message"]["content"]
         start = raw.index("{")
         end   = raw.rindex("}") + 1
         sel   = json.loads(raw[start:end])
 
-        top_id     = sel.get("topOfBackswing", {}).get("candidateId", "")
-        impact_id  = sel.get("impact",         {}).get("candidateId", "")
-        top_conf   = float(sel.get("topOfBackswing", {}).get("confidence", 0.5))
-        impact_conf = float(sel.get("impact",        {}).get("confidence", 0.5))
+        top_n    = int(sel.get("top",    {}).get("frame", 0))
+        impact_n = int(sel.get("impact", {}).get("frame", 0))
+        top_conf    = float(sel.get("top",    {}).get("confidence", 0.5))
+        impact_conf = float(sel.get("impact", {}).get("confidence", 0.5))
 
-        top_c    = next((c for c in top_cands    if c["id"] == top_id),    None)
-        impact_c = next((c for c in impact_cands if c["id"] == impact_id), None)
-
-        if not top_c or not impact_c:
-            print(f"[vision] candidate lookup failed: top={top_id} impact={impact_id}")
+        if not (1 <= top_n <= n_top and 1 <= impact_n <= n_impact):
+            print(f"[vision] frame numbers out of range: top={top_n}/{n_top} impact={impact_n}/{n_impact}")
             return None
 
-        print(f"[vision] top={top_c['time_ms']}ms(conf={top_conf:.2f}) "
-              f"impact={impact_c['time_ms']}ms(conf={impact_conf:.2f})")
+        tc = top_strip[top_n - 1]
+        ic = impact_strip[impact_n - 1]
+        print(f"[vision] top={tc['time_ms']}ms(conf={top_conf:.2f})  "
+              f"impact={ic['time_ms']}ms(conf={impact_conf:.2f})")
         return {
-            "top_fi":      top_c["fi"],
-            "top_ms":      top_c["time_ms"],
+            "top_fi":      tc["fi"],
+            "top_ms":      tc["time_ms"],
             "top_conf":    top_conf,
-            "impact_fi":   impact_c["fi"],
-            "impact_ms":   impact_c["time_ms"],
+            "impact_fi":   ic["fi"],
+            "impact_ms":   ic["time_ms"],
             "impact_conf": impact_conf,
         }
     except Exception as exc:
-        print(f"[vision] selection failed: {exc}")
+        print(f"[vision] sheet selection failed: {exc}")
         return None
 
 
 def detect_and_extract(cap, fps: float, include_overlays: bool = False,
-                       quality: str = "fast", club: str = "unknown") -> List[dict]:
+                       quality: str = "fast", club: str = "unknown"):
     """
-    Pose-based phase detection:
+    Burst-anchored phase detection — every phase is computed relative to when
+    the actual swing motion occurs, not global video percentages.
 
-       SETUP   — stable early hand position near address
-       TOP     — high, far hand position before the fast downswing
-       IMPACT  — fast post-top return near the setup hand position
-       FOLLOW  — first post-impact slowdown, or a short time after impact
-
-    Falls back to the older motion-burst percentages when landmark coverage is
-    too sparse or noisy to produce ordered phase frames.
+    1. find_swing_burst  → where the swing actually is in the video
+    2. address           → quietest frame in [burst_start-2.5s, burst_start-0.25s]
+    3. top window        → [address+0.2s, burst_start+0.35s]   (backswing region)
+    4. impact window     → [burst_start-0.15s, burst_start+60% of burst]
+    5. Vision contact-sheet selection for top + impact (one API call)
+    6. follow-through    → impact + 0.35–0.55s
     """
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total_frames <= 0:
-        return [{"frame": None, "overlay_frame": None, "landmarks": None,
-                 "time_ms": int(total_frames * p / fps * 1000)}
-                for p in [0.08, 0.40, 0.62, 0.82]]
+        empty = [{"frame": None, "overlay_frame": None, "landmarks": None, "time_ms": t}
+                 for t in [200, 1400, 2600, 3400]]
+        return empty, {}
 
-    try:
-        samples   = _sample_pose_track(cap, fps, total_frames, quality)
-        detection = detect_swing_events(samples, total_frames, fps)
-
-        if detection is not None:
-            phase_fis, confidence, methods = detection
-            addr_fi, top_fi_h, impact_fi_h, ft_fi = phase_fis
-
-            # ── Vision-assisted top + impact selection ──────────────────────
-            # Build candidate windows around the heuristic estimates
-            top_lo    = addr_fi + max(3, int(total_frames * 0.08))
-            top_hi    = min(int(total_frames * 0.62), top_fi_h + int(fps * 1.5))
-            impact_lo = top_fi_h + max(2, int(fps * 0.05))
-            impact_hi = min(int(total_frames * 0.88), impact_fi_h + int(fps * 1.2))
-
-            top_cands    = extract_candidate_window(cap, fps, total_frames,
-                                                    top_lo, top_hi, 7, "top")
-            impact_cands = extract_candidate_window(cap, fps, total_frames,
-                                                    impact_lo, impact_hi, 7, "impact")
-
-            vision = select_events_with_vision(top_cands, impact_cands, club)
-
-            if vision and vision["top_fi"] < vision["impact_fi"]:
-                phase_fis = [addr_fi, vision["top_fi"], vision["impact_fi"], ft_fi]
-                confidence["top"]    = vision["top_conf"]
-                confidence["impact"] = vision["impact_conf"]
-                methods["top"]    = "vision_assisted"
-                methods["impact"] = "vision_assisted"
-                print("[events] using vision-selected top+impact")
-            else:
-                if vision:
-                    print("[events] vision result invalid (out of order) — using heuristic")
-                phase_fis = refine_phase_indices(cap, fps, total_frames, phase_fis, quality)
-
-            # Validate final ordering
-            if not (phase_fis[0] < phase_fis[1] < phase_fis[2] < phase_fis[3]):
-                print("[events] final phase_fis out of order — fallback")
-                raise ValueError("out of order")
-
-            frames  = extract_phase_frames_at_indices(
-                cap, fps, total_frames, phase_fis, include_overlays)
-            metrics = compute_temporal_metrics(phase_fis, fps, samples)
-            metrics["eventConfidence"]  = confidence
-            metrics["detectionMethods"] = methods
-            return frames, metrics
-
-        print("[events] insufficient pose track; falling back to motion burst structure")
-    except Exception as exc:
-        print(f"[events] detection threw: {exc} — falling back to motion burst")
-        samples = []
-
+    # ── 1. Locate the swing burst ─────────────────────────────────────────────
     burst_start, burst_end = find_swing_burst(cap, total_frames, fps)
-    frames = extract_phase_frames_by_structure(cap, fps, total_frames, burst_start, burst_end)
-    span   = max(1, burst_end - burst_start)
-    fallback_fis = [
-        int(total_frames * 0.08),
-        burst_start,
-        burst_start + int(span * 0.25),
-        burst_start + int(span * 0.82),
-    ]
-    metrics = compute_temporal_metrics(fallback_fis, fps, samples)
+    burst_span = max(1, burst_end - burst_start)
+
+    # ── 2. Address frame ──────────────────────────────────────────────────────
+    # Quietest frame in the window before the burst (player still at setup)
+    addr_lo = max(0, burst_start - int(fps * 2.5))
+    addr_hi = max(addr_lo + 3, burst_start - int(fps * 0.25))
+    addr_fi  = _find_quietest_frame(cap, addr_lo, addr_hi)
+
+    # ── 3. Top of backswing window ────────────────────────────────────────────
+    # From shortly after address up to just past the burst start.
+    # The backswing ends at or very near burst_start (when the downswing explosion begins).
+    top_lo = addr_fi + max(2, int(fps * 0.20))
+    top_hi = min(burst_start + int(fps * 0.35), int(total_frames * 0.82))
+
+    # ── 4. Impact window ─────────────────────────────────────────────────────
+    # The burst IS the downswing. Impact is in the first ~60% of the burst.
+    impact_lo = max(burst_start - int(fps * 0.15), top_lo + int(fps * 0.08))
+    impact_hi = min(burst_start + int(burst_span * 0.62), int(total_frames * 0.88))
+
+    # Ensure windows are valid
+    if top_hi <= top_lo:
+        top_hi = top_lo + max(2, int(fps * 0.5))
+    if impact_hi <= impact_lo:
+        impact_hi = impact_lo + max(2, int(fps * 0.3))
+
+    print(f"[burst] addr={int(addr_fi/fps*1000)}ms  "
+          f"burst={int(burst_start/fps*1000)}-{int(burst_end/fps*1000)}ms")
+    print(f"[windows] top={int(top_lo/fps*1000)}-{int(top_hi/fps*1000)}ms  "
+          f"impact={int(impact_lo/fps*1000)}-{int(impact_hi/fps*1000)}ms")
+
+    # ── 5. Extract frame strips for vision ───────────────────────────────────
+    N_STRIP = 12  # frames per contact sheet
+    top_strip    = _extract_strip_frames(cap, fps, total_frames, top_lo,    top_hi,    N_STRIP)
+    impact_strip = _extract_strip_frames(cap, fps, total_frames, impact_lo, impact_hi, N_STRIP)
+
+    # Fallback indices if vision is unavailable
+    top_fi    = max(top_lo,    burst_start - int(fps * 0.05))
+    impact_fi = min(impact_hi, burst_start + int(burst_span * 0.25))
+
+    vision = select_phases_with_vision(top_strip, impact_strip, club)
+    if vision and vision["top_fi"] < vision["impact_fi"]:
+        top_fi    = vision["top_fi"]
+        impact_fi = vision["impact_fi"]
+        print("[events] using vision-selected top + impact")
+    else:
+        # Vision unavailable or returned invalid order — use motion energy within windows
+        if top_strip:
+            # Top = frame with lowest inter-frame motion in the top window (the pause at the top)
+            prev_roi, motion_vals = None, []
+            for info in top_strip:
+                gray = cv2.cvtColor(info["frame_bgr"], cv2.COLOR_BGR2GRAY)
+                h, w = gray.shape
+                roi  = cv2.resize(gray[int(h*0.05):int(h*0.92), int(w*0.08):int(w*0.92)], (64, 96))
+                m    = 0.0 if prev_roi is None else float(cv2.absdiff(roi, prev_roi).mean())
+                prev_roi = roi
+                motion_vals.append((info["fi"], m))
+            if len(motion_vals) > 1:
+                top_fi = min(motion_vals[1:], key=lambda x: x[1])[0]
+
+        if impact_strip:
+            # Impact = peak motion in the impact window
+            prev_roi, motion_vals = None, []
+            for info in impact_strip:
+                gray = cv2.cvtColor(info["frame_bgr"], cv2.COLOR_BGR2GRAY)
+                h, w = gray.shape
+                roi  = cv2.resize(gray[int(h*0.05):int(h*0.92), int(w*0.08):int(w*0.92)], (64, 96))
+                m    = 0.0 if prev_roi is None else float(cv2.absdiff(roi, prev_roi).mean())
+                prev_roi = roi
+                motion_vals.append((info["fi"], m))
+            if motion_vals:
+                impact_fi = max(motion_vals, key=lambda x: x[1])[0]
+
+        print(f"[events] no-vision fallback: top={int(top_fi/fps*1000)}ms  "
+              f"impact={int(impact_fi/fps*1000)}ms")
+
+    # ── 6. Follow-through ─────────────────────────────────────────────────────
+    ft_min  = impact_fi + max(2, int(fps * 0.30))
+    ft_fi   = min(ft_min + int(fps * 0.20), int(total_frames * 0.96) - 1)
+
+    # ── 7. Enforce ordering ───────────────────────────────────────────────────
+    min_gap = max(1, int(fps * 0.04))  # at least 40ms between phases
+    if top_fi <= addr_fi + min_gap:
+        top_fi = addr_fi + min_gap
+    if impact_fi <= top_fi + min_gap:
+        impact_fi = top_fi + min_gap
+    if ft_fi <= impact_fi + min_gap:
+        ft_fi = impact_fi + min_gap
+    ft_fi = min(ft_fi, total_frames - 1)
+
+    phase_fis = [int(addr_fi), int(top_fi), int(impact_fi), int(ft_fi)]
+    print(f"[phases] addr={int(addr_fi/fps*1000)}ms  top={int(top_fi/fps*1000)}ms  "
+          f"impact={int(impact_fi/fps*1000)}ms  ft={int(ft_fi/fps*1000)}ms")
+
+    # ── 8. Extract final frames + temporal metrics ────────────────────────────
+    frames  = extract_phase_frames_at_indices(cap, fps, total_frames, phase_fis, include_overlays)
+    samples = _sample_pose_track(cap, fps, total_frames, quality)
+    metrics = compute_temporal_metrics(phase_fis, fps, samples)
+    metrics["detectionMethods"] = {
+        "address":       "burst_anchor",
+        "top":           "vision_sheet" if (vision and vision["top_fi"] == top_fi) else "motion_energy",
+        "impact":        "vision_sheet" if (vision and vision["impact_fi"] == impact_fi) else "motion_energy",
+        "followThrough": "offset",
+    }
     return frames, metrics
 
 
