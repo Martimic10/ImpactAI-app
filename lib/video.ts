@@ -1,6 +1,8 @@
 import * as LegacyFS from 'expo-file-system/legacy';
 
-const FRAME_TIMES_MS = [200, 1000, 2000];
+// Spread across a wider range so longer videos (5-8s) are covered
+// Used only when backend is unavailable
+const FRAME_TIMES_MS = [400, 1200, 2200, 3400, 5000];
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
 
 function getVideoThumbnails() {
@@ -76,7 +78,20 @@ export async function extractFrames(uri: string): Promise<string[]> {
     }
   }
 
-  // Videos: try local thumbnail extraction first
+  // Videos: backend is strongly preferred for AI analysis.
+  // It uses OpenCV to sample evenly across the actual video duration,
+  // resizes to 640px max (vs full-res thumbnails), handles HEVC/MOV,
+  // and produces ~50KB frames instead of ~270KB — far better for GPT-4o.
+  if (BACKEND_URL) {
+    const backendFrames = await extractFramesViaBackend(uri);
+    if (backendFrames.length >= 2) {
+      console.log(`[video] backend extracted ${backendFrames.length} frames`);
+      return backendFrames;
+    }
+    console.warn('[video] backend returned insufficient frames, trying local');
+  }
+
+  // Local fallback — when backend is unavailable
   const VideoThumbnails = getVideoThumbnails();
   if (VideoThumbnails) {
     const frames: string[] = [];
@@ -84,23 +99,19 @@ export async function extractFrames(uri: string): Promise<string[]> {
       try {
         const { uri: thumbUri } = await VideoThumbnails.getThumbnailAsync(uri, {
           time: timeMs,
-          quality: 0.7,
+          quality: 0.55,  // lower quality = smaller files, fewer refusals from AI
         });
         const base64 = await readBase64(thumbUri);
         frames.push(base64);
-      } catch (e) {
-        console.warn(`[video] frame at ${timeMs}ms failed:`, e);
+        if (frames.length >= 4) break;  // 4 good local frames is enough
+      } catch {
+        // timestamp past video end — normal for short videos, just skip
       }
     }
-    console.log(`[video] local extracted ${frames.length}/${FRAME_TIMES_MS.length} frames`);
-    if (frames.length > 0) return frames;
+    console.log(`[video] local extracted ${frames.length} frames`);
+    if (frames.length >= 2) return frames;
   }
 
-  // Fallback: send video to backend for server-side frame extraction
-  if (BACKEND_URL) {
-    return extractFramesViaBackend(uri);
-  }
-
-  console.warn('[video] no frames extracted and no backend configured');
+  console.warn('[video] no frames extracted');
   return [];
 }

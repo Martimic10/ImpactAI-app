@@ -26,12 +26,13 @@ export interface SwingScores {
 }
 
 export interface SwingScoreReasoning {
-  position: string;
-  tempo: string;
-  sequence: string;
-  stability: string;
-  contact: string;
-  // Legacy
+  // v3 field names
+  position?: string;
+  tempo?: string;
+  sequence?: string;
+  stability?: string;
+  contact?: string;
+  // Legacy v2 field names — kept so old saved swings still render
   setup?: string;
   posture?: string;
   swingPath?: string;

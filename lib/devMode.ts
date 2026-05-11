@@ -41,7 +41,7 @@ export const MOCK_SWINGS: Swing[] = [
       clubMatch: 'match' as const,
       clubMatchReason: 'Club length and head size consistent with a mid iron.',
       cameraAngle: 'face-on' as const,
-      scores: { overallScore: 63, setupScore: 74, postureScore: 44, swingPathScore: 66, tempoScore: 71, balanceScore: 58, contactScore: 55, confidence: 6 },
+      scores: { overallScore: 63, positionScore: 74, tempoScore: 71, sequenceScore: 66, stabilityScore: 44, contactScore: 55, confidence: 6 },
       evidence: [
         'Hips appear to thrust toward the ball rather than rotate, causing the upper body to rise.',
         'From the face-on view, posture angle is lost before impact.',
@@ -89,7 +89,7 @@ export const MOCK_SWINGS: Swing[] = [
       clubMatch: 'match' as const,
       clubMatchReason: 'Short, lofted club visible — consistent with a wedge.',
       cameraAngle: 'down-the-line' as const,
-      scores: { overallScore: 71, setupScore: 80, postureScore: 76, swingPathScore: 73, tempoScore: 82, balanceScore: 75, contactScore: 48, confidence: 7 },
+      scores: { overallScore: 71, positionScore: 80, tempoScore: 82, sequenceScore: 73, stabilityScore: 76, contactScore: 48, confidence: 7 },
       evidence: [
         'Hands appear to release past the clubhead before impact, removing forward shaft lean.',
         'The trail wrist appears to flip through the impact zone rather than hold its angle.',

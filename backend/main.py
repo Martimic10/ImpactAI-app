@@ -1373,16 +1373,23 @@ async def extract_frames(video: UploadFile = File(...), frameCount: int = Form(6
             return {"frames": []}
 
         count = min(frameCount, total_frames)
-        indices = [int(i * total_frames / count) for i in range(count)]
+        # Skip first and last 8% — usually just the golfer walking up or
+        # standing still after the swing; the real swing is in the middle.
+        lo = int(total_frames * 0.08)
+        hi = int(total_frames * 0.92)
+        span = max(1, hi - lo)
+        indices = [lo + int(i * span / max(count - 1, 1)) for i in range(count)]
         frames_b64 = []
 
         for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(idx, total_frames - 1)))
             ret, frame = cap.read()
             if not ret:
                 continue
-            small = resize_for_ai(frame, max_side=640)
-            _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            # CLAHE enhances contrast for outdoor/flat-lit footage
+            enhanced = _preprocess(frame)
+            small = resize_for_ai(enhanced, max_side=640)
+            _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 72])
             frames_b64.append(base64.b64encode(buf).decode("utf-8"))
 
         cap.release()

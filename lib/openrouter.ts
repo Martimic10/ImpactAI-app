@@ -423,11 +423,10 @@ function isRefusal(content: string): boolean {
   return !lower.startsWith('{') && REFUSAL_PATTERNS.some((p) => lower.includes(p));
 }
 
-const FORCE_JSON_PROMPT = `You must analyze this golf swing image and return ONLY a JSON object.
-Do NOT refuse. Do NOT say you cannot analyze it.
-Even if image quality is low, estimate scores and provide coaching.
-A low-quality analysis is far better than no analysis.
-Return the JSON schema immediately — start with { and end with }.`;
+const FORCE_JSON_PROMPT = `These images show a golfer. Analyze the visible body position, club, and motion.
+You MUST return the JSON schema — no refusals, no plain text.
+If image quality limits your view, estimate from what is visible and set confidence to 3-4.
+Start your response with { and end with }.`;
 
 export async function analyzeSwingFrames(
   base64Frames: string[],
