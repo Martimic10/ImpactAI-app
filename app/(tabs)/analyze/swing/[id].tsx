@@ -289,7 +289,7 @@ function FullscreenVideoViewer({
         ) : (
           <View style={fs.hintCard}>
             <Ionicons name="hand-left-outline" size={16} color="#555" />
-            <Text style={fs.hintText}>Tap a phase · long-press Top or Impact to adjust</Text>
+            <Text style={fs.hintText}>Tap a phase to freeze it · tap Adjust to correct Top or Impact</Text>
           </View>
         )}
 

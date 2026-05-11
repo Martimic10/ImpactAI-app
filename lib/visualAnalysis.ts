@@ -100,7 +100,7 @@ async function uploadFrame(
 }
 
 // Sends the local video file directly to the backend (for file:// URIs)
-async function extractViaBackendUpload(localUri: string): Promise<BackendResult | null> {
+async function extractViaBackendUpload(localUri: string, club?: string): Promise<BackendResult | null> {
   try {
     const formData = new FormData();
     formData.append('video', {
@@ -110,6 +110,7 @@ async function extractViaBackendUpload(localUri: string): Promise<BackendResult 
     } as unknown as Blob);
     formData.append('include_overlays', REQUEST_OVERLAY_IMAGES ? 'true' : 'false');
     formData.append('quality', 'fast');
+    if (club) formData.append('club', club);
 
     const res = await fetch(`${BACKEND_URL}/extract-key-frames-upload`, {
       method: 'POST',
@@ -197,7 +198,7 @@ export async function generateVisualAnalysis(
     console.log('[visualAnalysis] using backend extraction for', swingId);
     const backendResult = videoUri.startsWith('http')
       ? await extractViaBackend(videoUri, club)
-      : await extractViaBackendUpload(videoUri);
+      : await extractViaBackendUpload(videoUri, club);
 
     if (backendResult && backendResult.frames.length === 4) {
       const { frames: bf, metrics } = backendResult;
@@ -276,9 +277,10 @@ export async function generateVisualAnalysisPreview(
 
   const notes = buildCoachingNotes(result);
   console.log('[visualAnalysis] using fast preview extraction for', swingId);
+  const club = result.selectedClub;
   const backendResult = videoUri.startsWith('http')
-    ? await extractViaBackend(videoUri)
-    : await extractViaBackendUpload(videoUri);
+    ? await extractViaBackend(videoUri, club)
+    : await extractViaBackendUpload(videoUri, club);
 
   if (!backendResult || backendResult.frames.length !== 4) return null;
   const { frames: bf } = backendResult;

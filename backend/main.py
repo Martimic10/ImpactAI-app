@@ -1209,6 +1209,7 @@ async def extract_key_frames_upload(
     video: UploadFile = File(...),
     include_overlays: bool = Form(False),
     quality: str = Form("fast"),
+    club: str = Form("unknown"),
 ):
     tmp_path = None
     cleanup = None
@@ -1220,7 +1221,7 @@ async def extract_key_frames_upload(
         cap, _, cleanup = open_video(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         quality = quality if quality in ["fast", "accurate"] else "fast"
-        results, metrics = detect_and_extract(cap, fps, include_overlays, quality)
+        results, metrics = detect_and_extract(cap, fps, include_overlays, quality, club=club)
 
         cap.release()
         return {"frames": results, "metrics": metrics}
