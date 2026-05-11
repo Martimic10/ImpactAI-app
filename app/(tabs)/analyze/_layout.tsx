@@ -6,9 +6,9 @@ export default function AnalyzeLayout() {
       <Stack.Screen name="index" />
       <Stack.Screen name="record" options={{ presentation: 'fullScreenModal' }} />
       <Stack.Screen name="preview" options={{ presentation: 'fullScreenModal' }} />
-      <Stack.Screen name="processing" options={{ presentation: 'fullScreenModal', gestureEnabled: false }} />
+      <Stack.Screen name="processing" options={{ presentation: 'fullScreenModal' }} />
       <Stack.Screen name="results" options={{ presentation: 'fullScreenModal' }} />
-      <Stack.Screen name="swing/[id]" options={{ presentation: 'fullScreenModal' }} />
+      <Stack.Screen name="swing/[id]" />
     </Stack>
   );
 }

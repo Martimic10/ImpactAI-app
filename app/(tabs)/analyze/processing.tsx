@@ -78,7 +78,7 @@ export default function ProcessingScreen() {
 
       advanceTo(100, 400);
       setTimeout(() => {
-        router.replace({
+        router.push({
           pathname: '/(tabs)/analyze/swing/[id]',
           params: { id: swingId, from: 'analysis' },
         });

@@ -496,7 +496,9 @@ export default function SwingDetailScreen() {
   const { id, from } = useLocalSearchParams<{ id: string; from?: string }>();
   const goBack = () => {
     if (from === 'analysis') {
-      router.dismissAll();
+      // After a fresh analysis, replace the whole stack with the analyze home
+      // so the back history doesn't include preview/processing screens
+      router.replace('/(tabs)/analyze');
     } else if (router.canGoBack()) {
       router.back();
     } else {
