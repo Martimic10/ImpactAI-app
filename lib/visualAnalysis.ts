@@ -51,6 +51,16 @@ interface BackendResult {
   metrics: TemporalMetrics | null;
 }
 
+export async function fetchBackendResult(
+  videoUri: string,
+  club?: string,
+): Promise<BackendResult | null> {
+  if (!BACKEND_URL) return null;
+  return videoUri.startsWith('http')
+    ? extractViaBackend(videoUri, club)
+    : extractViaBackendUpload(videoUri, club);
+}
+
 async function extractViaBackend(videoUrl: string, club?: string): Promise<BackendResult | null> {
   try {
     const res = await fetch(`${BACKEND_URL}/extract-key-frames`, {
@@ -262,6 +272,35 @@ export async function generateVisualAnalysis(
     console.error('[visualAnalysis] local extraction threw:', e);
     return null;
   }
+}
+
+export type { BackendResult };
+
+export async function buildVisualAnalysisFromBackendResult(
+  backendResult: BackendResult,
+  swingId: string,
+  userId: string,
+  result: SwingResult,
+): Promise<VisualAnalysis | null> {
+  const notes = buildCoachingNotes(result);
+  const { frames: bf } = backendResult;
+  if (bf.length !== 4 || bf.filter((f) => f.frame).length < 2) return null;
+
+  const uploadedUrls = await Promise.all(
+    PHASES.map((phase, i) =>
+      bf[i].frame ? uploadFrame(bf[i].frame!, userId, swingId, phase) : Promise.resolve(null)
+    )
+  );
+
+  const va: VisualAnalysis = {
+    setup:  buildFrame('setup',  uploadedUrls[0], notes.setup,  bf[0]?.landmarks, undefined, bf[0]?.time_ms),
+    top:    buildFrame('top',    uploadedUrls[1], notes.top,    bf[1]?.landmarks, undefined, bf[1]?.time_ms),
+    impact: buildFrame('impact', uploadedUrls[2], notes.impact, bf[2]?.landmarks, undefined, bf[2]?.time_ms),
+    finish: buildFrame('finish', uploadedUrls[3], notes.finish, bf[3]?.landmarks, undefined, bf[3]?.time_ms),
+  };
+
+  await saveVisualAnalysis(swingId, va);
+  return va;
 }
 
 export async function generateVisualAnalysisPreview(

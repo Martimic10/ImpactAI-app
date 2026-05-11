@@ -5,11 +5,14 @@ import { extractFrames } from '@/lib/video';
 import { analyzeSwingFrames } from '@/lib/openrouter';
 import { MOCK_SWING_RESULT } from '@/lib/frames';
 import { generateAndUploadThumbnail } from '@/lib/thumbnails';
-import { generateVisualAnalysis, saveVisualAnalysis } from '@/lib/visualAnalysis';
+import {
+  fetchBackendResult,
+  buildVisualAnalysisFromBackendResult,
+} from '@/lib/visualAnalysis';
 import { getSwingById, saveSwingThumbnail, updateSwingAnalysis } from '@/lib/swings';
 import { supabase } from '@/lib/supabase';
+import { getSwingPrivacy } from '@/lib/preferences';
 
-// Download a remote video to the local cache so VideoThumbnails can read it
 async function downloadToLocal(remoteUrl: string, swingId: string): Promise<string> {
   const dest = `${LegacyFS.cacheDirectory}swing_${swingId}.mp4`;
   const { uri } = await LegacyFS.downloadAsync(remoteUrl, dest);
@@ -45,18 +48,43 @@ const useMock = () =>
   !process.env.EXPO_PUBLIC_OPENROUTER_API_KEY ||
   process.env.EXPO_PUBLIC_OPENROUTER_API_KEY === 'your_openrouter_api_key';
 
-async function runFrameAnalysis(uri: string, club?: string): Promise<SwingResult> {
+// ─── Unified backend analysis ─────────────────────────────────────────────────
+// Calls /extract-key-frames once to get phase-aligned frames + temporal metrics,
+// feeds them directly to the AI. Eliminates the separate /extract-frames call.
+// Falls back to /extract-frames if the backend is unavailable.
+interface FrameAnalysisResult {
+  result: SwingResult;
+  backendResult?: Awaited<ReturnType<typeof fetchBackendResult>>;
+}
+
+async function runFrameAnalysis(uri: string, club?: string): Promise<FrameAnalysisResult> {
   if (useMock()) {
     await new Promise((r) => setTimeout(r, 1200));
-    return { ...MOCK_SWING_RESULT, selectedClub: club ?? MOCK_SWING_RESULT.selectedClub };
+    return { result: { ...MOCK_SWING_RESULT, selectedClub: club ?? MOCK_SWING_RESULT.selectedClub } };
   }
-  const frames = await extractFrames(uri);
-  console.log(`[analysis] frames extracted: ${frames.length}, sizes: ${frames.slice(0, 3).map(f => f.length).join(',')}`);
+
+  // Try the phase-detection backend first — gives us temporal metrics for the AI
+  const backendResult = await fetchBackendResult(uri, club);
+  const goodFrames = backendResult?.frames.filter((f) => f.frame) ?? [];
+
+  let frames: string[];
+  if (goodFrames.length >= 2) {
+    frames = goodFrames.map((f) => f.frame!);
+    console.log(`[analysis] using ${frames.length} phase-aligned backend frames`);
+  } else {
+    // Fallback: evenly-spaced frames via /extract-frames (no temporal metrics)
+    frames = await extractFrames(uri);
+    console.log(`[analysis] fallback: ${frames.length} frames, sizes: ${frames.slice(0, 3).map(f => f.length).join(',')}`);
+  }
+
   if (frames.length === 0) {
     console.warn('[analysis] No frames — using mock result');
-    return { ...MOCK_SWING_RESULT, selectedClub: club ?? MOCK_SWING_RESULT.selectedClub };
+    return { result: { ...MOCK_SWING_RESULT, selectedClub: club ?? MOCK_SWING_RESULT.selectedClub } };
   }
-  return analyzeSwingFrames(frames, club);
+
+  const metrics = goodFrames.length >= 2 ? (backendResult?.metrics ?? undefined) : undefined;
+  const result = await analyzeSwingFrames(frames, club, undefined, metrics ?? undefined);
+  return { result, backendResult: goodFrames.length >= 2 ? backendResult : undefined };
 }
 
 // ── New swing analysis ─────────────────────────────────────────────────────
@@ -78,16 +106,18 @@ export async function runSwingAnalysis({
     // non-fatal — continue with local URI
   }
 
-  // 2. Analyze
+  // 2. Analyze (phase frames + temporal metrics + AI in one shot)
   notify('extracting');
   notify('analyzing');
-  const result = await runFrameAnalysis(uri, club);
+  const { result, backendResult } = await runFrameAnalysis(uri, club);
 
   // 3. Save to DB
   notify('saving');
 
   const { data: sessionData } = await supabase.auth.getSession();
   if (!sessionData.session) throw new Error('Not authenticated — please sign in again.');
+
+  const privacy = await getSwingPrivacy();
 
   let data: { id: string } | null = null;
   let error: { message: string } | null = null;
@@ -100,7 +130,7 @@ export async function runSwingAnalysis({
       club: club ?? null,
       status: 'completed',
       result_json: result,
-      privacy: 'private',
+      privacy,
       last_analyzed_at: new Date().toISOString(),
     })
     .select('id')
@@ -109,7 +139,7 @@ export async function runSwingAnalysis({
   if (error) {
     ({ data, error } = await supabase
       .from('swings')
-      .insert({ user_id: userId, video_url: videoUrl, result_json: result, privacy: 'private' })
+      .insert({ user_id: userId, video_url: videoUrl, result_json: result, privacy })
       .select('id')
       .single());
   }
@@ -125,8 +155,15 @@ export async function runSwingAnalysis({
     .then((url) => { if (url) saveSwingThumbnail(swingId, url); })
     .catch(() => {});
 
-  // Visual analysis is generated in [id].tsx when the user opens the swing detail
-  // to avoid race conditions with concurrent backend calls.
+  // 5. Save visual analysis immediately from the backend result we already have.
+  //    This avoids a second backend call when the user opens the swing detail.
+  if (backendResult) {
+    buildVisualAnalysisFromBackendResult(backendResult, swingId, userId, result)
+      .then((va) => {
+        if (va) console.log('[analysis] visual analysis saved inline for', swingId);
+      })
+      .catch((e) => console.warn('[analysis] inline VA save failed:', e));
+  }
 
   // 6. MediaPipe overlay (non-blocking)
   if (MEDIAPIPE_URL && videoUrl !== uri && data) {
@@ -150,29 +187,28 @@ export async function reanalyzeSwing(
   if (swing.user_id !== userId) throw new Error('Unauthorized.');
 
   notify('extracting');
-  // Download remote video locally so VideoThumbnails can extract real frames
   let localUri = swing.video_url;
   if (swing.video_url.startsWith('http')) {
     try { localUri = await downloadToLocal(swing.video_url, swingId); } catch { /* use remote URL */ }
   }
 
   notify('analyzing');
-  const result = await runFrameAnalysis(localUri, swing.club);
+  const { result, backendResult } = await runFrameAnalysis(localUri, swing.club);
 
   notify('saving');
   await updateSwingAnalysis(swingId, result, swing.analysis_version ?? 1);
 
-  // Regenerate thumbnail if missing
   if (!swing.thumbnail_url) {
     generateAndUploadThumbnail(localUri, userId, swingId)
       .then((url) => { if (url) saveSwingThumbnail(swingId, url); })
       .catch(() => {});
   }
 
-  // Regenerate visual analysis
-  generateVisualAnalysis(localUri, userId, swingId, result)
-    .then((va) => { if (va) saveVisualAnalysis(swingId, va); })
-    .catch(() => {});
+  // Regenerate visual analysis from the already-fetched backend result
+  if (backendResult) {
+    buildVisualAnalysisFromBackendResult(backendResult, swingId, userId, result)
+      .catch(() => {});
+  }
 
   notify('done');
   return result;

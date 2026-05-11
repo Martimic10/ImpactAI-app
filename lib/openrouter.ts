@@ -39,26 +39,42 @@ const GENERIC_PHRASES = [
 function isGenericAnalysis(result: SwingResult): boolean {
   if (result.scores) {
     const s = result.scores;
-    const vals = [s.positionScore, s.tempoScore, s.sequenceScore, s.stabilityScore, s.contactScore];
+    const allKeys = ['positionScore', 'tempoScore', 'sequenceScore', 'stabilityScore', 'contactScore'] as const;
+    const vals = allKeys.map((k) => s[k] as number);
     const spread = Math.max(...vals) - Math.min(...vals);
-    if (spread < 8) {
+
+    // All 5 scores too similar — AI isn't differentiating
+    if (spread < 12) {
       console.warn('[openrouter] generic: scores too clustered (spread=' + spread + ')');
       return true;
     }
-    // The issue category should be clearly below the others
+
+    // Issue category not far enough below the others
     const issueKey = ISSUE_TO_SCORE_KEY[result.issueCategory ?? ''];
     if (issueKey && s[issueKey] != null) {
       const issueScore = s[issueKey] as number;
-      const others = vals.filter((_, i) =>
-        (['positionScore','tempoScore','sequenceScore','stabilityScore','contactScore'] as const)[i] !== issueKey
-      );
+      const others = allKeys
+        .filter((k) => k !== issueKey)
+        .map((k) => s[k] as number);
       const avgOthers = others.reduce((a, b) => a + b, 0) / others.length;
-      if (avgOthers - issueScore < 8) {
-        console.warn(`[openrouter] generic: issue category (${issueKey}=${issueScore}) not clearly below others (avg=${avgOthers.toFixed(0)})`);
+      if (avgOthers - issueScore < 12) {
+        console.warn(`[openrouter] generic: issue gap too small (${issueKey}=${issueScore} avg-others=${avgOthers.toFixed(0)})`);
         return true;
       }
     }
+
+    // Non-issue scores too clustered — AI didn't differentiate what's good vs. ok
+    const issueKeyForFilter = ISSUE_TO_SCORE_KEY[result.issueCategory ?? ''];
+    const nonIssueVals = allKeys
+      .filter((k) => k !== issueKeyForFilter)
+      .map((k) => s[k] as number);
+    const nonIssueSpread = Math.max(...nonIssueVals) - Math.min(...nonIssueVals);
+    if (nonIssueVals.length >= 3 && nonIssueSpread < 8) {
+      console.warn(`[openrouter] generic: non-issue scores clustered (spread=${nonIssueSpread})`);
+      return true;
+    }
   }
+
   if (!result.evidence || result.evidence.length < 3) {
     console.warn('[openrouter] generic: insufficient evidence');
     return true;
@@ -86,51 +102,58 @@ function isTooSimilarToPrevious(current: SwingResult, previous: SwingResult): bo
 // ─────────────────────────────────────────────────────────────────────────────
 // Prompts
 // ─────────────────────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are an elite PGA-level golf instructor and biomechanics analyst.
+const SYSTEM_PROMPT = `You are an elite PGA Tour-level instructor and biomechanics coach. Your job is to identify the single most damaging fault in this golfer's swing and quantify every mechanical category honestly.
 
-Analyze a golfer's swing using the provided frames and extracted swing metrics.
+━━━ TEMPO RULE (read first) ━━━
+Tempo is a TIMING measurement — it CANNOT be assessed from still frames alone.
+• If computedTempoScore is provided in the metrics: use that exact value for tempoScore. Tempo is already measured.
+• If computedTempoScore ≥ 75: tempo is NOT the primary issue. Pick a different issueCategory.
+• If NO metrics are provided: set tempoScore to 68 and NEVER use "tempo" as issueCategory. Static frames cannot show rhythm.
 
-SCORING CATEGORIES — score each 1-100:
+━━━ SCORING CATEGORIES (1-100 each) ━━━
+positionScore  — Setup stance/grip/ball position + top-of-backswing plane + impact alignment + finish
+sequenceScore  — Kinematic order: hips rotate first, torso second, arms third, club last. Body-arm coordination.
+stabilityScore — Head stability (minimal lateral or vertical drift), spine angle held from address through impact, balanced finish
+contactScore   — Shaft lean at impact, low-point location (in front of ball), face delivery, divot direction
 
-positionScore  — Address setup, top-of-backswing position, impact alignment, finish position
-tempoScore     — Backswing/downswing rhythm and transition. Use the tempoRatio from metrics if provided.
-sequenceScore  — Kinematic sequence: do hips lead, then torso, then arms, then club? Body-arm coordination.
-stabilityScore — Head movement, spine angle retention, balance throughout the swing
-contactScore   — Impact posture, shaft lean at contact, low-point control, face delivery
+━━━ SCORING SCALE ━━━
+90–100 : Tour-quality — only if genuinely excellent
+80–89  : Solid, above-average amateur
+70–79  : Functional but one visible flaw
+60–69  : Clear fault affecting consistency
+50–59  : Major fault — repeated poor contact
+< 50   : Severe breakdown
 
-SCORING RULES:
-- Base every score on observable evidence in the frames + provided metrics.
-- Use the FULL range — 90-100: excellent · 80-89: good · 70-79: decent · 60-69: clear issue · <60: major problem
-- If tempoRatio is provided in metrics, use it to set tempoScore (3:1 = ~88, 2:1 or 4:1 = ~72, outside = lower).
+━━━ PRIMARY ISSUE RULE ━━━
+The issueCategory you name MUST have a score at least 20 points below the average of the other four categories.
+- If it doesn't, lower the issue score further until that gap exists.
+- Do NOT drag all five scores down together. One category is the problem; the other four reflect the actual quality of those specific mechanics.
 
-PRIMARY ISSUE RULE (critical):
-- The category that matches the primaryIssue MUST score at least 15 points BELOW the average of the other 4.
-- If tempo is the only problem: positionScore, sequenceScore, stabilityScore, contactScore should each score 72–88 based on what you actually see — NOT all identical.
-- Two swings with the same primaryIssue WILL receive different overall scores when their non-issue mechanics differ.
-- Do NOT drag down all 5 categories just because one has an issue.
+━━━ SCORE DIFFERENTIATION (critical) ━━━
+- Each of the four non-issue categories must be scored INDEPENDENTLY based on visible evidence.
+- They must NOT be identical or within 4 points of each other.
+- A golfer with great posture but poor sequencing scores stabilityScore=84, sequenceScore=58. Not both at 70.
+- Two different swings with the same primary issue MUST receive different non-issue scores.
+- Ask yourself: what does THIS swing do well? Score that high. What does it do poorly outside the main issue? Score that low.
 
-SINGLE-ISSUE vs MULTI-ISSUE:
-- One clear issue: overall 70-84. The other 4 categories are strong (72+).
-- Two issues: overall 60-72. Two categories clearly below 65.
-- Three+ issues: overall 45-62. Multiple categories below 60.
+━━━ MULTI-ISSUE LOGIC ━━━
+- One clear issue: overall ~72-84. Other four categories span from ~68 to ~88.
+- Two issues: overall ~60-72. Two categories below 63.
+- Three+ issues: overall ~45-62. Score the worst mechanics honestly below 55.
 
-DIFFERENTIATION (important):
-- No two swings should receive identical category scores unless mechanics are genuinely identical.
-- A swing with good posture but bad tempo scores differently from one with bad posture AND bad tempo.
-- Score each category independently from the others.
+━━━ CLUB-SPECIFIC ━━━
+Driver: launch, face control, rotation speed, trail-side balance
+Long irons (2-5): spine angle, smooth transition, divot direction
+Mid irons (6-8): ball-first contact, shaft lean, hip rotation
+Short irons + wedges: shaft lean, descending blow, face control at impact
+Do not give driver advice for wedge swings or vice versa.
 
-CLUB-SPECIFIC RULES:
-- Driver: launch angle, path, face control, rotation, balance
-- Irons (4-6): posture, low-point, contact, path
-- Irons (7-9): all fundamentals equally
-- Wedges: shaft lean, low-point, distance control
-- Do NOT give wedge advice to driver swings or vice versa.
+━━━ EVIDENCE ━━━
+3-5 specific, visual observations about THIS swing. Reference actual body parts, positions, or angles you can see. No generic phrases like "work on fundamentals."
 
-EVIDENCE: Include 3-5 specific observations about THIS swing. Not generic.
+━━━ OUTPUT ━━━
+Return ONLY valid JSON. No markdown. Start with { end with }.
 
-OUTPUT: Return ONLY valid JSON. No markdown. Start with { end with }.
-
-Schema:
 {
   "selectedClub": "string",
   "detectedClubType": "string",
@@ -146,18 +169,18 @@ Schema:
     "contactScore": 0,
     "confidence": 0
   },
-  "primaryIssue": "string",
+  "primaryIssue": "string — name the single most damaging fault",
   "issueCategory": "setup | posture | path | clubface | tempo | contact | balance | rotation | unclear",
-  "whyItHappens": "string",
+  "whyItHappens": "string — root cause, not just description",
   "ballFlightPrediction": "string",
   "contactPrediction": "string",
   "evidence": ["string", "string", "string"],
   "scoreReasoning": {
-    "position": "string — what drove the positionScore",
-    "tempo": "string — what drove the tempoScore",
-    "sequence": "string — what drove the sequenceScore",
-    "stability": "string — what drove the stabilityScore",
-    "contact": "string — what drove the contactScore"
+    "position": "string — one specific observation that drove positionScore up or down",
+    "tempo": "string — one specific observation about rhythm or the metric value",
+    "sequence": "string — one specific observation about body-arm order",
+    "stability": "string — one specific observation about head/spine movement",
+    "contact": "string — one specific observation about impact position"
   },
   "clubSpecificNotes": "string",
   "fixes": ["string", "string", "string"],
@@ -172,11 +195,18 @@ Schema:
 
 const SECOND_PASS_SUFFIX = `
 
-IMPORTANT — SECOND PASS:
-The previous analysis was flagged as too generic or too similar to another swing.
-Re-examine these frames carefully. Identify what is visually UNIQUE about this swing.
-Assign category scores that reflect THIS swing's actual mechanics.
-Do not reuse the same drill, issue, or score. Be more specific with evidence.`;
+SECOND PASS — the first analysis was rejected for one or more of these reasons:
+• All 5 category scores were too close together (less than 12 pts spread)
+• The non-issue categories were identical or near-identical
+• Tempo was flagged as the primary issue without timing data to support it
+• Evidence was too generic
+
+You MUST fix all of the above:
+1. Find THIS swing's single biggest fault. Name it precisely (e.g. "early extension at impact" not "posture issue").
+2. Score the four non-issue categories as INDEPENDENT observations — not all at 70-75.
+3. If tempo was your previous issue but no timing metrics exist, pick a different issueCategory.
+4. Evidence must name specific body parts, joint angles, or positions you can see in the frames.
+5. The issue category score must be ≥ 22 points below the average of the other four.`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API call
@@ -196,27 +226,37 @@ async function callOpenRouter(
       image_url: { url: `data:image/jpeg;base64,${frame}`, detail: 'auto' as const },
     }));
 
-  const metricsBlock = temporalMetrics
+  const hasMetrics = temporalMetrics != null;
+  const metricsBlock = hasMetrics
     ? {
-        backswingDurationMs: temporalMetrics.backswingDurationMs,
-        downswingDurationMs: temporalMetrics.downswingDurationMs,
-        tempoRatio:          temporalMetrics.tempoRatio,
-        motionSmoothness:    temporalMetrics.motionSmoothness,
-        computedTempoScore:  temporalMetrics.computedTempoScore,
-        note: 'tempoRatio = backswing ÷ downswing duration. Tour average is ~3.0.',
+        backswingDurationMs: temporalMetrics!.backswingDurationMs,
+        downswingDurationMs: temporalMetrics!.downswingDurationMs,
+        tempoRatio:          temporalMetrics!.tempoRatio,
+        motionSmoothness:    temporalMetrics!.motionSmoothness,
+        computedTempoScore:  temporalMetrics!.computedTempoScore,
+        note: 'tempoRatio = backswing ÷ downswing. Tour average ≈ 3.0. computedTempoScore is authoritative.',
       }
-    : { framesProvided: imageContent.length };
+    : null;
+
+  const tempoInstruction = hasMetrics
+    ? `Tempo metrics provided above — use computedTempoScore (${temporalMetrics!.computedTempoScore}) for tempoScore. ${
+        (temporalMetrics!.computedTempoScore ?? 0) >= 75
+          ? 'Tempo is acceptable — do NOT use "tempo" as issueCategory.'
+          : 'Tempo ratio is poor — "tempo" is a valid issueCategory.'
+      }`
+    : 'NO timing data available — set tempoScore=68 and do NOT use "tempo" as issueCategory. Tempo cannot be assessed from still frames.';
 
   const userText = `Analyze this golf swing.
 
 Selected club: ${club ?? 'unknown'}
-Frames provided: ${imageContent.length}
+Frames: ${imageContent.length} phase-aligned frames (address → top → impact → follow-through)
 
-Computed swing metrics (use these for scoring):
-${JSON.stringify(metricsBlock, null, 2)}
+${metricsBlock ? `Timing metrics:\n${JSON.stringify(metricsBlock, null, 2)}` : 'No timing metrics available.'}
 
-Score this swing based ONLY on what you can observe in these frames + the metrics above.
-Do NOT cluster scores around 70 without evidence.
+TEMPO INSTRUCTION: ${tempoInstruction}
+
+Score each category based strictly on what is visible in these frames.
+Non-issue categories MUST vary — not all at the same value.
 Return ONLY the JSON object — start with { end with }.`;
 
   const response = await fetch(OPENROUTER_BASE_URL, {
@@ -234,7 +274,7 @@ Return ONLY the JSON object — start with { end with }.`;
         { role: 'user', content: [{ type: 'text', text: userText }, ...imageContent] },
       ],
       max_tokens: 2500,
-      temperature: 0.35,
+      temperature: 0.20,
     }),
   });
 
@@ -295,21 +335,38 @@ function validateAndFix(result: SwingResult, club?: string, temporalMetrics?: Te
   const computedTempo = temporalMetrics?.computedTempoScore;
   s.tempoScore = computedTempo != null ? computedTempo : clamp(s.tempoScore);
 
-  // ── Enforce: issue category must score meaningfully lower than others ──────
-  // If the AI ignored the PRIMARY ISSUE RULE, correct it here so the overall
-  // score reflects the actual severity rather than a generic 65-70 across all.
+  // ── Tempo gating: if backend says tempo is fine (≥75) or no data exists,
+  //    the AI cannot call "tempo" the primary issue — reassign to actual worst ─
+  const allScoreKeys = ['positionScore', 'tempoScore', 'sequenceScore', 'stabilityScore', 'contactScore'] as const;
+  if (result.issueCategory === 'tempo') {
+    const tempoIsGood = computedTempo != null && computedTempo >= 75;
+    const noTempoData = computedTempo == null;
+    if (tempoIsGood || noTempoData) {
+      const NON_TEMPO: (typeof allScoreKeys[number])[] = ['positionScore', 'sequenceScore', 'stabilityScore', 'contactScore'];
+      const worst = NON_TEMPO.reduce((a, b) => (s[a] as number) <= (s[b] as number) ? a : b);
+      const catMap: Record<string, string> = {
+        positionScore: 'setup', sequenceScore: 'rotation',
+        stabilityScore: 'balance', contactScore: 'contact',
+      };
+      const reason = tempoIsGood
+        ? `tempo is fine (computed=${computedTempo})`
+        : 'no temporal data — cannot assess from frames';
+      console.log(`[openrouter] overriding tempo issue (${reason}) → ${catMap[worst]} (score=${s[worst]})`);
+      result.issueCategory = catMap[worst] as SwingResult['issueCategory'];
+    }
+  }
+
+  // ── Enforce: issue category must score at least 20 pts below avg of others ──
   const issueKey = ISSUE_TO_SCORE_KEY[result.issueCategory ?? ''];
   if (issueKey && s[issueKey] != null) {
-    const allKeys = ['positionScore', 'tempoScore', 'sequenceScore', 'stabilityScore', 'contactScore'] as const;
-    const otherScores = allKeys
+    const otherScores = allScoreKeys
       .filter((k) => k !== issueKey)
       .map((k) => s[k] as number);
     const avgOthers = otherScores.reduce((a, b) => a + b, 0) / otherScores.length;
     const currentIssue = s[issueKey] as number;
 
-    if (avgOthers - currentIssue < 12) {
-      // Issue score isn't clearly enough below the others — pull it down
-      const corrected = Math.round(Math.max(30, Math.min(currentIssue, avgOthers - 15)));
+    if (avgOthers - currentIssue < 20) {
+      const corrected = Math.round(Math.max(28, Math.min(currentIssue, avgOthers - 22)));
       console.log(`[openrouter] enforcing issue gap: ${issueKey} ${currentIssue}→${corrected} (others avg=${avgOthers.toFixed(1)})`);
       (s as unknown as Record<string, number>)[issueKey] = corrected;
     }
