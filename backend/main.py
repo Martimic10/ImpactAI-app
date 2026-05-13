@@ -78,40 +78,245 @@ class ExtractKeyFramesRequest(BaseModel):
     club: Optional[str] = None
 
 
-def find_swing_burst(cap, total_frames: int, fps: float):
-    """
-    Scan for the main swing burst.
-    Only considers runs that START before 75% of the video —
-    the actual swing never begins in the last quarter of the clip.
-    Picks the run with the highest total motion score among those.
-    """
-    scan_n = min(40, total_frames)
-    step = max(1, total_frames // scan_n)
-    scores, prev_gray = [], None
+# ─────────────────────────────────────────────────────────────────────────────
+# Audio-based impact detection
+# ─────────────────────────────────────────────────────────────────────────────
+# Pose tracking is great at finding "the body is moving fast around here", but
+# the clubface-on-ball moment is a sharp, sub-frame transient that's much
+# easier to pin down in the audio waveform. The microphone picks up a brief
+# broadband click whenever a clubhead meets a ball — typically the loudest
+# event in the entire recording.
+#
+# Locating that click in the audio gives us impact accuracy of ±1 video frame
+# (≈ ±33ms at 30fps), which is far better than the 3-5 frame uncertainty of
+# pose-only detection. Once impact is locked, top/address/finish derive
+# naturally from it: top ≈ 0.3-0.8s before impact, finish ≈ 0.4s after.
 
-    for i in range(0, total_frames, step):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-        roi = cv2.resize(gray[int(h*0.05):int(h*0.92), int(w*0.08):int(w*0.92)], (80, 140))
-        score = 0.0 if prev_gray is None else float(cv2.absdiff(roi, prev_gray).mean())
-        prev_gray = roi
-        scores.append((i, score))
+_FFMPEG_PATH: Optional[str] = None
+
+
+def _get_ffmpeg_path() -> Optional[str]:
+    """
+    Resolve a working ffmpeg binary. Prefers imageio_ffmpeg's bundled binary
+    (~30MB pip install, no system deps) but falls back to a system-installed
+    ffmpeg if that's already there. Cached so repeated calls are free.
+    """
+    global _FFMPEG_PATH
+    if _FFMPEG_PATH is not None:
+        return _FFMPEG_PATH or None
+    try:
+        import imageio_ffmpeg  # type: ignore
+        _FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+        return _FFMPEG_PATH
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=2)
+        if result.returncode == 0:
+            _FFMPEG_PATH = "ffmpeg"
+            return _FFMPEG_PATH
+    except Exception:
+        pass
+    _FFMPEG_PATH = ""  # cached sentinel for "we already checked, none available"
+    return None
+
+
+def detect_audio_impact(
+    video_path: str,
+    fps: float,
+    total_frames: int,
+    lo_pct: float = 0.10,
+    hi_pct: float = 0.92,
+) -> Optional[Dict]:
+    """
+    Find the impact moment from the audio track.
+
+    Pipeline (~200-500ms total on typical phone-captured swings):
+      1. ffmpeg: extract a mono 22050Hz 16-bit PCM WAV.
+      2. Compute short-time energy (squared amplitude, 20ms boxcar window).
+      3. Find the global energy peak inside the candidate window
+         (lo_pct..hi_pct of the clip — skips microphone-handling thumps
+         at the very start and any putdown noise at the end).
+      4. Convert peak-sample-index → video-frame-index via fps.
+
+    Returns:
+      { frame_idx, time_ms, confidence, peak_to_median_ratio }
+        confidence is log10(peak/median)/2, clamped to [0,1]. >0.6 = a clear,
+        loud impact; <0.3 = no audible impact (mic too far, very windy, or
+        the video has muted audio). The caller should fall back to pose-based
+        detection when confidence is below the threshold.
+      None if audio extraction fails, the clip is too short, or no peak.
+    """
+    if fps <= 0 or total_frames <= 0:
+        return None
+
+    ffmpeg = _get_ffmpeg_path()
+    if not ffmpeg:
+        print("[audio-impact] no ffmpeg available — skipping")
+        return None
+
+    wav_path = None
+    try:
+        wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(wav_fd)
+        cmd = [
+            ffmpeg, "-y", "-i", video_path,
+            "-ac", "1",       # mono
+            "-ar", "22050",   # 22.05kHz — way above the 1-5kHz band where
+                              # impact lives, plenty for our purposes
+            "-vn",            # no video stream
+            "-f", "wav",
+            wav_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
+        if result.returncode != 0:
+            err = result.stderr[:200].decode("utf-8", errors="ignore") if result.stderr else "(no stderr)"
+            print(f"[audio-impact] ffmpeg failed: {err}")
+            return None
+
+        import wave
+        with wave.open(wav_path, "rb") as wf:
+            sr = wf.getframerate()
+            n_audio = wf.getnframes()
+            sampwidth = wf.getsampwidth()
+            audio_bytes = wf.readframes(n_audio)
+
+        # PCM dtype depends on ffmpeg's chosen sample format. Default for our
+        # `-f wav` invocation is 16-bit signed.
+        if sampwidth == 2:
+            audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sampwidth == 4:
+            audio = np.frombuffer(audio_bytes, dtype=np.int32).astype(np.float32) / 2147483648.0
+        elif sampwidth == 1:
+            audio = (np.frombuffer(audio_bytes, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        else:
+            print(f"[audio-impact] unsupported sample width: {sampwidth}")
+            return None
+
+        if len(audio) < int(sr * 0.5):
+            return None  # < 0.5s of audio, not a real swing recording
+
+        # Short-time energy. Squared amplitude is more selective for sharp
+        # impulsive peaks than abs amplitude (the squaring suppresses the
+        # body of speech / wind / ambient and lifts the click).
+        win = max(32, int(sr * 0.02))  # 20ms window
+        energy = audio * audio
+        kernel = np.ones(win, dtype=np.float32) / float(win)
+        smoothed = np.convolve(energy, kernel, mode="same")
+
+        # Bound search to the candidate swing window.
+        lo = max(0, int(len(smoothed) * lo_pct))
+        hi = min(len(smoothed), int(len(smoothed) * hi_pct))
+        if hi - lo < int(sr * 0.3):
+            return None
+
+        region = smoothed[lo:hi]
+        peak_idx_in_region = int(np.argmax(region))
+        peak_idx = lo + peak_idx_in_region
+        peak_val = float(smoothed[peak_idx])
+
+        # Confidence: how prominent is the peak vs. ambient? Median is robust
+        # to the peak itself (the peak occupies ~1 of len(smoothed) samples).
+        median_val = float(np.median(smoothed))
+        if median_val <= 1e-12 or peak_val <= 1e-12:
+            return None
+        ratio = peak_val / (median_val + 1e-12)
+        # ratio = 1 → confidence 0; ratio = 100 → confidence 1.0; log-scaled
+        # so a 10x peak is moderately confident, a 100x peak is very confident.
+        confidence = float(min(1.0, max(0.0, np.log10(max(ratio, 1.0)) / 2.0)))
+
+        # Convert audio-sample-index → video-frame-index.
+        time_sec = peak_idx / float(sr)
+        frame_idx = int(round(time_sec * fps))
+        frame_idx = max(0, min(frame_idx, total_frames - 1))
+
+        print(
+            f"[audio-impact] peak at {time_sec:.3f}s = frame {frame_idx}/{total_frames} "
+            f"ratio={ratio:.1f}x confidence={confidence:.2f}"
+        )
+
+        return {
+            "frame_idx": frame_idx,
+            "time_ms": int(time_sec * 1000),
+            "confidence": confidence,
+            "peak_to_median_ratio": float(ratio),
+        }
+    except Exception as e:
+        print(f"[audio-impact] failed: {type(e).__name__}: {e}")
+        return None
+    finally:
+        if wav_path and os.path.exists(wav_path):
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+
+def _walk_motion_samples(cap, total_frames: int, sample_n: int = 60):
+    """
+    ONE forward pass through the video collecting motion-only samples at evenly
+    spaced indices. Uses cap.grab() to skip decoding of non-sample frames, which
+    is ~10x faster than seeking every time. Returns a list of dicts:
+
+        [{ "fi": int, "motion": float }, ...]
+
+    No pose, no CLAHE, no color conversion to RGB — keeps the scan cheap so
+    we can do other work synchronously without blowing the Render timeout.
+    """
+    if total_frames <= 0:
+        return []
+
+    sample_n = max(8, min(sample_n, total_frames))
+    step = max(1, total_frames // sample_n)
+    sample_fis = set(range(0, total_frames, step))
+
+    samples = []
+    prev_roi = None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    fi = 0
+    while fi < total_frames:
+        if fi in sample_fis:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape
+            roi = cv2.resize(
+                gray[int(h * 0.05):int(h * 0.92), int(w * 0.08):int(w * 0.92)],
+                (80, 140),
+            )
+            motion = 0.0 if prev_roi is None else float(cv2.absdiff(roi, prev_roi).mean())
+            prev_roi = roi
+            samples.append({"fi": fi, "motion": motion})
+        else:
+            # grab() advances the decoder pointer without producing a numpy frame —
+            # roughly 5-10x faster than read() per non-sample frame.
+            if not cap.grab():
+                break
+        fi += 1
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    if len(scores) < 3:
+    return samples
+
+
+def _detect_burst_from_samples(samples, total_frames: int, fps: float):
+    """
+    Identify the main swing burst from precomputed motion samples.
+    Returns (burst_start_fi, burst_end_fi).
+    """
+    if len(samples) < 3:
         return 0, total_frames - 1
 
-    motion = np.array([s for _, s in scores], dtype=np.float32)
+    motion = np.array([s["motion"] for s in samples], dtype=np.float32)
     threshold = max(float(np.percentile(motion, 55)), float(motion.mean() * 0.7), 1.0)
-    active_flags = [s >= threshold for _, s in scores]
+    active_flags = [v >= threshold for v in motion]
 
-    max_gap = max(1, int(len(scores) * 0.10))
+    max_gap = max(1, int(len(samples) * 0.10))
+    step = samples[1]["fi"] - samples[0]["fi"] if len(samples) > 1 else 1
+
     runs, run_start, prev_active = [], None, -max_gap - 1
-    for idx in range(len(scores)):
+    for idx in range(len(samples)):
         if active_flags[idx]:
             if run_start is None or idx - prev_active > max_gap:
                 run_start = idx
@@ -125,18 +330,32 @@ def find_swing_burst(cap, total_frames: int, fps: float):
     if not runs:
         return 0, total_frames - 1
 
-    # Only consider runs that START before 75% of the video
-    cutoff_idx = int(len(scores) * 0.75)
+    cutoff_idx = int(len(samples) * 0.75)
     early_runs = [r for r in runs if r[0] < cutoff_idx]
     candidates = early_runs if early_runs else runs
 
-    best = max(candidates, key=lambda r: sum(scores[i][1] for i in range(r[0], r[1] + 1)))
-    start_fi = max(0, scores[best[0]][0] - step)
-    end_fi   = min(total_frames - 1, scores[best[1]][0] + step * 2)
+    best = max(
+        candidates,
+        key=lambda r: sum(float(motion[i]) for i in range(r[0], r[1] + 1)),
+    )
+    start_fi = max(0, samples[best[0]]["fi"] - step)
+    end_fi = min(total_frames - 1, samples[best[1]]["fi"] + step * 2)
 
-    print(f"[burst] {int(start_fi/fps*1000)}ms–{int(end_fi/fps*1000)}ms "
-          f"({len(runs)} runs, {len(candidates)} early, picked {best})")
+    print(
+        f"[burst] {int(start_fi/fps*1000)}ms–{int(end_fi/fps*1000)}ms "
+        f"({len(runs)} runs, {len(candidates)} early, picked {best})"
+    )
     return start_fi, end_fi
+
+
+def find_swing_burst(cap, total_frames: int, fps: float):
+    """
+    Back-compat wrapper. Equivalent to walking 40 motion samples and detecting
+    the burst from them. New code should call _walk_motion_samples directly
+    and reuse the samples for downstream work (smoothness, address detection).
+    """
+    samples = _walk_motion_samples(cap, total_frames, sample_n=40)
+    return _detect_burst_from_samples(samples, total_frames, fps)
 
 
 def find_top_of_backswing(cap, fps: float, fi_address: int, burst_start: int) -> int:
@@ -291,17 +510,20 @@ def _sample_pose_track(cap, fps: float, total_frames: int, quality: str = "fast"
     Sample the whole clip and track the hand/wrist center. The phase detector uses
     normalized pose coordinates so it is much less sensitive to clip length, fps,
     pauses, or extra motion after the swing.
+
+    Only used in quality="accurate" mode now — the fast path reuses the cheaper
+    motion-only walk from _walk_motion_samples().
     """
     if total_frames <= 0:
         return []
 
-    # 50 samples: enough resolution for fast swings, stays well under Render timeout
-    max_samples = 50
+    # Fewer samples in fast mode (kept around for accurate mode); the trade-off
+    # is +25-40% speed for ~5% lower phase-localization precision.
+    max_samples = 50 if quality == "accurate" else 30
     step = max(1, int(np.ceil(total_frames / max_samples)))
 
     samples = []
     prev_gray = None
-    # model_complexity=0 for speed — we process up to 80 frames here
     with mp_pose.Pose(
         static_image_mode=False,
         model_complexity=0,
@@ -316,14 +538,15 @@ def _sample_pose_track(cap, fps: float, total_frames: int, quality: str = "fast"
             if not ret:
                 continue
 
-            enhanced = _preprocess(frame)
-            gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+            # No CLAHE: MediaPipe handles low-contrast frames well, and CLAHE
+            # was costing ~30ms per sample (~1.5s total on 50 samples).
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             h, w = gray.shape
             roi = cv2.resize(gray[int(h * 0.05):int(h * 0.95), int(w * 0.05):int(w * 0.95)], (96, 160))
             motion = 0.0 if prev_gray is None else float(cv2.absdiff(roi, prev_gray).mean())
             prev_gray = roi
 
-            rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             det = pose.process(rgb)
             if not det.pose_landmarks:
                 samples.append({"fi": fi, "time": fi / fps, "hand": None, "vis": 0.0,
@@ -679,7 +902,8 @@ def _find_quietest_frame(cap, lo_fi: int, hi_fi: int) -> int:
         ret, frame = cap.read()
         if not ret:
             continue
-        gray = cv2.cvtColor(_preprocess(frame), cv2.COLOR_BGR2GRAY)
+        # No CLAHE: we only need motion DIFFERENCES, not contrast — saves ~30ms/frame.
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         roi  = cv2.resize(gray[int(h*0.05):int(h*0.92), int(w*0.08):int(w*0.92)], (80, 120))
         motion = 0.0 if prev_roi is None else float(cv2.absdiff(roi, prev_roi).mean())
@@ -694,10 +918,15 @@ def _find_quietest_frame(cap, lo_fi: int, hi_fi: int) -> int:
 
 
 def _extract_strip_frames(cap, fps: float, total_frames: int,
-                           lo_fi: int, hi_fi: int, n: int) -> List[Dict]:
+                           lo_fi: int, hi_fi: int, n: int,
+                           enhance: bool = True) -> List[Dict]:
     """
     Extract n evenly-spaced frames between lo_fi and hi_fi.
     Returns list of {fi, time_ms, frame_bgr} dicts.
+
+    `enhance` toggles CLAHE preprocessing. Vision contact-sheet selection
+    benefits from contrast-enhanced frames, but motion-energy fallback does
+    not — pass enhance=False there to save ~30ms per frame.
     """
     lo_fi = max(0, int(lo_fi))
     hi_fi = min(int(total_frames) - 1, int(hi_fi))
@@ -715,7 +944,7 @@ def _extract_strip_frames(cap, fps: float, total_frames: int,
         results.append({
             "fi":       fi,
             "time_ms":  int(fi / fps * 1000),
-            "frame_bgr": _preprocess(frame),
+            "frame_bgr": _preprocess(frame) if enhance else frame,
         })
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     return results
@@ -833,15 +1062,26 @@ def select_phases_with_vision(top_strip: List[Dict], impact_strip: List[Dict],
 def detect_and_extract(cap, fps: float, include_overlays: bool = False,
                        quality: str = "fast", club: str = "unknown"):
     """
-    Burst-anchored phase detection — every phase is computed relative to when
-    the actual swing motion occurs, not global video percentages.
+    Burst-anchored phase detection. Designed around a single forward decoder
+    walk + a few targeted seeks for final phase frames.
 
-    1. find_swing_burst  → where the swing actually is in the video
-    2. address           → quietest frame in [burst_start-2.5s, burst_start-0.25s]
-    3. top window        → [address+0.2s, burst_start+0.35s]   (backswing region)
-    4. impact window     → [burst_start-0.15s, burst_start+60% of burst]
-    5. Vision contact-sheet selection for top + impact (one API call)
-    6. follow-through    → impact + 0.35–0.55s
+    Two quality tiers:
+
+      • "fast" (default, used in production):
+          - One motion-only walk of the video (~60 samples, cap.grab() for skips)
+          - Address = quietest sample in pre-burst window
+          - Top     = lowest-motion sample in [address, burst_start+0.35s]
+          - Impact  = highest-motion sample in [burst_start-0.15s, burst_start+62%]
+          - Follow  = offset from impact
+          - Skips OpenRouter vision contact-sheet call (5–15s saved)
+          - Skips _sample_pose_track (5–10s saved) — motionSmoothness comes
+            from the same walk samples we already have
+
+      • "accurate": adds the vision contact-sheet selection for top + impact
+          and a 50-frame MediaPipe pose track for a tighter motionSmoothness.
+
+    Pose detection is ALWAYS run on the 4 final phase frames (cheap — only 4
+    MediaPipe inferences).
     """
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total_frames <= 0:
@@ -849,28 +1089,40 @@ def detect_and_extract(cap, fps: float, include_overlays: bool = False,
                  for t in [200, 1400, 2600, 3400]]
         return empty, {}
 
-    # ── 1. Locate the swing burst ─────────────────────────────────────────────
-    burst_start, burst_end = find_swing_burst(cap, total_frames, fps)
+    accurate = quality == "accurate"
+
+    # ── 1. Single motion walk — reused for burst + smoothness ────────────────
+    sample_n = 80 if accurate else 60
+    walk_samples = _walk_motion_samples(cap, total_frames, sample_n=sample_n)
+    burst_start, burst_end = _detect_burst_from_samples(walk_samples, total_frames, fps)
     burst_span = max(1, burst_end - burst_start)
 
+    # Build a fi → motion lookup for picking phase frames without re-seeking
+    sample_motion = {s["fi"]: s["motion"] for s in walk_samples}
+    sample_fis_sorted = sorted(sample_motion.keys())
+
+    def _samples_in_window(lo_fi: int, hi_fi: int):
+        return [(fi, sample_motion[fi]) for fi in sample_fis_sorted if lo_fi <= fi <= hi_fi]
+
     # ── 2. Address frame ──────────────────────────────────────────────────────
-    # Quietest frame in the window before the burst (player still at setup)
+    # Quietest sample in the pre-burst window (player still at setup).
     addr_lo = max(0, burst_start - int(fps * 2.5))
     addr_hi = max(addr_lo + 3, burst_start - int(fps * 0.25))
-    addr_fi  = _find_quietest_frame(cap, addr_lo, addr_hi)
+    addr_window = _samples_in_window(addr_lo, addr_hi)
+    if addr_window:
+        # Skip the very first sample — motion is 0 by definition at index 0.
+        candidates = addr_window[1:] if len(addr_window) > 1 else addr_window
+        addr_fi = min(candidates, key=lambda x: x[1])[0]
+    else:
+        # No samples in window → fall back to a targeted quietest-frame search.
+        addr_fi = _find_quietest_frame(cap, addr_lo, addr_hi)
 
-    # ── 3. Top of backswing window ────────────────────────────────────────────
-    # From shortly after address up to just past the burst start.
-    # The backswing ends at or very near burst_start (when the downswing explosion begins).
+    # ── 3 + 4. Top + impact windows ──────────────────────────────────────────
     top_lo = addr_fi + max(2, int(fps * 0.20))
     top_hi = min(burst_start + int(fps * 0.35), int(total_frames * 0.82))
-
-    # ── 4. Impact window ─────────────────────────────────────────────────────
-    # The burst IS the downswing. Impact is in the first ~60% of the burst.
     impact_lo = max(burst_start - int(fps * 0.15), top_lo + int(fps * 0.08))
     impact_hi = min(burst_start + int(burst_span * 0.62), int(total_frames * 0.88))
 
-    # Ensure windows are valid
     if top_hi <= top_lo:
         top_hi = top_lo + max(2, int(fps * 0.5))
     if impact_hi <= impact_lo:
@@ -881,57 +1133,48 @@ def detect_and_extract(cap, fps: float, include_overlays: bool = False,
     print(f"[windows] top={int(top_lo/fps*1000)}-{int(top_hi/fps*1000)}ms  "
           f"impact={int(impact_lo/fps*1000)}-{int(impact_hi/fps*1000)}ms")
 
-    # ── 5. Extract frame strips for vision ───────────────────────────────────
-    N_STRIP = 12  # frames per contact sheet
-    top_strip    = _extract_strip_frames(cap, fps, total_frames, top_lo,    top_hi,    N_STRIP)
-    impact_strip = _extract_strip_frames(cap, fps, total_frames, impact_lo, impact_hi, N_STRIP)
-
-    # Fallback indices if vision is unavailable
-    top_fi    = max(top_lo,    burst_start - int(fps * 0.05))
+    # ── 5. Pick top + impact ─────────────────────────────────────────────────
+    # Fallback indices (used if windows have no walk samples).
+    top_fi = max(top_lo, burst_start - int(fps * 0.05))
     impact_fi = min(impact_hi, burst_start + int(burst_span * 0.25))
+    top_method = "motion_minimum"
+    impact_method = "motion_peak"
+    vision = None
 
-    vision = select_phases_with_vision(top_strip, impact_strip, club)
-    if vision and vision["top_fi"] < vision["impact_fi"]:
-        top_fi    = vision["top_fi"]
-        impact_fi = vision["impact_fi"]
-        print("[events] using vision-selected top + impact")
-    else:
-        # Vision unavailable or returned invalid order — use motion energy within windows
-        if top_strip:
-            # Top = frame with lowest inter-frame motion in the top window (the pause at the top)
-            prev_roi, motion_vals = None, []
-            for info in top_strip:
-                gray = cv2.cvtColor(info["frame_bgr"], cv2.COLOR_BGR2GRAY)
-                h, w = gray.shape
-                roi  = cv2.resize(gray[int(h*0.05):int(h*0.92), int(w*0.08):int(w*0.92)], (64, 96))
-                m    = 0.0 if prev_roi is None else float(cv2.absdiff(roi, prev_roi).mean())
-                prev_roi = roi
-                motion_vals.append((info["fi"], m))
-            if len(motion_vals) > 1:
-                top_fi = min(motion_vals[1:], key=lambda x: x[1])[0]
+    if accurate:
+        # Premium path: GPT-4o picks the best frame from a labeled contact sheet.
+        N_STRIP = 12
+        top_strip = _extract_strip_frames(cap, fps, total_frames, top_lo, top_hi, N_STRIP)
+        impact_strip = _extract_strip_frames(cap, fps, total_frames, impact_lo, impact_hi, N_STRIP)
+        vision = select_phases_with_vision(top_strip, impact_strip, club)
+        if vision and vision["top_fi"] < vision["impact_fi"]:
+            top_fi = vision["top_fi"]
+            impact_fi = vision["impact_fi"]
+            top_method = "vision_sheet"
+            impact_method = "vision_sheet"
+            print("[events] using vision-selected top + impact")
+        else:
+            vision = None
 
-        if impact_strip:
-            # Impact = peak motion in the impact window
-            prev_roi, motion_vals = None, []
-            for info in impact_strip:
-                gray = cv2.cvtColor(info["frame_bgr"], cv2.COLOR_BGR2GRAY)
-                h, w = gray.shape
-                roi  = cv2.resize(gray[int(h*0.05):int(h*0.92), int(w*0.08):int(w*0.92)], (64, 96))
-                m    = 0.0 if prev_roi is None else float(cv2.absdiff(roi, prev_roi).mean())
-                prev_roi = roi
-                motion_vals.append((info["fi"], m))
-            if motion_vals:
-                impact_fi = max(motion_vals, key=lambda x: x[1])[0]
-
-        print(f"[events] no-vision fallback: top={int(top_fi/fps*1000)}ms  "
+    if not vision:
+        top_window = _samples_in_window(top_lo, top_hi)
+        impact_window = _samples_in_window(impact_lo, impact_hi)
+        if len(top_window) >= 2:
+            # Top = lowest-motion sample in the top window (the pause at the top).
+            # Drop the very first sample if motion=0 (boundary artefact).
+            usable_top = [t for t in top_window if t[1] > 0] or top_window
+            top_fi = min(usable_top, key=lambda x: x[1])[0]
+        if impact_window:
+            impact_fi = max(impact_window, key=lambda x: x[1])[0]
+        print(f"[events] motion-energy: top={int(top_fi/fps*1000)}ms  "
               f"impact={int(impact_fi/fps*1000)}ms")
 
     # ── 6. Follow-through ─────────────────────────────────────────────────────
-    ft_min  = impact_fi + max(2, int(fps * 0.30))
-    ft_fi   = min(ft_min + int(fps * 0.20), int(total_frames * 0.96) - 1)
+    ft_min = impact_fi + max(2, int(fps * 0.30))
+    ft_fi = min(ft_min + int(fps * 0.20), int(total_frames * 0.96) - 1)
 
     # ── 7. Enforce ordering ───────────────────────────────────────────────────
-    min_gap = max(1, int(fps * 0.04))  # at least 40ms between phases
+    min_gap = max(1, int(fps * 0.04))
     if top_fi <= addr_fi + min_gap:
         top_fi = addr_fi + min_gap
     if impact_fi <= top_fi + min_gap:
@@ -945,13 +1188,20 @@ def detect_and_extract(cap, fps: float, include_overlays: bool = False,
           f"impact={int(impact_fi/fps*1000)}ms  ft={int(ft_fi/fps*1000)}ms")
 
     # ── 8. Extract final frames + temporal metrics ────────────────────────────
-    frames  = extract_phase_frames_at_indices(cap, fps, total_frames, phase_fis, include_overlays)
-    samples = _sample_pose_track(cap, fps, total_frames, quality)
-    metrics = compute_temporal_metrics(phase_fis, fps, samples)
+    frames = extract_phase_frames_at_indices(cap, fps, total_frames, phase_fis, include_overlays)
+
+    if accurate:
+        # High-resolution motion track for tighter smoothness numbers.
+        metric_samples = _sample_pose_track(cap, fps, total_frames, quality)
+    else:
+        # Reuse the walk samples we already have — no extra video pass.
+        metric_samples = walk_samples
+
+    metrics = compute_temporal_metrics(phase_fis, fps, metric_samples)
     metrics["detectionMethods"] = {
-        "address":       "burst_anchor",
-        "top":           "vision_sheet" if (vision and vision["top_fi"] == top_fi) else "motion_energy",
-        "impact":        "vision_sheet" if (vision and vision["impact_fi"] == impact_fi) else "motion_energy",
+        "address": "motion_minimum",
+        "top": top_method,
+        "impact": impact_method,
         "followThrough": "offset",
     }
     return frames, metrics
@@ -1323,12 +1573,47 @@ async def extract_key_frames_upload(
 
 
 @app.post("/extract-frames")
-async def extract_frames(video: UploadFile = File(...), frameCount: int = Form(6)):
+async def extract_frames(
+    video: UploadFile = File(...),
+    frameCount: int = Form(8),
+    mode: str = Form("analysis"),
+):
     """
     Accept a video file, extract evenly-spaced frames using OpenCV,
-    return them as base64 JPEG strings for AI analysis.
+    return them as base64 JPEG strings.
+
+    Two modes:
+
+      • "analysis"        — 6 to 8 frames. For OpenRouter coaching.
+                            Trims first/last 8% to avoid pre/post-swing dead time.
+                            Higher JPEG quality (72), 640px max side.
+
+      • "phaseDetection"  — 60 to 90 frames. For client-side selection of
+                            Address / Top / Impact / Follow-Through.
+                            Trims first/last 2% only (we need the whole swing).
+                            Smaller JPEGs (quality 62, 480px max side) since
+                            we're shipping many more.
     """
+    if mode not in ("analysis", "phaseDetection"):
+        mode = "analysis"
+
+    if mode == "phaseDetection":
+        frameCount = max(24, min(120, frameCount))
+        lo_pct, hi_pct = 0.02, 0.98
+        # Phone screens are ~390px wide and the VA modal renders frames at
+        # less than that. 384px is plenty of resolution for both display
+        # AND the motion-energy calc, and saves ~25% in JPEG encode +
+        # transfer time over the previous 480.
+        max_side = 384
+        jpeg_q = 55
+    else:
+        frameCount = max(4, min(12, frameCount))
+        lo_pct, hi_pct = 0.08, 0.92
+        max_side = 640
+        jpeg_q = 72
+
     tmp_path = None
+    cleanup_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
             tmp.write(await video.read())
@@ -1336,41 +1621,307 @@ async def extract_frames(video: UploadFile = File(...), frameCount: int = Form(6
 
         cap, _, cleanup_path = open_video(tmp_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        print(f"[extract-frames] total_frames={total_frames}")
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        duration_ms = int((total_frames / max(fps, 1.0)) * 1000) if total_frames > 0 else 0
+        print(f"[extract-frames] mode={mode} requested={frameCount} total_frames={total_frames} fps={fps:.2f}")
         if total_frames <= 0:
             cap.release()
-            return {"frames": []}
+            return {"frames": [], "mode": mode, "fps": fps, "total_frames": 0, "duration_ms": 0,
+                    "lo_pct": lo_pct, "hi_pct": hi_pct}
 
         count = min(frameCount, total_frames)
-        # Skip first and last 8% — usually just the golfer walking up or
-        # standing still after the swing; the real swing is in the middle.
-        lo = int(total_frames * 0.08)
-        hi = int(total_frames * 0.92)
+        lo = int(total_frames * lo_pct)
+        hi = int(total_frames * hi_pct)
         span = max(1, hi - lo)
         indices = [lo + int(i * span / max(count - 1, 1)) for i in range(count)]
-        frames_b64 = []
+        frames_b64: list[str] = []
+        # Per-sample motion energy. Only populated for phaseDetection mode
+        # because the client uses it to find the swing burst. For analysis
+        # mode we'd just be paying the cost for no benefit.
+        motion: list[float] = []
+        prev_gray = None
+        motion_h = 90  # downscale-then-diff is plenty for burst detection
 
         for idx in indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(idx, total_frames - 1)))
             ret, frame = cap.read()
             if not ret:
                 continue
-            # CLAHE enhances contrast for outdoor/flat-lit footage
-            enhanced = _preprocess(frame)
-            small = resize_for_ai(enhanced, max_side=640)
-            _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 72])
+            # CLAHE only for analysis — phaseDetection wants raw motion fidelity
+            processed = _preprocess(frame) if mode == "analysis" else frame
+            small = resize_for_ai(processed, max_side=max_side)
+            _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
             frames_b64.append(base64.b64encode(buf).decode("utf-8"))
 
+            if mode == "phaseDetection":
+                # Downscale aggressively for motion calc — we only need a
+                # rough scalar per frame. ~90px tall keeps the math <0.1ms.
+                h0, w0 = frame.shape[:2]
+                if h0 > 0:
+                    sw = max(1, int(w0 * motion_h / h0))
+                    tiny = cv2.resize(frame, (sw, motion_h), interpolation=cv2.INTER_AREA)
+                    gray = cv2.cvtColor(tiny, cv2.COLOR_BGR2GRAY)
+                    if prev_gray is None or prev_gray.shape != gray.shape:
+                        motion.append(0.0)
+                    else:
+                        diff = cv2.absdiff(gray, prev_gray)
+                        motion.append(float(diff.mean()))
+                    prev_gray = gray
+                else:
+                    motion.append(0.0)
+
         cap.release()
-        sizes = [len(f) for f in frames_b64]
-        print(f"[extract-frames] returning {len(frames_b64)} frames, sizes: {sizes}")
-        return {"frames": frames_b64}
+
+        # Audio impact detection for phaseDetection mode. The mic-captured
+        # click is the most precise signal we have for impact (±1 frame).
+        # We additionally compute the dense-frame index so the client picker
+        # can use it directly without inverting the index mapping. Sequential
+        # after the frame loop (~200-500ms) — short enough that we don't
+        # bother making it async.
+        audio_impact_out = None
+        if mode == "phaseDetection":
+            ai = detect_audio_impact(tmp_path, fps, total_frames, lo_pct, hi_pct)
+            if ai:
+                # Map the audio-derived video frame index onto the dense
+                # frames array we just emitted. `indices` is the actual list
+                # of source-video frame indices for each dense frame, in
+                # order, so the dense index is just the position of the
+                # nearest entry.
+                if indices:
+                    diffs = [abs(idx - ai["frame_idx"]) for idx in indices]
+                    dense_idx = int(diffs.index(min(diffs)))
+                else:
+                    dense_idx = -1
+                audio_impact_out = {
+                    "frameIdx": int(ai["frame_idx"]),
+                    "denseIdx": dense_idx,
+                    "timeMs": int(ai["time_ms"]),
+                    "confidence": float(ai["confidence"]),
+                    "peakToMedianRatio": float(ai["peak_to_median_ratio"]),
+                }
+
+        if mode == "analysis":
+            sizes = [len(f) for f in frames_b64]
+            print(f"[extract-frames] returning {len(frames_b64)} analysis frames, sizes: {sizes}")
+        else:
+            avg = (sum(len(f) for f in frames_b64) // max(len(frames_b64), 1))
+            mx = max(motion) if motion else 0.0
+            mn = min(motion) if motion else 0.0
+            ai_tag = (f" audio_impact_dense={audio_impact_out['denseIdx']} "
+                      f"conf={audio_impact_out['confidence']:.2f}"
+                      if audio_impact_out else "")
+            print(f"[extract-frames] returning {len(frames_b64)} phaseDetection frames, "
+                  f"avg_size={avg} motion_range=[{mn:.2f},{mx:.2f}]{ai_tag}")
+
+        # Return video metadata alongside frames so the client can convert
+        # picked frame indices back to video timestamps — needed for accurate
+        # tempo metrics in the dense-frame phase-detection pipeline.
+        return {
+            "frames": frames_b64,
+            "mode": mode,
+            "fps": fps,
+            "total_frames": total_frames,
+            "duration_ms": duration_ms,
+            "lo_pct": lo_pct,
+            "hi_pct": hi_pct,
+            # motion[i] = grayscale absdiff mean between sampled frame i and i-1.
+            # motion[0] = 0 by convention. Only present in phaseDetection mode.
+            "motion": motion,
+            # Audio-derived impact location. Only present (and only attempted)
+            # in phaseDetection mode. null when no ffmpeg available, audio is
+            # silent, or no clear peak.
+            "audio_impact": audio_impact_out,
+        }
 
     except Exception as e:
         print(f"[extract-frames] error: {e}")
-        return {"frames": []}
+        return {"frames": [], "mode": mode}
     finally:
-        for p in [tmp_path, cleanup_path if 'cleanup_path' in dir() else None]:
+        for p in [tmp_path, cleanup_path]:
+            if p and os.path.exists(p):
+                os.remove(p)
+
+
+@app.post("/detect-phases-pose")
+async def detect_phases_pose(
+    video: UploadFile = File(...),
+    club: str = Form("unknown"),
+    include_overlays: bool = Form(False),
+):
+    """
+    Pose-based swing phase detection — the right way.
+
+    Pipeline (single pass, ~3-5s total):
+    1. Sample ~30 frames evenly across the video.
+    2. Run MediaPipe Pose on each, tracking the golfer's hand (wrist) Y-position
+       and frame-to-frame motion. (Same proven _sample_pose_track helper that
+       the slower /extract-key-frames-upload "accurate" path uses.)
+    3. Hand-off to detect_swing_events, which finds:
+        - Impact = peak combined motion+wrist-speed energy
+        - Top of backswing = last local energy minimum before impact (the
+          brief pause where the club reverses direction)
+        - Address = lowest-energy frame in the first 22% (golfer still still)
+        - Finish = ~0.35s after impact
+    4. Seek to those exact video-frame indices, encode at full quality, and
+       run MediaPipe again to attach landmarks for the overlay.
+    5. Compute deterministic tempo metrics from the picked indices.
+
+    This bypasses the brittle /extract-key-frames-upload flow and the
+    percentage-window dense fallback. The phase decisions come straight
+    from physical signal in the video (hand trajectory + scene motion),
+    so they're correct regardless of how the user trimmed the recording.
+    """
+    tmp_path = None
+    cleanup_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp.write(await video.read())
+            tmp_path = tmp.name
+
+        cap, _, cleanup_path = open_video(tmp_path)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration_ms = int((total_frames / max(fps, 1.0)) * 1000) if total_frames > 0 else 0
+
+        if total_frames <= 0:
+            cap.release()
+            print("[detect-phases-pose] empty video")
+            return {"frames": [], "metrics": None, "fps": fps, "total_frames": 0}
+
+        print(f"[detect-phases-pose] total_frames={total_frames} fps={fps:.2f} club={club}")
+
+        # 1-2. Pose-tracked motion samples (~30 frames, ~1.5-2.5s).
+        samples = _sample_pose_track(cap, fps, total_frames, quality="fast")
+        if not samples or len(samples) < 6:
+            cap.release()
+            print(f"[detect-phases-pose] not enough samples ({len(samples) if samples else 0})")
+            return {"frames": [], "metrics": None, "fps": fps, "total_frames": total_frames}
+
+        # 3. Phase detection from energy curve.
+        events = detect_swing_events(samples, total_frames, fps)
+        if not events:
+            cap.release()
+            print("[detect-phases-pose] detect_swing_events returned None")
+            return {"frames": [], "metrics": None, "fps": fps, "total_frames": total_frames}
+
+        phase_fis, confidence, methods = events
+        phase_labels = ["setup", "top", "impact", "finish"]
+        phase_fis = list(phase_fis)
+        print(f"[detect-phases-pose] pose indices={phase_fis} "
+              f"ms={[int(fi/fps*1000) for fi in phase_fis]} "
+              f"methods={methods}")
+
+        # 3b. AUDIO-OVERRIDE — try locating impact from the audio click. When
+        # confident, replace the pose-derived impact frame with the audio one
+        # and shift top / finish to maintain a sensible swing arc around it.
+        # This is the single biggest accuracy win for phase detection: impact
+        # is the only phase that produces a deterministic, sub-frame signal
+        # that's directly observable (the sound of the clubface meeting the
+        # ball). Pose tracking can only see "the body moved fast around here",
+        # which is ±3-5 frames at best.
+        audio_impact = detect_audio_impact(tmp_path, fps, total_frames,
+                                            lo_pct=0.10, hi_pct=0.92)
+        AUDIO_CONFIDENCE_THRESHOLD = 0.40
+        if audio_impact and audio_impact["confidence"] >= AUDIO_CONFIDENCE_THRESHOLD:
+            audio_fi = int(audio_impact["frame_idx"])
+            pose_fi = int(phase_fis[2])
+            delta = audio_fi - pose_fi
+            print(f"[detect-phases-pose] audio override: pose impact={pose_fi} "
+                  f"→ audio impact={audio_fi} (Δ={delta} frames, conf={audio_impact['confidence']:.2f})")
+            phase_fis[2] = audio_fi
+            methods["impact"] = "audio_peak"
+            confidence["impact"] = max(confidence.get("impact", 0.5),
+                                       audio_impact["confidence"])
+
+            # Keep the swing arc coherent: top must be before impact, finish
+            # must be after. Shift each by `delta` if they end up on the wrong
+            # side, then clamp to plausible distances from impact.
+            #   • Top: pose detector placed it relative to old impact, so just
+            #     translate it by the same delta. Then ensure it's ≥0.15s and
+            #     ≤1.2s before audio impact (anything outside that is implausible
+            #     for a normal swing tempo).
+            min_top_gap = max(2, int(0.15 * fps))   # tour-fast = ~0.18s
+            max_top_gap = max(min_top_gap + 1, int(1.20 * fps))
+            new_top = phase_fis[1] + delta
+            if new_top < 0 or new_top >= phase_fis[2] - min_top_gap:
+                new_top = phase_fis[2] - max(min_top_gap, int(0.45 * fps))
+            elif phase_fis[2] - new_top > max_top_gap:
+                new_top = phase_fis[2] - max_top_gap
+            phase_fis[1] = max(0, new_top)
+
+            # Address: just nudge by the same delta if it stays valid; otherwise
+            # re-anchor at the lowest-energy sample in the first quarter.
+            new_addr = phase_fis[0] + delta if delta < 0 else phase_fis[0]
+            if new_addr < 0 or new_addr >= phase_fis[1]:
+                new_addr = max(0, phase_fis[1] - max(2, int(0.30 * fps)))
+            phase_fis[0] = new_addr
+
+            # Finish: ~0.35s after impact is a reliable target for a clean
+            # hold-finish frame; clamp to the actual video length.
+            post_impact = max(2, int(0.35 * fps))
+            phase_fis[3] = min(total_frames - 1, phase_fis[2] + post_impact)
+
+            # Sanity: ensure strict monotonicity.
+            for i in range(1, 4):
+                if phase_fis[i] <= phase_fis[i - 1]:
+                    phase_fis[i] = min(total_frames - 1, phase_fis[i - 1] + 1)
+
+            print(f"[detect-phases-pose] post-audio indices={phase_fis} "
+                  f"ms={[int(fi/fps*1000) for fi in phase_fis]}")
+        elif audio_impact:
+            print(f"[detect-phases-pose] audio impact found but confidence "
+                  f"{audio_impact['confidence']:.2f} below threshold "
+                  f"{AUDIO_CONFIDENCE_THRESHOLD} — using pose-only result")
+
+        # 4. Extract the 4 phase frames at full quality + landmarks.
+        ts_list = [int(fi / fps * 1000) for fi in phase_fis]
+        results = extract_frames_with_pose(cap, ts_list, fps, include_overlays)
+
+        # 5. Tempo metrics from the picked indices + smoothness from samples.
+        metrics = compute_temporal_metrics(phase_fis, fps, samples)
+
+        # Attach confidence + detection method metadata for downstream consumers.
+        metrics_out = dict(metrics) if metrics else {}
+        metrics_out["confidence"] = confidence
+        metrics_out["detectionMethods"] = {
+            "address": methods.get("address", "energy_minimum"),
+            "top": methods.get("top", "local_minimum"),
+            "impact": methods.get("impact", "energy_peak"),
+            "followThrough": methods.get("followThrough", "post_impact_window"),
+        }
+        if audio_impact:
+            metrics_out["audioImpact"] = {
+                "frameIdx": int(audio_impact["frame_idx"]),
+                "timeMs": int(audio_impact["time_ms"]),
+                "confidence": float(audio_impact["confidence"]),
+                "peakToMedianRatio": float(audio_impact["peak_to_median_ratio"]),
+            }
+
+        # Annotate each phase frame with its label + confidence so the client
+        # can drop them straight into VisualAnalysis without re-indexing.
+        for i, label in enumerate(phase_labels):
+            if i < len(results):
+                results[i]["phase"] = label
+                results[i]["confidence"] = confidence.get(label if label != "finish" else "followThrough", 0.5)
+
+        cap.release()
+        print(f"[detect-phases-pose] returning {len(results)} frames "
+              f"({sum(1 for r in results if r.get('frame'))} valid)")
+        return {
+            "frames": results,
+            "metrics": metrics_out,
+            "fps": fps,
+            "total_frames": total_frames,
+            "duration_ms": duration_ms,
+        }
+
+    except Exception as e:
+        print(f"[detect-phases-pose] error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"frames": [], "metrics": None}
+    finally:
+        for p in [tmp_path, cleanup_path]:
             if p and os.path.exists(p):
                 os.remove(p)
 

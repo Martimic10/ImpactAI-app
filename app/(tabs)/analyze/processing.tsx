@@ -7,27 +7,15 @@ import Animated, {
   useAnimatedStyle,
   useSharedValue,
   withTiming,
+  withSequence,
   Easing,
+  useDerivedValue,
+  runOnJS,
 } from 'react-native-reanimated';
-import { runSwingAnalysis, AnalysisStage } from '@/lib/analysis';
+import { runSwingAnalysis } from '@/lib/analysis';
 import { useAuth } from '@/hooks/useAuth';
 import { useTheme } from '@/hooks/useTheme';
 import { useAppColors } from '@/lib/theme';
-
-const STEPS = [
-  { label: 'Uploading video…', stage: 'uploading' },
-  { label: 'Extracting frames…', stage: 'extracting' },
-  { label: 'Analyzing swing with AI…', stage: 'analyzing' },
-  { label: 'Saving results…', stage: 'saving' },
-];
-
-const STAGE_PROGRESS: Record<string, number> = {
-  uploading: 20,
-  extracting: 45,
-  analyzing: 75,
-  saving: 92,
-  done: 100,
-};
 
 export default function ProcessingScreen() {
   const router = useRouter();
@@ -37,29 +25,73 @@ export default function ProcessingScreen() {
   const { user, loading: authLoading } = useAuth();
 
   const [stepLabel, setStepLabel] = useState('Preparing…');
-  const progress = useSharedValue(0);
+  const [pctText, setPctText] = useState(0);
+  const progress = useSharedValue(0); // 0-100
   const hasRun = useRef(false);
+  // The bar runs in two stages so it NEVER appears frozen, no matter how long
+  // the backend takes:
+  //   Stage 1 (FAST): 0 → 80% linear over EXPECTED_FAST_MS. This is the
+  //                    "things are happening" phase that covers the typical
+  //                    analysis time on a healthy connection.
+  //   Stage 2 (SLOW): 80 → 96% ease-out over LONG_TAIL_MS. A long, decelerating
+  //                    creep so the bar always advances by at least a pixel.
+  //                    Asymptotes toward 96% — the final 4% is reserved for
+  //                    the "done" tween so it lands cleanly at 100.
+  const EXPECTED_FAST_MS = 8000;
+  const LONG_TAIL_MS = 22000;
 
   const barStyle = useAnimatedStyle(() => ({
     width: `${progress.value}%`,
   }));
 
-  function advanceTo(pct: number, duration = 600) {
-    progress.value = withTiming(pct, { duration, easing: Easing.out(Easing.quad) });
+  // Mirror the animated shared value to React state so the percentage number
+  // updates smoothly. We gate the runOnJS call on the UI thread so React
+  // only sees a new value when the rounded integer actually ticks.
+  const lastEmitted = useSharedValue(-1);
+  useDerivedValue(() => {
+    const v = Math.round(progress.value);
+    if (v !== lastEmitted.value) {
+      lastEmitted.value = v;
+      runOnJS(setPctText)(v);
+    }
+  });
+
+  function setLabel(label: string) {
+    setStepLabel(label);
+  }
+
+  // Finish the bar cleanly when the analysis is actually done. We pick a
+  // tween duration that scales with the remaining distance so the final
+  // sweep feels natural whether the bar was at 50% or 88% when done fired.
+  function finishProgress() {
+    const current = progress.value;
+    const remaining = Math.max(0, 100 - current);
+    const duration = Math.max(280, Math.min(800, remaining * 9));
+    progress.value = withTiming(100, {
+      duration,
+      easing: Easing.out(Easing.cubic),
+    });
   }
 
   useEffect(() => {
     if (authLoading) return;
     if (hasRun.current) return;
     hasRun.current = true;
-
-    advanceTo(8, 400);
+    // Fast linear climb, then a long ease-out tail. Combined, the user always
+    // sees the bar moving even on slow networks; finishProgress() snaps the
+    // remaining distance smoothly when the analysis actually returns.
+    progress.value = withSequence(
+      withTiming(80, { duration: EXPECTED_FAST_MS, easing: Easing.linear }),
+      withTiming(96, { duration: LONG_TAIL_MS, easing: Easing.out(Easing.quad) }),
+    );
     runAnalysis();
   }, [authLoading]);
 
   async function runAnalysis() {
     if (!uri || !user) {
-      Alert.alert('Error', 'Missing video or user.', [{ text: 'Back', onPress: () => router.back() }]);
+      Alert.alert('Error', 'Missing video or user.', [
+        { text: 'Back', onPress: () => router.back() },
+      ]);
       return;
     }
 
@@ -68,25 +100,26 @@ export default function ProcessingScreen() {
         uri,
         userId: user.id,
         club: club ?? undefined,
-        onStage: (stage: AnalysisStage) => {
-          const pct = STAGE_PROGRESS[stage] ?? 0;
-          const match = STEPS.find((s) => s.stage === stage);
-          if (match) setStepLabel(match.label);
-          advanceTo(pct, 700);
+        onProgress: ({ label }) => {
+          // Milestones drive the label only — the bar climbs on its own.
+          setLabel(label);
         },
       });
 
-      advanceTo(100, 400);
+      finishProgress();
+      setLabel('Done');
       setTimeout(() => {
         router.push({
           pathname: '/(tabs)/analyze/swing/[id]',
           params: { id: swingId, from: 'analysis' },
         });
-      }, 350);
+      }, 450);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Analysis failed';
       console.error('[Analysis]', msg);
-      Alert.alert('Analysis Error', msg, [{ text: 'Try Again', onPress: () => router.back() }]);
+      Alert.alert('Analysis Error', msg, [
+        { text: 'Try Again', onPress: () => router.back() },
+      ]);
     }
   }
 
@@ -102,8 +135,11 @@ export default function ProcessingScreen() {
         <Text style={styles.headline}>Analyzing your swing</Text>
         <Text style={styles.sub}>{stepLabel}</Text>
 
-        <View style={styles.barTrack}>
-          <Animated.View style={[styles.barFill, barStyle]} />
+        <View style={styles.barRow}>
+          <View style={styles.barTrack}>
+            <Animated.View style={[styles.barFill, barStyle]} />
+          </View>
+          <Text style={styles.pctText}>{pctText}%</Text>
         </View>
 
         {club && (
@@ -123,7 +159,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 32,
     justifyContent: 'center',
     alignItems: 'center',
-    gap: 0,
   },
 
   iconWrap: {
@@ -152,20 +187,35 @@ const styles = StyleSheet.create({
     color: '#8E8E93',
     textAlign: 'center',
     marginBottom: 32,
+    minHeight: 18,
   },
 
-  barTrack: {
+  barRow: {
     width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginBottom: 20,
+  },
+  barTrack: {
+    flex: 1,
     height: 6,
     backgroundColor: '#2A2A2A',
     borderRadius: 3,
     overflow: 'hidden',
-    marginBottom: 20,
   },
   barFill: {
     height: '100%',
     backgroundColor: '#4CAF50',
     borderRadius: 3,
+  },
+  pctText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    fontVariant: ['tabular-nums'],
+    minWidth: 42,
+    textAlign: 'right',
   },
 
   clubPill: {

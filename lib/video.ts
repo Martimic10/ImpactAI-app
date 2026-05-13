@@ -1,9 +1,15 @@
 import * as LegacyFS from 'expo-file-system/legacy';
+import { extractFramesFromVideo } from '@/lib/frames';
 
 // Spread across a wider range so longer videos (5-8s) are covered
 // Used only when backend is unavailable
 const FRAME_TIMES_MS = [400, 1200, 2200, 3400, 5000];
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
+
+// AI coaching only needs a handful of frames — more = bigger payload and
+// no real improvement in coaching quality. Dense phase-detection frames
+// go through a different code path in visualAnalysis.ts.
+const COACHING_FRAME_COUNT = 8;
 
 function getVideoThumbnails() {
   try {
@@ -30,32 +36,13 @@ async function readBase64(uri: string): Promise<string> {
   return LegacyFS.readAsStringAsync(uri, { encoding: 'base64' });
 }
 
-// Send video file to backend and get back base64 frames for AI analysis
 async function extractFramesViaBackend(uri: string): Promise<string[]> {
   try {
-    console.log('[video] falling back to backend frame extraction');
-    const formData = new FormData();
-    formData.append('video', {
-      uri,
-      name: 'swing.mp4',
-      type: 'video/mp4',
-    } as unknown as Blob);
-    formData.append('frameCount', '6');
-
-    const res = await fetch(`${BACKEND_URL}/extract-frames`, {
-      method: 'POST',
-      body: formData,
+    const frames = await extractFramesFromVideo(uri, {
+      mode: 'analysis',
+      frameCount: COACHING_FRAME_COUNT,
     });
-
-    if (!res.ok) {
-      console.warn('[video] backend /extract-frames error:', res.status);
-      return [];
-    }
-
-    const json = await res.json();
-    const frames: string[] = (json.frames ?? []).filter((f: string) => f && f.length > 0);
-    console.log(`[video] backend returned ${frames.length} frames`);
-    return frames;
+    return frames.filter((f) => f && f.length > 0);
   } catch (e) {
     console.warn('[video] backend extraction threw:', e);
     return [];

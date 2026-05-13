@@ -1,12 +1,102 @@
-// Frame extraction utilities — V1 sends video URI to backend for FFmpeg processing.
-// Backend extracts 5-8 frames and returns them as base64 strings.
+// Frame extraction utilities.
+//
+// Two distinct extraction modes are supported, because AI coaching and
+// visual phase detection have very different needs:
+//
+//   • "analysis"        → 6–8 evenly-spaced frames for OpenRouter coaching.
+//                         Cheap, fast, low bandwidth. Token-friendly.
+//
+//   • "phaseDetection"  → 60–90 evenly-spaced frames for selecting
+//                         Address / Top / Impact / Follow-Through.
+//                         Dense enough to distinguish top vs. impact.
+//
+// IMPORTANT: never feed phaseDetection frames into the coaching model.
+// The cost would explode and the model doesn't need 75 frames to coach.
+
+export type FrameExtractionMode = 'analysis' | 'phaseDetection';
+
+export interface ExtractFramesOptions {
+  mode?: FrameExtractionMode;
+  frameCount?: number;
+}
+
+// Video metadata returned alongside the dense frame array. The client uses
+// these to map a picked frame's index in the returned array back to its real
+// timestamp in the source video — required for accurate tempo metrics.
+export interface ExtractFramesMeta {
+  fps: number;
+  totalFrames: number;
+  durationMs: number;
+  // Fraction of total_frames the backend trimmed off head/tail before
+  // sampling. For phaseDetection that's [0.02, 0.98]; for analysis [0.08, 0.92].
+  loPct: number;
+  hiPct: number;
+  // Per-sampled-frame motion energy (grayscale absdiff mean). motion[0] = 0.
+  // Only populated for phaseDetection mode; used by the burst-anchored phase
+  // picker to find Address/Top/Impact/Finish even when the swing happens at
+  // non-standard timing within the video.
+  motion?: number[];
+  // Audio-derived impact location. The clubface-on-ball click is the most
+  // precise temporal signal in a swing recording (±1 frame); when present,
+  // the dense-frame phase picker anchors impact here instead of relying on
+  // motion-burst heuristics. Null/undefined when the backend doesn't have
+  // ffmpeg, the audio is silent, or no clear peak was found.
+  audioImpact?: {
+    frameIdx: number;     // index in the source video's frame space
+    denseIdx: number;     // index in the returned dense frames array (-1 if outside)
+    timeMs: number;
+    confidence: number;   // 0..1, log-scaled peak-to-median ratio
+    peakToMedianRatio: number;
+  };
+}
+
+export interface ExtractFramesResult {
+  frames: string[];
+  meta: ExtractFramesMeta | null;
+}
 
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
 
-export async function extractFramesFromVideo(videoUri: string): Promise<string[]> {
+const ANALYSIS_DEFAULT_FRAMES = 8;
+const PHASE_DETECTION_DEFAULT_FRAMES = 75;
+
+// Hard caps prevent accidentally requesting absurd counts that would
+// blow up bandwidth or run the model out of context.
+const ANALYSIS_MIN_FRAMES = 4;
+const ANALYSIS_MAX_FRAMES = 12;
+const PHASE_DETECTION_MIN_FRAMES = 24;
+const PHASE_DETECTION_MAX_FRAMES = 120;
+
+function clampFrameCount(mode: FrameExtractionMode, requested: number): number {
+  if (mode === 'phaseDetection') {
+    return Math.max(PHASE_DETECTION_MIN_FRAMES, Math.min(PHASE_DETECTION_MAX_FRAMES, requested));
+  }
+  return Math.max(ANALYSIS_MIN_FRAMES, Math.min(ANALYSIS_MAX_FRAMES, requested));
+}
+
+export async function extractFramesFromVideo(
+  videoUri: string,
+  options: ExtractFramesOptions = {}
+): Promise<string[]> {
+  const { frames } = await extractFramesFromVideoWithMeta(videoUri, options);
+  return frames;
+}
+
+export async function extractFramesFromVideoWithMeta(
+  videoUri: string,
+  options: ExtractFramesOptions = {}
+): Promise<ExtractFramesResult> {
+  const mode: FrameExtractionMode = options.mode ?? 'analysis';
+  const requested =
+    options.frameCount ??
+    (mode === 'phaseDetection' ? PHASE_DETECTION_DEFAULT_FRAMES : ANALYSIS_DEFAULT_FRAMES);
+  const frameCount = clampFrameCount(mode, requested);
+
+  console.log(`[frames] extract mode=${mode} requested=${requested} clamped=${frameCount}`);
+
   if (!BACKEND_URL) {
-    // Return mock frames for development when no backend is configured
-    return getMockFrames();
+    console.log('[frames] no BACKEND_URL — returning mock frames');
+    return { frames: getMockFrames(frameCount), meta: null };
   }
 
   const formData = new FormData();
@@ -15,14 +105,15 @@ export async function extractFramesFromVideo(videoUri: string): Promise<string[]
     name: 'swing.mp4',
     type: 'video/mp4',
   } as unknown as Blob);
-  formData.append('frameCount', '6');
+  formData.append('mode', mode);
+  formData.append('frameCount', String(frameCount));
 
+  // NOTE: don't set Content-Type manually — RN needs to inject the
+  // multipart boundary itself, and overriding the header silently
+  // breaks the upload on some platforms.
   const response = await fetch(`${BACKEND_URL}/extract-frames`, {
     method: 'POST',
     body: formData,
-    headers: {
-      'Content-Type': 'multipart/form-data',
-    },
   });
 
   if (!response.ok) {
@@ -30,13 +121,67 @@ export async function extractFramesFromVideo(videoUri: string): Promise<string[]
   }
 
   const data = await response.json();
-  return data.frames as string[];
+  const frames = (data.frames ?? []) as string[];
+
+  const ai = data.audio_impact;
+  const audioImpact = ai && typeof ai === 'object' && Number.isFinite(ai.frameIdx)
+    ? {
+        frameIdx: Number(ai.frameIdx),
+        denseIdx: Number.isFinite(ai.denseIdx) ? Number(ai.denseIdx) : -1,
+        timeMs: Number(ai.timeMs) || 0,
+        confidence: Number(ai.confidence) || 0,
+        peakToMedianRatio: Number(ai.peakToMedianRatio) || 0,
+      }
+    : undefined;
+
+  const meta: ExtractFramesMeta | null = data.total_frames
+    ? {
+        fps: Number(data.fps) || 30,
+        totalFrames: Number(data.total_frames) || 0,
+        durationMs: Number(data.duration_ms) || 0,
+        loPct: typeof data.lo_pct === 'number' ? data.lo_pct : (mode === 'phaseDetection' ? 0.02 : 0.08),
+        hiPct: typeof data.hi_pct === 'number' ? data.hi_pct : (mode === 'phaseDetection' ? 0.98 : 0.92),
+        motion: Array.isArray(data.motion) ? (data.motion as number[]) : undefined,
+        audioImpact,
+      }
+    : null;
+
+  console.log(
+    `[frames] backend returned ${frames.length} frames (mode=${mode})` +
+      (meta ? ` fps=${meta.fps.toFixed(1)} dur=${meta.durationMs}ms` : '') +
+      (meta?.motion ? ` motion=${meta.motion.length}pts` : '') +
+      (meta?.audioImpact
+        ? ` audio_impact_dense=${meta.audioImpact.denseIdx} conf=${meta.audioImpact.confidence.toFixed(2)}`
+        : ''),
+  );
+  return { frames, meta };
 }
 
-// Mock frames for development / demo mode
-function getMockFrames(): string[] {
-  // Return empty strings as placeholders — AI will generate a mock response
-  return Array(6).fill('');
+function getMockFrames(count: number = ANALYSIS_DEFAULT_FRAMES): string[] {
+  return Array(count).fill('');
+}
+
+// Map a picked dense-frame array index back to the source video frame index.
+// Dense samples are evenly spaced across [loPct, hiPct] of total_frames.
+export function denseIndexToVideoFrameIndex(
+  denseIdx: number,
+  pickedCount: number,
+  meta: ExtractFramesMeta,
+): number {
+  if (pickedCount <= 1 || meta.totalFrames <= 0) return 0;
+  const span = meta.hiPct - meta.loPct;
+  const frac = meta.loPct + (denseIdx / (pickedCount - 1)) * span;
+  return Math.round(frac * meta.totalFrames);
+}
+
+export function denseIndexToTimeMs(
+  denseIdx: number,
+  pickedCount: number,
+  meta: ExtractFramesMeta,
+): number {
+  if (meta.fps <= 0) return 0;
+  const fi = denseIndexToVideoFrameIndex(denseIdx, pickedCount, meta);
+  return Math.round((fi / meta.fps) * 1000);
 }
 
 export const MOCK_SWING_RESULT = {

@@ -4,3 +4,7 @@ mediapipe==0.10.14
 opencv-python-headless==4.10.0.84
 supabase==2.7.4
 python-multipart==0.0.9
+# Bundled static ffmpeg binary used by detect_audio_impact() for audio-based
+# impact detection. Pulls a self-contained ~30MB binary, so the deploy works
+# without needing apt-get install ffmpeg on the host.
+imageio-ffmpeg==0.5.1
