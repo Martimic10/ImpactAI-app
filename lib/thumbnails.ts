@@ -1,8 +1,26 @@
 import * as LegacyFS from 'expo-file-system/legacy';
+import { notifySwingDataUpdates } from '@/lib/swingDataUpdates';
 import { supabase } from '@/lib/supabase';
 import { Swing } from '@/types';
 
 const BUCKET = 'swing-videos';
+
+/** In-memory thumbs for swings before DB thumbnail_url is saved. */
+const pendingThumbCache: Record<string, string> = {};
+
+export function getCachedSwingThumbnail(swingId: string): string | null {
+  return pendingThumbCache[swingId] ?? null;
+}
+
+export function prefetchSwingThumbnail(swingId: string, videoUri: string): void {
+  if (!videoUri || pendingThumbCache[swingId]) return;
+  void extractVideoThumbnailUri(videoUri, swingId).then((url) => {
+    if (url) {
+      pendingThumbCache[swingId] = url;
+      notifySwingDataUpdates();
+    }
+  });
+}
 
 function getVideoThumbnails() {
   try {
@@ -19,7 +37,7 @@ function getVideoThumbnails() {
   }
 }
 
-async function localUriForVideo(videoUri: string, swingId: string): Promise<string> {
+export async function localUriForVideo(videoUri: string, swingId: string): Promise<string> {
   // Already a local file — use as-is
   if (!videoUri.startsWith('http')) return videoUri;
 
@@ -31,6 +49,28 @@ async function localUriForVideo(videoUri: string, swingId: string): Promise<stri
   } catch (e) {
     console.warn('[thumbnails] download failed, trying remote URL directly:', e);
     return videoUri;
+  }
+}
+
+/** Extract a local JPEG thumbnail URI from a video (local or remote). */
+export async function extractVideoThumbnailUri(
+  videoUri: string,
+  swingId: string,
+): Promise<string | null> {
+  if (!videoUri) return null;
+  const VideoThumbnails = getVideoThumbnails();
+  if (!VideoThumbnails) return null;
+
+  try {
+    const localUri = await localUriForVideo(videoUri, swingId);
+    const { uri: thumbUri } = await VideoThumbnails.getThumbnailAsync(localUri, {
+      time: 1000,
+      quality: 0.7,
+    });
+    return thumbUri;
+  } catch (e) {
+    console.warn('[thumbnails] extractVideoThumbnailUri failed:', e);
+    return null;
   }
 }
 
@@ -46,13 +86,8 @@ export async function generateAndUploadThumbnail(
   }
 
   try {
-    const localUri = await localUriForVideo(videoUri, swingId);
-    console.log('[thumbnails] extracting frame from:', localUri.slice(0, 80));
-
-    const { uri: thumbUri } = await VideoThumbnails.getThumbnailAsync(localUri, {
-      time: 1000,
-      quality: 0.7,
-    });
+    const thumbUri = await extractVideoThumbnailUri(videoUri, swingId);
+    if (!thumbUri) return null;
     console.log('[thumbnails] frame extracted:', thumbUri);
 
     const base64 = await LegacyFS.readAsStringAsync(thumbUri, { encoding: 'base64' });

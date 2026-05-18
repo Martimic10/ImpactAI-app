@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import json
 import base64
 import subprocess
@@ -8,11 +9,16 @@ import tempfile
 import urllib.request
 import urllib.error
 import mediapipe as mp
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException, Query
+import urllib.parse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from supabase import create_client, Client
+from dotenv import load_dotenv
+
+# Load backend/.env when running locally (Render/production inject env vars directly).
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 app = FastAPI(title="ImpactAI MediaPipe Service")
 
@@ -2044,6 +2050,67 @@ def run_mediapipe(swing_id: str, video_url: str, user_id: str):
         for path in [input_path, output_path]:
             if path and os.path.exists(path):
                 os.remove(path)
+
+
+GOLF_COURSE_API_BASE = "https://api.golfcourseapi.com"
+
+
+def _normalize_golf_api_key(raw: str) -> str:
+    """Accept plain key or full 'Key <token>' pasted from docs."""
+    key = (raw or "").strip()
+    if key.lower().startswith("key "):
+        key = key[4:].strip()
+    return key
+
+
+GOLF_COURSE_API_KEY = _normalize_golf_api_key(os.environ.get("GOLF_COURSE_API_KEY", ""))
+
+
+def _golf_course_headers() -> Dict[str, str]:
+    return {"Authorization": f"Key {GOLF_COURSE_API_KEY}"}
+
+
+def _golf_course_request(path: str, query: Optional[Dict[str, str]] = None) -> dict:
+    if not GOLF_COURSE_API_KEY:
+        raise HTTPException(status_code=503, detail="Golf course API key not configured")
+    qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+    url = f"{GOLF_COURSE_API_BASE}{path}{qs}"
+    req = urllib.request.Request(url, headers=_golf_course_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:300]
+        print(f"[golf-course] upstream {e.code}: {body}")
+        if e.code == 401:
+            raise HTTPException(status_code=503, detail="Golf course API key invalid")
+        if e.code == 404:
+            raise HTTPException(status_code=404, detail="Course not found")
+        raise HTTPException(status_code=502, detail="Golf course API error")
+    except Exception as e:
+        print(f"[golf-course] request failed: {e}")
+        raise HTTPException(status_code=502, detail="Golf course API unreachable")
+
+
+@app.get("/golf-courses/status")
+def golf_course_status():
+    """Debug helper — confirms the server sees your API key (never returns the key)."""
+    return {
+        "configured": bool(GOLF_COURSE_API_KEY),
+        "key_length": len(GOLF_COURSE_API_KEY),
+    }
+
+
+@app.get("/golf-courses/search")
+def golf_course_search(search_query: str = Query(..., min_length=2)):
+    data = _golf_course_request("/v1/search", {"search_query": search_query})
+    return {"courses": data.get("courses", [])}
+
+
+@app.get("/golf-courses/{course_id}")
+def golf_course_detail(course_id: int):
+    data = _golf_course_request(f"/v1/courses/{course_id}")
+    return data
 
 
 if __name__ == "__main__":

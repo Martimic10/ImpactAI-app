@@ -1,15 +1,10 @@
 import * as LegacyFS from 'expo-file-system/legacy';
-import { extractFramesFromVideo } from '@/lib/frames';
+import { extractCoachingFrames, extractFramesFromVideo } from '@/lib/frames';
 
 // Spread across a wider range so longer videos (5-8s) are covered
 // Used only when backend is unavailable
 const FRAME_TIMES_MS = [400, 1200, 2200, 3400, 5000];
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
-
-// AI coaching only needs a handful of frames — more = bigger payload and
-// no real improvement in coaching quality. Dense phase-detection frames
-// go through a different code path in visualAnalysis.ts.
-const COACHING_FRAME_COUNT = 8;
 
 function getVideoThumbnails() {
   try {
@@ -38,10 +33,7 @@ async function readBase64(uri: string): Promise<string> {
 
 async function extractFramesViaBackend(uri: string): Promise<string[]> {
   try {
-    const frames = await extractFramesFromVideo(uri, {
-      mode: 'analysis',
-      frameCount: COACHING_FRAME_COUNT,
-    });
+    const frames = await extractCoachingFrames(uri);
     return frames.filter((f) => f && f.length > 0);
   } catch (e) {
     console.warn('[video] backend extraction threw:', e);

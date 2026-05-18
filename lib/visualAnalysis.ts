@@ -8,8 +8,11 @@ import {
   type ExtractFramesMeta,
 } from '@/lib/frames';
 
+import { fetchWithTimeout } from '@/lib/fetchWithTimeout';
+
 const BUCKET = 'swing-videos';
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
+const BACKEND_FETCH_TIMEOUT_MS = 120_000;
 // Bumped to 16 when the timing-anchored picker replaced the motion-burst
 // picker as the default for the dense pipeline. The motion-burst detector
 // was systematically under-sizing the swing (its threshold only cleared
@@ -165,9 +168,10 @@ async function detectPhasesViaPose(
     if (club) formData.append('club', club);
     formData.append('include_overlays', 'false');
 
-    const res = await fetch(`${BACKEND_URL}/detect-phases-pose`, {
+    const res = await fetchWithTimeout(`${BACKEND_URL}/detect-phases-pose`, {
       method: 'POST',
       body: formData,
+      timeoutMs: BACKEND_FETCH_TIMEOUT_MS,
     });
     if (!res.ok) {
       // 404 = endpoint isn't deployed; 5xx = server can't handle pose requests.
@@ -217,10 +221,11 @@ async function analyzeFramesForLandmarks(
     return payload.map(() => null);
   }
   try {
-    const res = await fetch(`${BACKEND_URL}/analyze-frames`, {
+    const res = await fetchWithTimeout(`${BACKEND_URL}/analyze-frames`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ frames: payload }),
+      timeoutMs: BACKEND_FETCH_TIMEOUT_MS,
     });
     if (!res.ok) {
       console.warn('[visualAnalysis] /analyze-frames error:', res.status);

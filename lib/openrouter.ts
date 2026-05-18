@@ -1,153 +1,402 @@
-import { SwingResult, SwingScores, TemporalMetrics, PoseLandmark } from '@/types';
+// ─────────────────────────────────────────────────────────────────────────────
+// ImpactAI — Coaching LLM Wrapper (v4)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// HARD RULE: the LLM does NOT produce numeric scores. It can only produce
+// qualitative category grades. The app maps those grades to numbers and
+// applies deterministic pose-based guardrail caps for clear faults.
+//
+// The LLM is asked for QUALITATIVE coaching only:
+//   - cameraAngle, club identification
+//   - evidence sentences (visible observations)
+//   - root-cause explanation
+//   - ball flight + contact prediction
+//   - drill (name + why + steps)
+//   - fixes
+//   - key checkpoints
+//   - summary
+//
+// The engine's category scores + detected faults are passed INTO the prompt
+// so the LLM's narrative agrees with the numbers the user actually sees.
+
+import { SwingResult, TemporalMetrics, PoseLandmark } from '@/types';
+import { humanizeSwingResultText } from '@/lib/humanizeSwingText';
+import {
+  scoreSwing,
+  toLegacyScores,
+  legacyReasoning,
+  CategoryKey,
+  SwingScoringResult,
+  PerFrameLandmarks,
+  CATEGORY_LABELS,
+} from '@/lib/swingScoring';
+
+import { fetchWithTimeout } from '@/lib/fetchWithTimeout';
 
 const OPENROUTER_API_KEY  = process.env.EXPO_PUBLIC_OPENROUTER_API_KEY ?? '';
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPENROUTER_TIMEOUT_MS = 90_000;
+const LLM_MAX_FRAMES = 4;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Weighted overall score — backend owns this, AI never sets it directly
-// ─────────────────────────────────────────────────────────────────────────────
-export function calculateOverallScore(scores: SwingScores): number {
-  return Math.round(
-    scores.positionScore  * 0.25 +
-    scores.tempoScore     * 0.20 +
-    scores.sequenceScore  * 0.20 +
-    scores.stabilityScore * 0.20 +
-    scores.contactScore   * 0.15
-  );
-}
-
-// Maps issueCategory → which SwingScores key should be the lowest
-const ISSUE_TO_SCORE_KEY: Record<string, 'positionScore' | 'tempoScore' | 'sequenceScore' | 'stabilityScore' | 'contactScore'> = {
-  setup:    'positionScore',
-  posture:  'stabilityScore',
-  path:     'sequenceScore',
-  clubface: 'contactScore',
-  tempo:    'tempoScore',
-  contact:  'contactScore',
-  balance:  'stabilityScore',
-  rotation: 'sequenceScore',
+// Map the engine's CategoryKey → the legacy issueCategory vocabulary used
+// throughout the rest of the app (drills, UI, leaderboards).
+const ENGINE_CATEGORY_TO_ISSUE: Record<CategoryKey, SwingResult['issueCategory']> = {
+  setup:          'setup',
+  balance:        'balance',
+  tempo:          'tempo',
+  rotation:       'rotation',
+  swingPath:      'path',
+  impactPosition: 'contact',
+  followThrough:  'balance',
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Generic / duplicate detection
-// ─────────────────────────────────────────────────────────────────────────────
-const GENERIC_PHRASES = [
-  'work on fundamentals', 'improve consistency', 'keep practicing',
-  'needs practice', 'work on your game', 'focus on consistency',
-];
+type VisualGrade = 'excellent' | 'strong' | 'solid' | 'needs-work' | 'major-issues';
 
-function isGenericAnalysis(result: SwingResult): boolean {
-  if (result.scores) {
-    const s = result.scores;
-    const allKeys = ['positionScore', 'tempoScore', 'sequenceScore', 'stabilityScore', 'contactScore'] as const;
-    const vals = allKeys.map((k) => s[k] as number);
-    const spread = Math.max(...vals) - Math.min(...vals);
+const VISUAL_GRADE_SCORE: Record<VisualGrade, number> = {
+  excellent: 94,
+  strong: 85,
+  solid: 76,
+  'needs-work': 64,
+  'major-issues': 48,
+};
 
-    // All 5 scores too similar — AI isn't differentiating
-    if (spread < 12) {
-      console.warn('[openrouter] generic: scores too clustered (spread=' + spread + ')');
-      return true;
+// Pick the category with the largest score deficit (rawScore furthest below
+// 90). Returns null when nothing is meaningfully weak.
+function pickPrimaryCategory(scoring: SwingScoringResult): CategoryKey | null {
+  let worstKey: CategoryKey | null = null;
+  let worstDeficit = 0;
+  (Object.keys(scoring.categories) as CategoryKey[]).forEach((k) => {
+    const c = scoring.categories[k];
+    if (c.confidence < 0.30) return; // ignore low-confidence categories
+    const deficit = 90 - c.rawScore;
+    if (deficit > worstDeficit) {
+      worstDeficit = deficit;
+      worstKey = k;
     }
-
-    // Issue category not far enough below the others
-    const issueKey = ISSUE_TO_SCORE_KEY[result.issueCategory ?? ''];
-    if (issueKey && s[issueKey] != null) {
-      const issueScore = s[issueKey] as number;
-      const others = allKeys
-        .filter((k) => k !== issueKey)
-        .map((k) => s[k] as number);
-      const avgOthers = others.reduce((a, b) => a + b, 0) / others.length;
-      if (avgOthers - issueScore < 12) {
-        console.warn(`[openrouter] generic: issue gap too small (${issueKey}=${issueScore} avg-others=${avgOthers.toFixed(0)})`);
-        return true;
-      }
-    }
-
-    // Non-issue scores too clustered — AI didn't differentiate what's good vs. ok
-    const issueKeyForFilter = ISSUE_TO_SCORE_KEY[result.issueCategory ?? ''];
-    const nonIssueVals = allKeys
-      .filter((k) => k !== issueKeyForFilter)
-      .map((k) => s[k] as number);
-    const nonIssueSpread = Math.max(...nonIssueVals) - Math.min(...nonIssueVals);
-    if (nonIssueVals.length >= 3 && nonIssueSpread < 8) {
-      console.warn(`[openrouter] generic: non-issue scores clustered (spread=${nonIssueSpread})`);
-      return true;
-    }
-  }
-
-  if (!result.evidence || result.evidence.length < 3) {
-    console.warn('[openrouter] generic: insufficient evidence');
-    return true;
-  }
-  const evidenceLower = result.evidence.join(' ').toLowerCase();
-  if (GENERIC_PHRASES.some(p => evidenceLower.includes(p))) {
-    console.warn('[openrouter] generic: evidence contains generic phrase');
-    return true;
-  }
-  return false;
+  });
+  // Only meaningful if at least 12 points below 90 (i.e. raw < 78).
+  return worstDeficit >= 12 ? worstKey : null;
 }
 
-function isTooSimilarToPrevious(current: SwingResult, previous: SwingResult): boolean {
+function normalizeVisualGrade(value: unknown): VisualGrade | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, '-');
   if (
-    current.primaryIssue === previous.primaryIssue &&
-    current.drill?.name  === previous.drill?.name &&
-    current.scores?.overallScore === previous.scores?.overallScore
+    normalized === 'excellent' ||
+    normalized === 'strong' ||
+    normalized === 'solid' ||
+    normalized === 'needs-work' ||
+    normalized === 'major-issues'
   ) {
-    console.warn('[openrouter] duplicate: same issue, drill, and score as previous swing');
-    return true;
+    return normalized;
   }
-  return false;
+  return null;
+}
+
+function bandForScore(score: number): SwingScoringResult['band'] {
+  if (score >= 90) return 'excellent';
+  if (score >= 80) return 'strong';
+  if (score >= 70) return 'solid';
+  if (score >= 60) return 'needs-work';
+  if (score >= 50) return 'major-issues';
+  return 'poor';
+}
+
+function bandLabelForScore(score: number): string {
+  switch (bandForScore(score)) {
+    case 'excellent': return 'Excellent';
+    case 'strong': return 'Strong';
+    case 'solid': return 'Solid';
+    case 'needs-work': return 'Needs work';
+    case 'major-issues': return 'Major issues';
+    case 'poor':
+    default: return 'Poor / unusable';
+  }
+}
+
+// Pose guardrail caps. The LLM can describe what it sees, but it cannot erase
+// clear measured faults. These caps keep a visibly bad swing from scoring above
+// a cleaner one just because the model was generous with category grades.
+function categoryFaultCap(scoring: SwingScoringResult, key: CategoryKey): number {
+  const penalties = scoring.categories[key].penalties;
+  const severe = penalties.filter((p) => p.severity === 'severe').length;
+  const moderate = penalties.filter((p) => p.severity === 'moderate').length;
+  if (severe >= 3) return 58;
+  if (severe >= 2) return 68;
+  if (severe >= 1 && moderate >= 2) return 74;
+  if (severe >= 1) return 82;
+  if (moderate >= 3) return 84;
+  return 100;
+}
+
+function overallFaultCap(scoring: SwingScoringResult): number {
+  const penalties = Object.values(scoring.categories).flatMap((c) => c.penalties);
+  const severe = penalties.filter((p) => p.severity === 'severe').length;
+  const moderate = penalties.filter((p) => p.severity === 'moderate').length;
+  if (severe >= 6) return 55;
+  if (severe >= 4) return 65;
+  if (severe >= 3) return 74;
+  if (severe >= 2 && moderate >= 3) return 78;
+  if (severe >= 1 && moderate >= 5) return 82;
+  return 100;
+}
+
+function visualAdjustmentLimit(scoring: SwingScoringResult, key: CategoryKey, direction: 'up' | 'down'): number {
+  const category = scoring.categories[key];
+  const penalties = category.penalties;
+  const severe = penalties.filter((p) => p.severity === 'severe').length;
+  const moderate = penalties.filter((p) => p.severity === 'moderate').length;
+
+  if (direction === 'down') {
+    if (category.confidence >= 0.55) return 14;
+    if (category.confidence >= 0.30) return 10;
+    return 6;
+  }
+
+  if (severe > 0) return 0;
+  if (moderate >= 2) return 2;
+  if (moderate === 1) return category.confidence >= 0.55 ? 5 : 3;
+  if (category.confidence >= 0.70) return 8;
+  if (category.confidence >= 0.45) return 6;
+  return 3;
+}
+
+function applyVisualGradeScoring(scoring: SwingScoringResult, llm: LlmTextResult): void {
+  const grades = llm.categoryGrades ?? {};
+  const validGrades: Partial<Record<CategoryKey, VisualGrade>> = {};
+  (Object.keys(scoring.categories) as CategoryKey[]).forEach((k) => {
+    const g = normalizeVisualGrade(grades[k]);
+    if (g) validGrades[k] = g;
+  });
+  const gradeCount = Object.keys(validGrades).length;
+
+  console.log(
+    `[hybrid] LLM returned ${gradeCount}/7 valid category grades: ` +
+      (Object.keys(validGrades) as CategoryKey[])
+        .map((k) => `${k}=${validGrades[k]}`)
+        .join(', '),
+  );
+
+  if (gradeCount < 4) {
+    console.warn('[hybrid] LLM returned insufficient grades — keeping deterministic engine scores');
+    scoring.debug.log += '\n[hybrid] Insufficient LLM visual grades; engine scores unchanged.';
+    return;
+  }
+
+  const debug: string[] = ['[hybrid] Applied bounded visual category adjustments:'];
+  let weighted = 0;
+  let totalWeight = 0;
+
+  (Object.keys(scoring.categories) as CategoryKey[]).forEach((key) => {
+    const category = scoring.categories[key];
+    const grade = validGrades[key];
+    if (!grade) {
+      weighted += category.score * category.weight;
+      totalWeight += category.weight;
+      debug.push(`  ${CATEGORY_LABELS[key].padEnd(16)} no grade → engine=${category.score}`);
+      return;
+    }
+
+    const engineScore = category.score;
+    const visualScore = VISUAL_GRADE_SCORE[grade];
+    const cap = categoryFaultCap(scoring, key);
+    const direction = visualScore >= engineScore ? 'up' : 'down';
+    const limit = visualAdjustmentLimit(scoring, key, direction);
+    const boundedVisual = direction === 'up'
+      ? Math.min(visualScore, engineScore + limit)
+      : Math.max(visualScore, engineScore - limit);
+    const finalScore = Math.round(Math.min(boundedVisual, cap));
+
+    category.score = finalScore;
+    category.reason = `${CATEGORY_LABELS[key]} engine score ${engineScore}/100; visual grade ${grade.replace('-', ' ')} adjusted it to ${finalScore}/100.`;
+
+    weighted += finalScore * category.weight;
+    totalWeight += category.weight;
+    debug.push(
+      `  ${CATEGORY_LABELS[key].padEnd(16)} engine=${String(engineScore).padStart(3)} ` +
+        `grade=${grade.padEnd(13)} visual=${visualScore} limit=${limit} cap=${cap} final=${finalScore}`,
+    );
+  });
+
+  const visualOverall = totalWeight > 0 ? Math.round(weighted / totalWeight) : scoring.overallScore;
+  const overallCap = overallFaultCap(scoring);
+  const finalOverall = Math.max(0, Math.min(100, Math.min(visualOverall, overallCap)));
+
+  scoring.overallScore = finalOverall;
+  scoring.band = bandForScore(scoring.overallScore);
+  scoring.bandLabel = bandLabelForScore(scoring.overallScore);
+
+  console.log(
+    `[hybrid] visual overall=${visualOverall}, pose overall-cap=${overallCap}, FINAL=${finalOverall} ` +
+      `(${scoring.bandLabel})`,
+  );
+  scoring.debug.log += `\n${debug.join('\n')}\n[hybrid] Overall visual=${visualOverall}, overall-cap=${overallCap}, final=${finalOverall}`;
+}
+
+function gradeScore(grade: VisualGrade | null | undefined): number | null {
+  return grade ? VISUAL_GRADE_SCORE[grade] : null;
+}
+
+function narrativeText(llm: LlmTextResult): string {
+  return [
+    llm.primaryIssue,
+    llm.whyItHappens,
+    llm.summary,
+    llm.contactPrediction,
+    llm.ballFlightPrediction,
+    ...(llm.evidence ?? []),
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
+function applyNarrativeCalibration(scoring: SwingScoringResult, llm: LlmTextResult): void {
+  const text = narrativeText(llm);
+  const penalties = Object.values(scoring.categories).flatMap((c) => c.penalties);
+  const severeCount = penalties.filter((p) => p.severity === 'severe').length;
+  const moderateCount = penalties.filter((p) => p.severity === 'moderate').length;
+
+  const majorTerms = [
+    'too narrow', 'severe', 'major', 'fundamental breakdown', 'off balance',
+    'unstable', 'affecting stability', 'affects stability', 'loss of balance',
+    'early extension', 'over the top', 'no shoulder turn', 'poor contact',
+    'thin', 'topped', 'slice', 'weak contact', 'chicken wing',
+  ];
+  const hasMajorNarrativeFault = majorTerms.some((term) => text.includes(term));
+
+  function clampCategory(key: CategoryKey, maxScore: number, reason: string) {
+    const category = scoring.categories[key];
+    if (category.score <= maxScore) return;
+    category.score = maxScore;
+    category.reason = `${category.reason} Score capped: ${reason}.`;
+  }
+
+  let cap = 100;
+  const capReasons: string[] = [];
+  if (hasMajorNarrativeFault) {
+    cap = Math.min(cap, 58);
+    capReasons.push('narrative describes a major swing fault');
+  }
+  if (text.includes('too narrow') && scoring.club.group === 'driver') {
+    cap = Math.min(cap, 55);
+    capReasons.push('driver stance is described as too narrow');
+    clampCategory('setup', 52, 'driver stance is too narrow');
+    clampCategory('balance', 62, 'narrow driver stance affects stability');
+  }
+  if (text.includes('off balance') || text.includes('unstable') || text.includes('loss of balance')) {
+    cap = Math.min(cap, 52);
+    capReasons.push('narrative describes balance failure');
+    clampCategory('balance', 52, 'balance failure described in analysis');
+    clampCategory('followThrough', 58, 'finish stability is compromised');
+  }
+  if (text.includes('severe') || text.includes('fundamental breakdown')) {
+    cap = Math.min(cap, 48);
+    capReasons.push('narrative describes severe mechanics');
+    (Object.keys(scoring.categories) as CategoryKey[]).forEach((key) => {
+      clampCategory(key, 62, 'analysis describes a severe mechanical breakdown');
+    });
+  }
+  if (severeCount >= 2 || moderateCount >= 5) {
+    cap = Math.min(cap, 58);
+    capReasons.push(`measured faults are substantial (severe=${severeCount}, moderate=${moderateCount})`);
+  }
+
+  const tempoScore = scoring.categories.tempo.score;
+  const severeLanguage = text.includes('severe') || text.includes('fundamental breakdown');
+  const balanceFailure = text.includes('off balance') || text.includes('unstable') || text.includes('loss of balance');
+  const tempoFloor = tempoScore >= 85 ? 75 : tempoScore >= 75 ? 68 : tempoScore >= 70 ? 64 : null;
+
+  if (cap < 100 && scoring.overallScore > cap) {
+    scoring.overallScore = cap;
+    scoring.band = bandForScore(scoring.overallScore);
+    scoring.bandLabel = bandLabelForScore(scoring.overallScore);
+    scoring.debug.log += `\n[calibration] Score capped at ${cap}: ${capReasons.join('; ')}.`;
+    console.log(`[calibration] score capped at ${cap}: ${capReasons.join('; ')}`);
+  }
+
+  if (
+    tempoFloor != null &&
+    scoring.overallScore < tempoFloor &&
+    !severeLanguage &&
+    !balanceFailure &&
+    severeCount < 2
+  ) {
+    scoring.overallScore = tempoFloor;
+    scoring.band = bandForScore(scoring.overallScore);
+    scoring.bandLabel = bandLabelForScore(scoring.overallScore);
+    scoring.debug.log += `\n[calibration] Tempo floor applied: tempo=${tempoScore}/100 → overall floor ${tempoFloor}.`;
+    console.log(`[calibration] tempo floor applied: tempo=${tempoScore}/100 overall=${tempoFloor}`);
+  }
+
+  if (cap < 100) {
+    return;
+  }
+
+  const grades = Object.values(llm.categoryGrades ?? {})
+    .map((g) => gradeScore(normalizeVisualGrade(g)))
+    .filter((n): n is number => typeof n === 'number');
+  if (grades.length >= 5) {
+    const avgGrade = grades.reduce((sum, n) => sum + n, 0) / grades.length;
+    const cleanNarrative = !hasMajorNarrativeFault && severeCount === 0 && moderateCount <= 2;
+    if (cleanNarrative && avgGrade >= 88 && scoring.overallScore < 82) {
+      scoring.overallScore = 82;
+      scoring.band = bandForScore(scoring.overallScore);
+      scoring.bandLabel = bandLabelForScore(scoring.overallScore);
+      scoring.debug.log += `\n[calibration] Strong clean visual narrative lifted noisy score floor to 82 (avg visual grade=${avgGrade.toFixed(1)}).`;
+      console.log(`[calibration] strong clean swing floor applied: 82 (avg visual grade=${avgGrade.toFixed(1)})`);
+    } else if (cleanNarrative && avgGrade >= 82 && scoring.overallScore < 75) {
+      scoring.overallScore = 75;
+      scoring.band = bandForScore(scoring.overallScore);
+      scoring.bandLabel = bandLabelForScore(scoring.overallScore);
+      scoring.debug.log += `\n[calibration] Clean visual narrative lifted noisy score floor to 75 (avg visual grade=${avgGrade.toFixed(1)}).`;
+      console.log(`[calibration] clean swing floor applied: 75 (avg visual grade=${avgGrade.toFixed(1)})`);
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Prompts
+// LLM prompt — text-only output
 // ─────────────────────────────────────────────────────────────────────────────
-// Compact PGA-instructor prompt. Was ~3000 tokens — tightened to ~1500 by
-// turning prose into tables, dropping repeated framing, and inlining the
-// essential rules. Schema, tempo rule, primary-issue gap rule, and score
-// differentiation rule are preserved exactly (validateAndFix enforces them).
-const SYSTEM_PROMPT = `You are an elite PGA Tour instructor (Sean Foley / Butch Harmon level). Analyze with biomechanics and the P-system. Be specific, anatomy-aware, root-cause first.
+const SYSTEM_PROMPT = `You are an elite PGA instructor (Sean Foley / Butch Harmon level). Write coaching for a normal recreational golfer. Be specific, anatomy-aware, root-cause first.
 
-FRAMES: 4 phase-aligned in order — P1 Address → P4 Top → P6/P7 Impact → P9 Finish.
+ROLE: You write QUALITATIVE coaching text AND you visually grade each category using a WORD scale only. The app maps your word grades to numbers deterministically — you are NOT picking the number.
+
+CATEGORY GRADING (required — every category must appear in your JSON "categoryGrades"):
+- "excellent"     — tour/elite-amateur level. Use this when the position looks technically near-perfect (e.g. full shoulder turn at the top, hands stacked at impact, balanced full finish, lead arm straight, no head movement). DO NOT withhold "excellent" — if the swing genuinely looks excellent at that phase, grade it excellent.
+- "strong"        — clearly above average. Slight refinement possible but the position looks athletic and well-controlled.
+- "solid"         — typical good amateur (mid-handicap). Functional, nothing dragging it down.
+- "needs-work"    — clear visible flaw that you can describe in plain English (e.g. "lead arm folds at impact", "head rises noticeably").
+- "major-issues"  — obvious fundamental breakdown (e.g. severe over-the-top, no shoulder turn, completely off balance at finish).
+
+GRADE WITH YOUR EYES. The 4 still pose readings are noisy — a clean-looking swing can have pose noise. If the swing visually looks smooth, balanced, and on-plan, grade it accordingly even if some pose metric was flagged. A truly clean amateur swing should usually average around "strong"; a tour-quality swing should mostly grade "excellent".
+
+FRAMES: The first 4 images are phase-aligned checkpoints in order — setup → top of backswing → impact → follow-through/finish. If more images are provided after those first 4, they are swing-sequence context frames sampled across the whole video. Use the sequence frames to judge motion, balance, club path, finish stability, and whether the phase frames look plausible. Do not treat sequence frames as replacement checkpoints.
+
+LANGUAGE: never write "P1", "P4", "P6", "P7", or "P9". Use normal phrases like "at setup", "at the top of the backswing", "approaching impact", "at impact", "in the follow-through", "at the finish".
 
 CAMERA ANGLE — call it first.
-- Down-the-line (behind golfer): see shaft plane, club path, trail elbow, right-side bend at impact, trail hip clearance, head dive. Cannot see: hip slide, X-factor.
-- Face-on (facing chest): see weight shift, hip slide vs. rotation, head sway, shaft lean at impact, lead-arm angle at top, secondary tilt, finish balance. Cannot see: club path direction, shaft plane.
-- If unclear, say so and set confidence 4-6.
+- Down-the-line (behind golfer): shaft plane, club path, trail elbow, right-side bend, head dive.
+- Face-on (facing chest): weight shift, hip slide vs. rotation, head sway, shaft lean.
+- If unclear, say so.
 
-SCORING CATEGORIES (1-100):
-- positionScore — static geometry at P1/P4/P7/P9 (stance, grip, posture from hips, ball position, lead-arm angle at top, shaft plane, handle ahead at impact, balanced finish).
-- sequenceScore — kinematic chain. Lower body initiates downswing (proximal-to-distal). Flags: over-the-top, casting, reverse pivot.
-- stabilityScore — postural integrity. Head drift <2", spine angle held into impact (early extension = hips thrust to ball), trail leg flex similar to address, balanced finish.
-- contactScore — impact geometry. Shaft lean appropriate to club, lead wrist flat/bowed, trail wrist bent, low point relative to ball, face square to path.
-- tempoScore — TIMING ONLY. See TEMPO RULE below.
-
-TEMPO RULE (non-negotiable):
-- If computedTempoScore is provided: tempoScore = that exact value.
-- If computedTempoScore ≥ 75: do NOT use "tempo" as issueCategory.
-- If no metrics: tempoScore = 68 and NEVER use "tempo" as issueCategory.
-
-SCORING SCALE:
-90-100 tour | 80-89 single-digit | 70-79 one visible flaw | 60-69 clear fault | 50-59 major break | <50 severe.
-
-PRIMARY ISSUE — issueCategory's score MUST be ≥22 below the AVG of the other four. Push the issue score down until that gap holds.
-
-DIFFERENTIATION — the four non-issue categories must vary; no two within 4 points unless evidence forces it. Ask "what does THIS swing do well?" and score that high (80s). What does it do poorly outside the main issue? Score lower (60s).
-
-EVIDENCE — each string names a specific body part / angle / position at a specific frame.
-GOOD: "At P4 the lead arm has folded to ~80° — across the line, an arm-pickup backswing."
-GOOD: "Through impact the right hip has thrust toward the ball — head has risen ~3" vs. address (early extension)."
+EVIDENCE — 4 specific sentences. Each names a body part, joint, or angle at a specific swing moment, using normal language.
+GOOD: "At the top of the backswing the lead arm has folded to roughly 80° — across the line, an arm-pickup pattern."
+GOOD: "Through impact the right hip has thrust toward the ball — head has risen visibly compared with setup."
 BAD: "Work on your posture." "Needs practice."
-If a checkpoint is GOOD, name it: "Posture at P1 is on-plane — hips tilted from the joint, arms hanging below shoulders."
+At least one evidence string should describe something the swing does WELL — not just faults.
 
-DRILLS — use established ones, match to the root cause, explain why mechanically:
-- Over-the-top → Pump Drill, Headcover Under Trail Arm, Anti-Casting Pump
-- Early extension → Wall Drill (glutes on wall), Chair Drill, Pelvic Tilt Hold
-- Casting / early release → Punch shot lead-hand only, Towel Under Both Armpits
+DRILLS — established, root-cause-matched, with mechanical reasoning:
+- Over the top → Pump Drill, Headcover Under Trail Arm, Anti-Casting Pump
+- Early extension / hip thrust → Wall Drill (glutes on wall), Chair Drill, Pelvic Tilt Hold
+- Casting / early release → Punch shots lead-hand-only, Towel Under Both Armpits
 - Sway → Headcover Outside Trail Foot, Wall-Behind-Lead-Hip
 - Steep / chicken wing → Pump-to-Slot, Tucked-Elbow Throw
 - Stuck on trail side → Step-Change (Sam Snead step-through)
 - Reverse pivot → Lead-Heel-Up at Top, Cross-Foot Hit
+- Across the line → L-to-L Drill, Mirror Top-Check
+- Scoop / flip → Punch-Out Drill, Impact Bag
+- Restricted rotation → Lead Shoulder Under Chin, Trail Heel Lift
 
 CLUB-SPECIFIC IMPACT TARGETS:
 - Driver: attack +3 to +5°, neutral-to-back shaft, ball forward, secondary tilt, trail-side bend.
@@ -158,37 +407,35 @@ CLUB-SPECIFIC IMPACT TARGETS:
 - Wedges: shaft lean 5-12°, attack -3 to -7°, hands lead.
 Don't give driver advice for a wedge or vice versa.
 
-FAULT VOCABULARY (use these names): over the top | early extension | casting / early release | steep | sway | reverse pivot | chicken wing | stuck | hanging back.
+VARYING YOUR PICKS: the primary issue is provided to you by the scoring engine (it's the lowest-scoring category). Phrase it precisely, but DO NOT just say "early extension at impact" by default — describe what's actually happening in THIS swing's frames.
 
-OUTPUT — JSON ONLY. Start with { end with }. No prose, no markdown.
+OUTPUT — JSON ONLY. Start with { end with }. No prose, no markdown. NO numeric scores. Category grades must be words only.
 
 {
-  "selectedClub": "string",
   "detectedClubType": "string",
   "clubMatch": "match | possible_mismatch | unclear",
   "clubMatchReason": "string",
   "cameraAngle": "down-the-line | face-on | unclear",
-  "scores": {
-    "overallScore": 0,
-    "positionScore": 0,
-    "tempoScore": 0,
-    "sequenceScore": 0,
-    "stabilityScore": 0,
-    "contactScore": 0,
-    "confidence": 0
+  "categoryGrades": {
+    "setup": "excellent | strong | solid | needs-work | major-issues",
+    "balance": "excellent | strong | solid | needs-work | major-issues",
+    "tempo": "excellent | strong | solid | needs-work | major-issues",
+    "rotation": "excellent | strong | solid | needs-work | major-issues",
+    "swingPath": "excellent | strong | solid | needs-work | major-issues",
+    "impactPosition": "excellent | strong | solid | needs-work | major-issues",
+    "followThrough": "excellent | strong | solid | needs-work | major-issues"
   },
-  "primaryIssue": "string — precise mechanical fault, e.g. 'Early extension at impact'",
-  "issueCategory": "setup | posture | path | clubface | tempo | contact | balance | rotation | unclear",
+  "primaryIssue": "string — phrase the engine's primaryCategory naturally, citing what you actually see in the frames (e.g. 'Across the line at the top with a flat shoulder turn', 'Hips thrust toward the ball at impact, head rises 3+ inches', 'Lead arm collapses at the top — backswing too short'). Keep it concrete.",
   "whyItHappens": "string — biomechanical root cause in 1-2 sentences",
-  "ballFlightPrediction": "string — start direction, curve, height, distance vs. expected",
+  "ballFlightPrediction": "string — start direction, curve, height, distance vs. expected for this club",
   "contactPrediction": "string — face location, divot, sound/feel",
   "evidence": ["string", "string", "string", "string"],
   "scoreReasoning": {
-    "position": "string",
-    "tempo":    "string — reference the metric or say 'no timing data — neutral 68'",
-    "sequence": "string",
-    "stability":"string",
-    "contact":  "string"
+    "position":  "string — 1 sentence on setup + impact geometry",
+    "tempo":     "string — 1 sentence on rhythm",
+    "sequence":  "string — 1 sentence on rotation / kinematic chain",
+    "stability": "string — 1 sentence on balance / posture retention",
+    "contact":   "string — 1 sentence on impact delivery"
   },
   "clubSpecificNotes": "string",
   "fixes": ["string", "string", "string"],
@@ -201,227 +448,93 @@ OUTPUT — JSON ONLY. Start with { end with }. No prose, no markdown.
   "summary": "string — 2-3 sentences: issue → fix → expected outcome"
 }`;
 
-const SECOND_PASS_SUFFIX = `
+// ─────────────────────────────────────────────────────────────────────────────
+// Build the context block for the LLM — engine scores + measurements
+// ─────────────────────────────────────────────────────────────────────────────
+function buildEngineContext(scoring: SwingScoringResult, primaryCat: CategoryKey | null): string {
+  // We deliberately do NOT show the pose engine's numeric scores here. Showing
+  // them biases the LLM to "agree" with the noisy pose numbers, which is the
+  // very thing that has been making good swings grade low. Instead we show only
+  // CONCRETE detected faults (severity = severe), and only when several
+  // independent metrics agree (i.e. the fault is unambiguous).
+  const lines: string[] = [];
+  lines.push(`Club selected by user: ${scoring.club.selected} (${scoring.club.group}).`);
+  lines.push('');
 
-SECOND PASS — the first analysis was rejected for one or more of these reasons:
-• All 5 category scores were too close together (less than 12 pts spread)
-• The non-issue categories were identical or near-identical
-• Tempo was flagged as the primary issue without timing data to support it
-• Evidence was too generic
+  // Collect ONLY severe penalties — these are pose readings extreme enough
+  // that they almost certainly indicate a real fault, not just noise.
+  const severeFaults: { cat: CategoryKey; fault: string; metric: string; value: number }[] = [];
+  (Object.keys(scoring.categories) as CategoryKey[]).forEach((k) => {
+    for (const p of scoring.categories[k].penalties) {
+      if (p.severity === 'severe') {
+        severeFaults.push({ cat: k, fault: p.fault, metric: p.metric, value: p.value });
+      }
+    }
+  });
 
-You MUST fix all of the above:
-1. Find THIS swing's single biggest fault. Name it precisely (e.g. "early extension at impact" not "posture issue").
-2. Score the four non-issue categories as INDEPENDENT observations — not all at 70-75.
-3. If tempo was your previous issue but no timing metrics exist, pick a different issueCategory.
-4. Evidence must name specific body parts, joint angles, or positions you can see in the frames.
-5. The issue category score must be ≥ 22 points below the average of the other four.`;
+  if (severeFaults.length > 0) {
+    lines.push('OBJECTIVELY MEASURED FAULTS (pose tracking flagged these as severe — corroborate visually before grading):');
+    for (const f of severeFaults.slice(0, 6)) {
+      lines.push(`  • ${CATEGORY_LABELS[f.cat]}: ${f.fault}  (measured ${f.metric}=${f.value})`);
+    }
+  } else {
+    lines.push('NO SEVERE POSE-MEASURED FAULTS — this swing has no objectively-broken positions. Grade based on what you VISUALLY see.');
+  }
+
+  if (scoring.phaseValidation.warnings.length > 0) {
+    lines.push('');
+    lines.push('Phase-detection warnings (the frames may not be perfectly aligned to setup/top/impact/finish — interpret visually):');
+    for (const w of scoring.phaseValidation.warnings) lines.push(`  • ${w}`);
+  }
+
+  if (primaryCat) {
+    lines.push('');
+    lines.push(`Pose engine's best guess at the weakest category: ${CATEGORY_LABELS[primaryCat]} — but TRUST YOUR EYES over this guess.`);
+  }
+
+  return lines.join('\n');
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// API call
+// LLM API call
 // ─────────────────────────────────────────────────────────────────────────────
-// Pose-derived numeric hints for a single phase frame.
-// We compute these from MediaPipe landmarks (when available) so the model has
-// concrete anchor measurements to reason from, not just pixels. Numbers are
-// rounded; angles are in degrees with the conventions described inline.
-interface PhaseGeometry {
-  phase: 'address' | 'top' | 'impact' | 'finish';
-  spineTiltDeg?: number;      // 0 = vertical, + = away from target (down-the-line view)
-  shoulderTiltDeg?: number;   // shoulder line vs. horizontal (+ = lead shoulder higher)
-  hipTiltDeg?: number;        // hip line vs. horizontal
-  headXNorm?: number;         // 0..1 normalized horizontal head position
-  headYNorm?: number;         // 0..1 normalized vertical head position
-  leadArmFoldDeg?: number;    // 180 = straight, 90 = fully folded
-  trailArmFoldDeg?: number;
-  kneeFlexLeadDeg?: number;
-  kneeFlexTrailDeg?: number;
-}
-
-// MediaPipe BlazePose joint indices we care about
-const LM = {
-  NOSE: 0,
-  LEFT_SHOULDER: 11,
-  RIGHT_SHOULDER: 12,
-  LEFT_ELBOW: 13,
-  RIGHT_ELBOW: 14,
-  LEFT_WRIST: 15,
-  RIGHT_WRIST: 16,
-  LEFT_HIP: 23,
-  RIGHT_HIP: 24,
-  LEFT_KNEE: 25,
-  RIGHT_KNEE: 26,
-  LEFT_ANKLE: 27,
-  RIGHT_ANKLE: 28,
-} as const;
-
-function v(lms: PoseLandmark[], idx: number): { x: number; y: number; vis: number } | null {
-  const p = lms[idx];
-  if (!p || (p.visibility ?? 1) < 0.35) return null;
-  return { x: p.x, y: p.y, vis: p.visibility ?? 1 };
-}
-
-function angleDeg(a: { x: number; y: number }, b: { x: number; y: number }, c: { x: number; y: number }): number {
-  const v1x = a.x - b.x, v1y = a.y - b.y;
-  const v2x = c.x - b.x, v2y = c.y - b.y;
-  const dot = v1x * v2x + v1y * v2y;
-  const m1 = Math.hypot(v1x, v1y);
-  const m2 = Math.hypot(v2x, v2y);
-  if (m1 < 1e-6 || m2 < 1e-6) return 180;
-  return Math.acos(Math.max(-1, Math.min(1, dot / (m1 * m2)))) * 180 / Math.PI;
-}
-
-function lineTiltDeg(p1: { x: number; y: number }, p2: { x: number; y: number }): number {
-  // Angle of the line p1→p2 against horizontal, in degrees. Positive = p2 above p1
-  // (image y increases downward, so we negate dy to get visual "up" as positive).
-  const dx = p2.x - p1.x;
-  const dy = -(p2.y - p1.y);
-  return Math.atan2(dy, dx) * 180 / Math.PI;
-}
-
-function computeGeometry(phase: PhaseGeometry['phase'], lms?: PoseLandmark[] | null): PhaseGeometry | null {
-  if (!lms || lms.length < 29) return null;
-  const ls = v(lms, LM.LEFT_SHOULDER);
-  const rs = v(lms, LM.RIGHT_SHOULDER);
-  const lh = v(lms, LM.LEFT_HIP);
-  const rh = v(lms, LM.RIGHT_HIP);
-  const lw = v(lms, LM.LEFT_WRIST);
-  const rw = v(lms, LM.RIGHT_WRIST);
-  const le = v(lms, LM.LEFT_ELBOW);
-  const re = v(lms, LM.RIGHT_ELBOW);
-  const lk = v(lms, LM.LEFT_KNEE);
-  const rk = v(lms, LM.RIGHT_KNEE);
-  const la = v(lms, LM.LEFT_ANKLE);
-  const ra = v(lms, LM.RIGHT_ANKLE);
-  const head = v(lms, LM.NOSE);
-
-  const out: PhaseGeometry = { phase };
-  const r1 = (n: number | undefined) => (typeof n === 'number' ? Math.round(n * 10) / 10 : undefined);
-
-  if (ls && rs && lh && rh) {
-    // Spine: midpoint of shoulders → midpoint of hips. Tilt vs. vertical (90°).
-    const shoulderMid = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
-    const hipMid = { x: (lh.x + rh.x) / 2, y: (lh.y + rh.y) / 2 };
-    const spineLineTilt = lineTiltDeg(hipMid, shoulderMid);  // angle vs. horizontal
-    out.spineTiltDeg = r1(spineLineTilt - 90);                // 0 = perfectly vertical
-  }
-  if (ls && rs) {
-    // Shoulder line tilt vs. horizontal. +ve = lead (left for RH) shoulder higher.
-    out.shoulderTiltDeg = r1(lineTiltDeg(rs, ls));
-  }
-  if (lh && rh) {
-    out.hipTiltDeg = r1(lineTiltDeg(rh, lh));
-  }
-  if (head) {
-    out.headXNorm = r1(head.x * 100) != null ? Math.round(head.x * 1000) / 1000 : undefined;
-    out.headYNorm = r1(head.y * 100) != null ? Math.round(head.y * 1000) / 1000 : undefined;
-  }
-  if (ls && le && lw) out.leadArmFoldDeg = r1(angleDeg(ls, le, lw));
-  if (rs && re && rw) out.trailArmFoldDeg = r1(angleDeg(rs, re, rw));
-  if (lh && lk && la) out.kneeFlexLeadDeg = r1(angleDeg(lh, lk, la));
-  if (rh && rk && ra) out.kneeFlexTrailDeg = r1(angleDeg(rh, rk, ra));
-
-  return out;
-}
-
-interface PerFrameLandmarks {
-  setup?: PoseLandmark[] | null;
-  top?: PoseLandmark[] | null;
-  impact?: PoseLandmark[] | null;
-  finish?: PoseLandmark[] | null;
-}
-
 async function callOpenRouter(
   base64Frames: string[],
   club: string | undefined,
   systemPrompt: string,
-  temporalMetrics?: TemporalMetrics,
-  landmarks?: PerFrameLandmarks,
+  scoring: SwingScoringResult,
+  primaryCat: CategoryKey | null,
 ): Promise<string> {
   const imageContent = base64Frames
     .filter((f) => f.length > 0)
+    .slice(0, LLM_MAX_FRAMES)
     .map((frame) => ({
       type: 'image_url' as const,
-      // 'auto' lets the model pick resolution — 'low' was shrinking frames to
-      // 512px thumbnails where swing mechanics are invisible
-      image_url: { url: `data:image/jpeg;base64,${frame}`, detail: 'auto' as const },
+      image_url: { url: `data:image/jpeg;base64,${frame}`, detail: 'low' as const },
     }));
 
-  const hasMetrics = temporalMetrics != null;
-  const metricsBlock = hasMetrics
-    ? {
-        backswingDurationMs: temporalMetrics!.backswingDurationMs,
-        downswingDurationMs: temporalMetrics!.downswingDurationMs,
-        tempoRatio:          temporalMetrics!.tempoRatio,
-        motionSmoothness:    temporalMetrics!.motionSmoothness,
-        computedTempoScore:  temporalMetrics!.computedTempoScore,
-        note: 'tempoRatio = backswing ÷ downswing. Tour average ≈ 3.0. computedTempoScore is authoritative.',
-      }
-    : null;
+  const engineBlock = buildEngineContext(scoring, primaryCat);
 
-  const geometry: PhaseGeometry[] = [];
-  if (landmarks) {
-    const setupG  = computeGeometry('address', landmarks.setup);
-    const topG    = computeGeometry('top',     landmarks.top);
-    const impactG = computeGeometry('impact',  landmarks.impact);
-    const finishG = computeGeometry('finish',  landmarks.finish);
-    for (const g of [setupG, topG, impactG, finishG]) if (g) geometry.push(g);
-  }
+  const userText = `Coach this golf swing. Selected club: ${club ?? 'unknown'}.
 
-  // Compute movement deltas address→impact: lateral head sway, head rise,
-  // hip-vs-shoulder rotation differential. These flag early extension, swaying,
-  // and over-rotation without the model having to eyeball pixels.
-  const deltas: Record<string, number> = {};
-  const a = landmarks?.setup;
-  const i = landmarks?.impact;
-  if (a && i && a.length >= 29 && i.length >= 29) {
-    const aHead = v(a, LM.NOSE);
-    const iHead = v(i, LM.NOSE);
-    if (aHead && iHead) {
-      deltas.headHorizontalDriftPct = Math.round((iHead.x - aHead.x) * 1000) / 10; // % of frame width
-      deltas.headVerticalRisePct    = Math.round((aHead.y - iHead.y) * 1000) / 10; // + = head moved up (early extension)
-    }
-    const aLh = v(a, LM.LEFT_HIP), aRh = v(a, LM.RIGHT_HIP);
-    const iLh = v(i, LM.LEFT_HIP), iRh = v(i, LM.RIGHT_HIP);
-    if (aLh && aRh && iLh && iRh) {
-      const aHipMid = { x: (aLh.x + aRh.x) / 2, y: (aLh.y + aRh.y) / 2 };
-      const iHipMid = { x: (iLh.x + iRh.x) / 2, y: (iLh.y + iRh.y) / 2 };
-      deltas.hipLateralSlidePct = Math.round((iHipMid.x - aHipMid.x) * 1000) / 10;
-      deltas.hipRotationDeg = Math.round((lineTiltDeg(iRh, iLh) - lineTiltDeg(aRh, aLh)) * 10) / 10;
-    }
-  }
+Frames: 4 images in swing order (early → mid-backswing → downswing/impact zone → finish).
 
-  const tempoInstruction = hasMetrics
-    ? `Tempo metrics provided above — use computedTempoScore (${temporalMetrics!.computedTempoScore}) for tempoScore. ${
-        (temporalMetrics!.computedTempoScore ?? 0) >= 75
-          ? 'Tempo is acceptable — do NOT use "tempo" as issueCategory.'
-          : 'Tempo ratio is poor — "tempo" is a valid issueCategory.'
-      }`
-    : 'NO timing data available — set tempoScore=68 and do NOT use "tempo" as issueCategory. Tempo cannot be assessed from still frames.';
+${engineBlock}
 
-  const geometryBlock = geometry.length > 0
-    ? `\nPose-derived geometry per phase (degrees; spineTilt 0=vertical; angles from MediaPipe — use as anchors, but trust your eyes too):\n${JSON.stringify(geometry, null, 2)}`
-    : '';
+YOUR JOB:
+1. Determine cameraAngle (down-the-line | face-on | unclear).
+2. Grade EVERY category in "categoryGrades" using ONLY one of: excellent, strong, solid, needs-work, major-issues. Grade based on what you SEE across the 4 checkpoint frames AND the extra sequence frames. If the swing visually looks fluid, balanced, and on-plan for an amateur, default to "strong" or "solid" — do NOT grade something "needs-work" unless you can describe in your evidence what is specifically wrong.
+3. Describe what the swing actually does — 4 evidence sentences. At least one positive.
+4. Phrase the primaryIssue naturally — describe what's actually happening in THIS swing. If the swing visually looks clean (you graded most categories "strong" or better), say it's generally on-plan and pick a small refinement.
+5. Explain why the issue happens (root cause, 1-2 sentences). If there is no real issue, skip the root cause and praise the strength.
+6. Predict ball flight + contact for THIS club.
+7. Pick a SINGLE established drill that targets the root cause OR reinforces the swing's strength.
+8. Give 3 concise fixes and 3 key checkpoints.
+9. Write a 2-3 sentence summary.
 
-  const deltasBlock = Object.keys(deltas).length > 0
-    ? `\nAddress→Impact deltas (in % of frame for translations, degrees for rotations):\n${JSON.stringify(deltas, null, 2)}\nInterpretation hints:\n• headVerticalRisePct > 1.5 → likely early extension\n• |hipLateralSlidePct| > 6 → lateral hip slide rather than rotation\n• hipRotationDeg < 20 (FO view) → hips under-rotated at impact`
-    : '';
+Return ONLY the JSON object — start with { end with }. NO numeric scores anywhere.`;
 
-  const userText = `Analyze this golf swing like a top-100 PGA instructor. Be specific, anatomy-aware, and brutal about differentiation.
-
-Selected club: ${club ?? 'unknown'}
-Frames: ${imageContent.length} phase-aligned frames in order: P1 Address → P4 Top → P6/P7 Impact → P9 Finish.
-
-${metricsBlock ? `Timing metrics:\n${JSON.stringify(metricsBlock, null, 2)}` : 'No timing metrics available.'}${geometryBlock}${deltasBlock}
-
-TEMPO INSTRUCTION: ${tempoInstruction}
-
-Step 1: Determine cameraAngle (down-the-line, face-on, or unclear) — analyze accordingly.
-Step 2: Walk through P1→P4→P7→P9. Note one specific thing at each.
-Step 3: Identify the single most damaging fault. Score that category at least 22 below the average of the others.
-Step 4: Score the four non-issue categories independently — they MUST vary, not cluster.
-
-Return ONLY the JSON object — start with { end with }.`;
-
-  const response = await fetch(OPENROUTER_BASE_URL, {
+  const response = await fetchWithTimeout(OPENROUTER_BASE_URL, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${OPENROUTER_API_KEY}`,
@@ -430,20 +543,15 @@ Return ONLY the JSON object — start with { end with }.`;
       'X-Title': 'ImpactAI Golf Coach',
     },
     body: JSON.stringify({
-      // gpt-4o-mini is ~3x faster than gpt-4o for vision tasks while still
-      // handling JSON-schema output reliably. The structured prompt above
-      // does the heavy lifting; the model size matters less when the rules
-      // are explicit. If quality regresses, swap back to 'openai/gpt-4o'.
-      model: 'openai/gpt-4o-mini',
+      model: 'openai/gpt-4o',
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: [{ type: 'text', text: userText }, ...imageContent] },
       ],
-      // 1500 covers a full structured response (typical output ~1000-1300
-      // tokens). Was 2500 — the extra ceiling just slowed generation.
-      max_tokens: 1500,
-      temperature: 0.20,
+      max_tokens: 750,
+      temperature: 0.0,
     }),
+    timeoutMs: OPENROUTER_TIMEOUT_MS,
   });
 
   if (!response.ok) {
@@ -457,249 +565,290 @@ Return ONLY the JSON object — start with { end with }.`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Parse + validate
+// Parse + minimal text validation (no score logic — engine owns scores)
 // ─────────────────────────────────────────────────────────────────────────────
-function parseResult(content: string): SwingResult | null {
+interface LlmTextResult {
+  detectedClubType?: string;
+  clubMatch?: SwingResult['clubMatch'];
+  clubMatchReason?: string;
+  cameraAngle?: SwingResult['cameraAngle'];
+  categoryGrades?: Partial<Record<CategoryKey, VisualGrade>>;
+  primaryIssue?: string;
+  whyItHappens?: string;
+  ballFlightPrediction?: string;
+  contactPrediction?: string;
+  evidence?: string[];
+  scoreReasoning?: {
+    position?: string;
+    tempo?: string;
+    sequence?: string;
+    stability?: string;
+    contact?: string;
+  };
+  clubSpecificNotes?: string;
+  fixes?: string[];
+  drill?: { name?: string; whyThisDrill?: string; steps?: string[] };
+  keyCheckpoints?: string[];
+  summary?: string;
+}
+
+function parseLlm(content: string): LlmTextResult | null {
   try {
     const start = content.indexOf('{');
     const end   = content.lastIndexOf('}');
     if (start === -1 || end === -1) return null;
-    return JSON.parse(content.slice(start, end + 1)) as SwingResult;
+    return JSON.parse(content.slice(start, end + 1)) as LlmTextResult;
   } catch {
     return null;
   }
 }
 
-function clamp(v: number | undefined, min = 1, max = 100): number {
-  return Math.max(min, Math.min(max, Math.round(v || 50)));
-}
-
-function validateAndFix(result: SwingResult, club?: string, temporalMetrics?: TemporalMetrics): SwingResult {
-  if (!result.evidence || !Array.isArray(result.evidence)) result.evidence = [];
-
-  if (!result.scores) {
-    result.scores = {
-      overallScore: 50, positionScore: 50, tempoScore: 50,
-      sequenceScore: 50, stabilityScore: 50, contactScore: 50, confidence: 3,
-    };
-  }
-
-  const s = result.scores;
-
-  // Handle AI returning old-schema field names — map them to new categories
-  if (!s.positionScore  && (s.setupScore || s.postureScore)) {
-    s.positionScore  = clamp(((s.setupScore ?? 50) + (s.postureScore ?? 50)) / 2);
-  }
-  if (!s.sequenceScore  && s.swingPathScore) s.sequenceScore  = clamp(s.swingPathScore);
-  if (!s.stabilityScore && s.balanceScore)   s.stabilityScore = clamp(s.balanceScore);
-
-  s.positionScore  = clamp(s.positionScore);
-  s.sequenceScore  = clamp(s.sequenceScore);
-  s.stabilityScore = clamp(s.stabilityScore);
-  s.contactScore   = clamp(s.contactScore);
-  s.confidence     = clamp(s.confidence, 1, 10);
-
-  // Tempo: prefer the deterministic computed score from pose metrics
-  const computedTempo = temporalMetrics?.computedTempoScore;
-  s.tempoScore = computedTempo != null ? computedTempo : clamp(s.tempoScore);
-
-  // ── Tempo gating: if backend says tempo is fine (≥75) or no data exists,
-  //    the AI cannot call "tempo" the primary issue — reassign to actual worst ─
-  const allScoreKeys = ['positionScore', 'tempoScore', 'sequenceScore', 'stabilityScore', 'contactScore'] as const;
-  if (result.issueCategory === 'tempo') {
-    const tempoIsGood = computedTempo != null && computedTempo >= 75;
-    const noTempoData = computedTempo == null;
-    if (tempoIsGood || noTempoData) {
-      const NON_TEMPO: (typeof allScoreKeys[number])[] = ['positionScore', 'sequenceScore', 'stabilityScore', 'contactScore'];
-      const worst = NON_TEMPO.reduce((a, b) => (s[a] as number) <= (s[b] as number) ? a : b);
-      const catMap: Record<string, string> = {
-        positionScore: 'setup', sequenceScore: 'rotation',
-        stabilityScore: 'balance', contactScore: 'contact',
-      };
-      const reason = tempoIsGood
-        ? `tempo is fine (computed=${computedTempo})`
-        : 'no temporal data — cannot assess from frames';
-      console.log(`[openrouter] overriding tempo issue (${reason}) → ${catMap[worst]} (score=${s[worst]})`);
-      result.issueCategory = catMap[worst] as SwingResult['issueCategory'];
-    }
-  }
-
-  // ── Enforce: issue category must score at least 20 pts below avg of others ──
-  const issueKey = ISSUE_TO_SCORE_KEY[result.issueCategory ?? ''];
-  if (issueKey && s[issueKey] != null) {
-    const otherScores = allScoreKeys
-      .filter((k) => k !== issueKey)
-      .map((k) => s[k] as number);
-    const avgOthers = otherScores.reduce((a, b) => a + b, 0) / otherScores.length;
-    const currentIssue = s[issueKey] as number;
-
-    if (avgOthers - currentIssue < 20) {
-      const corrected = Math.round(Math.max(28, Math.min(currentIssue, avgOthers - 22)));
-      console.log(`[openrouter] enforcing issue gap: ${issueKey} ${currentIssue}→${corrected} (others avg=${avgOthers.toFixed(1)})`);
-      (s as unknown as Record<string, number>)[issueKey] = corrected;
-    }
-  }
-
-  // Always recalculate overall from the weighted formula
-  const calculated = calculateOverallScore(s);
-  const aiScore = s.overallScore || 0;
-  if (Math.abs(aiScore - calculated) > 10) {
-    console.log(`[openrouter] correcting overallScore: AI=${aiScore} → formula=${calculated}`);
-  }
-  s.overallScore = calculated;
-
-  // Ensure score reasoning has new field names
-  if (result.scoreReasoning) {
-    const r = result.scoreReasoning;
-    if (!r.position  && r.setup)     r.position  = r.setup;
-    if (!r.sequence  && r.swingPath) r.sequence  = r.swingPath;
-    if (!r.stability && r.balance)   r.stability = r.balance;
-  }
-
-  if (!Array.isArray(result.fixes) || result.fixes.length < 3) {
-    result.fixes = (result.fixes ?? []).concat(['Review your fundamentals.', 'Film your swing.', 'Work with a coach.']).slice(0, 3);
-  }
-  if (!Array.isArray(result.keyCheckpoints) || result.keyCheckpoints.length < 3) {
-    result.keyCheckpoints = (result.keyCheckpoints ?? []).concat(['Check setup.', 'Review impact.', 'Hold finish.']).slice(0, 3);
-  }
-  if (!result.drill?.name) {
-    result.drill = {
-      name: 'Mirror Drill',
-      whyThisDrill: 'Builds awareness of your swing positions.',
-      steps: ['Stand in front of a mirror.', 'Make slow-motion swings.', 'Check your positions at key moments.'],
-    };
-  }
-  if (!result.selectedClub) result.selectedClub = club ?? 'Unknown';
-
-  return result;
-}
-
-function buildFallback(club?: string, message?: string): SwingResult {
-  return {
-    selectedClub: club ?? 'Unknown',
-    detectedClubType: 'Unclear',
-    clubMatch: 'unclear',
-    clubMatchReason: 'Could not identify club from frames.',
-    cameraAngle: 'unclear',
-    scores: {
-      overallScore: 45, positionScore: 45, tempoScore: 45,
-      sequenceScore: 45, stabilityScore: 45, contactScore: 45, confidence: 1,
-    },
-    primaryIssue: 'Video quality too low for analysis',
-    issueCategory: 'unclear',
-    whyItHappens: message
-      ? `The AI returned: "${message.slice(0, 120)}"`
-      : 'The frames did not provide enough visual information. Try filming in better light from a clearer angle.',
-    ballFlightPrediction: 'Unable to predict.',
-    contactPrediction: 'Unable to assess.',
-    clubSpecificNotes: `Selected club: ${club ?? 'Unknown'}. Ensure it is visible throughout the swing.`,
-    evidence: [
-      'Video quality or camera angle was insufficient for confident analysis.',
-      'Frame clarity limited the ability to assess swing mechanics.',
-      'Re-film with better lighting and a stable camera position.',
-    ],
-    scoreReasoning: {
-      position: 'Unable to assess — insufficient frame quality.',
-      tempo: 'Unable to assess.',
-      sequence: 'Unable to assess.',
-      stability: 'Unable to assess.',
-      contact: 'Unable to assess.',
-    },
-    fixes: [
-      'Film in good natural light — avoid strong backlight',
-      'Stand 8–12 feet from the camera so your full body is in frame',
-      'Use a stable surface and shoot from down-the-line or face-on',
-    ],
-    drill: {
-      name: 'Setup Check Drill',
-      whyThisDrill: 'Ensures correct camera angle and positioning for accurate AI analysis.',
-      steps: [
-        'Place your phone at hip height, 8–12 feet away',
-        'Film from directly behind (down-the-line) or directly facing you (face-on)',
-        'Ensure your full body and club are visible throughout the swing',
-      ],
-    },
-    keyCheckpoints: [
-      'Camera at hip height, 8–12 feet away',
-      'Full body visible from head to feet',
-      'Good lighting — no backlighting or deep shadows',
-    ],
-    summary: 'Analysis could not be completed due to video quality. Follow the filming tips and try again.',
-  };
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Main export
+// Fallbacks for when the LLM returns garbage or refuses
 // ─────────────────────────────────────────────────────────────────────────────
-// Phrases that indicate the AI refused instead of returning JSON
 const REFUSAL_PATTERNS = [
-  "i'm sorry",
-  "i cannot",
-  "i can't",
-  "i am unable",
-  "cannot analyze",
-  "unable to analyze",
-  "no golf swing",
-  "not able to",
+  "i'm sorry", "i cannot", "i can't", "i am unable",
+  "cannot analyze", "unable to analyze", "no golf swing", "not able to",
 ];
-
 function isRefusal(content: string): boolean {
   const lower = content.toLowerCase().trim();
   return !lower.startsWith('{') && REFUSAL_PATTERNS.some((p) => lower.includes(p));
 }
 
-const FORCE_JSON_PROMPT = `These images show a golfer. Analyze the visible body position, club, and motion.
-You MUST return the JSON schema — no refusals, no plain text.
-If image quality limits your view, estimate from what is visible and set confidence to 3-4.
-Start your response with { and end with }.`;
+function fallbackText(scoring: SwingScoringResult, primaryCat: CategoryKey | null): LlmTextResult {
+  const primary = primaryCat ? scoring.categories[primaryCat] : null;
+  const primaryIssue = primary?.topIssue ?? 'Swing fundamentals — consistency';
+  const fix = primary?.suggestedFix ?? 'Focus on rhythm and balance, hold a complete finish for every swing.';
+  return {
+    detectedClubType: scoring.club.selected,
+    clubMatch: 'unclear',
+    clubMatchReason: 'AI analysis fell back — using engine measurements only.',
+    cameraAngle: 'unclear',
+    categoryGrades: {
+      setup: scoring.categories.setup.score >= 85 ? 'strong' : scoring.categories.setup.score >= 70 ? 'solid' : 'needs-work',
+      balance: scoring.categories.balance.score >= 85 ? 'strong' : scoring.categories.balance.score >= 70 ? 'solid' : 'needs-work',
+      tempo: scoring.categories.tempo.score >= 85 ? 'strong' : scoring.categories.tempo.score >= 70 ? 'solid' : 'needs-work',
+      rotation: scoring.categories.rotation.score >= 85 ? 'strong' : scoring.categories.rotation.score >= 70 ? 'solid' : 'needs-work',
+      swingPath: scoring.categories.swingPath.score >= 85 ? 'strong' : scoring.categories.swingPath.score >= 70 ? 'solid' : 'needs-work',
+      impactPosition: scoring.categories.impactPosition.score >= 85 ? 'strong' : scoring.categories.impactPosition.score >= 70 ? 'solid' : 'needs-work',
+      followThrough: scoring.categories.followThrough.score >= 85 ? 'strong' : scoring.categories.followThrough.score >= 70 ? 'solid' : 'needs-work',
+    },
+    primaryIssue,
+    whyItHappens: 'Measured from pose data — see category breakdown for the specific deviations.',
+    ballFlightPrediction: 'Predicted based on measured impact position — see scores.',
+    contactPrediction: 'See impact-position category for measurement-based assessment.',
+    evidence: scoring.topFaults.slice(0, 4).length > 0
+      ? scoring.topFaults.slice(0, 4)
+      : ['Pose tracking confirmed each phase position.',
+         'Engine measurements logged — see category breakdown.',
+         'Camera and lighting quality affected detail.',
+         'Re-film with consistent angle for richer narrative.'],
+    scoreReasoning: legacyReasoning(scoring),
+    clubSpecificNotes: `Selected club: ${scoring.club.selected}.`,
+    fixes: [fix, 'Hold a balanced finish after every swing.', 'Film from a consistent angle to compare swings.'],
+    drill: {
+      name: 'Mirror Slow-Motion Drill',
+      whyThisDrill: 'Builds awareness of body positions at setup, top, impact and finish — the four moments measured by ImpactAI.',
+      steps: [
+        'Set up in front of a mirror with your normal stance.',
+        'Make slow swings, pausing at the top and at impact.',
+        'Match the four key positions to a target image of a good swing.',
+      ],
+    },
+    keyCheckpoints: ['Setup posture from the hips.', 'Full shoulder turn to the top.', 'Hold finish balanced on lead leg.'],
+    summary: `Scoring engine measured ${scoring.bandLabel.toLowerCase()} swing fundamentals (${scoring.overallScore}/100). Focus area: ${primary ? CATEGORY_LABELS[primaryCat!] : 'general consistency'}.`,
+  };
+}
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Merge LLM text + engine scores into the canonical SwingResult shape
+// ─────────────────────────────────────────────────────────────────────────────
+function buildResult(
+  llm: LlmTextResult,
+  scoring: SwingScoringResult,
+  club: string | undefined,
+  primaryCat: CategoryKey | null,
+): SwingResult {
+  const legacyScores = toLegacyScores(scoring);
+  const issueCategory: SwingResult['issueCategory'] = primaryCat
+    ? ENGINE_CATEGORY_TO_ISSUE[primaryCat]
+    : 'unclear';
+
+  // Default reasoning from engine, then overlay LLM text where present.
+  const engineReason = legacyReasoning(scoring);
+  const r = llm.scoreReasoning ?? {};
+  const scoreReasoning = {
+    position:  r.position  || engineReason.position,
+    tempo:     r.tempo     || engineReason.tempo,
+    sequence:  r.sequence  || engineReason.sequence,
+    stability: r.stability || engineReason.stability,
+    contact:   r.contact   || engineReason.contact,
+  };
+
+  const result: SwingResult = {
+    selectedClub: club ?? 'Unknown',
+    detectedClubType: llm.detectedClubType ?? club ?? 'Unknown',
+    clubMatch: llm.clubMatch ?? 'unclear',
+    clubMatchReason: llm.clubMatchReason ?? 'Club detection limited by frame quality.',
+    cameraAngle: llm.cameraAngle ?? 'unclear',
+    scores: {
+      overallScore:   legacyScores.overallScore,
+      positionScore:  legacyScores.positionScore,
+      tempoScore:     legacyScores.tempoScore,
+      sequenceScore:  legacyScores.sequenceScore,
+      stabilityScore: legacyScores.stabilityScore,
+      contactScore:   legacyScores.contactScore,
+      confidence:     legacyScores.confidence,
+    },
+    scoreReasoning,
+    scoringV4: {
+      overallScore: scoring.overallScore,
+      band: scoring.band,
+      bandLabel: scoring.bandLabel,
+      confidence: scoring.confidence,
+      confidenceScore: scoring.confidenceScore,
+      isLeaderboardEligible: scoring.isLeaderboardEligible,
+      warnings: scoring.warnings,
+      topFaults: scoring.topFaults,
+      club: scoring.club,
+      categories: scoring.categories,
+      phaseValidation: scoring.phaseValidation,
+    },
+    primaryIssue: llm.primaryIssue ?? (primaryCat
+      ? (scoring.categories[primaryCat].topIssue ?? `${CATEGORY_LABELS[primaryCat]} needs work`)
+      : 'Overall swing fundamentals'),
+    issueCategory,
+    whyItHappens: llm.whyItHappens ?? 'See category breakdown for specific deviations from ideal positions.',
+    ballFlightPrediction: llm.ballFlightPrediction ?? 'Predicted from impact-position measurements.',
+    contactPrediction: llm.contactPrediction ?? 'See impact-position category for delivery measurements.',
+    clubSpecificNotes: llm.clubSpecificNotes ?? `Selected club: ${club ?? 'Unknown'}.`,
+    evidence: (llm.evidence ?? []).filter((s) => typeof s === 'string' && s.length > 4).slice(0, 6),
+    fixes: (llm.fixes ?? []).filter((s) => typeof s === 'string' && s.length > 4).slice(0, 4),
+    drill: {
+      name: llm.drill?.name ?? 'Mirror Slow-Motion Drill',
+      whyThisDrill: llm.drill?.whyThisDrill ?? 'Builds awareness of the four key swing positions.',
+      steps: (llm.drill?.steps ?? ['Set up in front of a mirror.', 'Make slow swings.', 'Check each position.'])
+        .filter((s) => typeof s === 'string' && s.length > 3)
+        .slice(0, 6),
+    },
+    keyCheckpoints: (llm.keyCheckpoints ?? ['Setup posture.', 'Top of backswing.', 'Impact balance.'])
+      .filter((s) => typeof s === 'string' && s.length > 3)
+      .slice(0, 6),
+    summary: llm.summary ?? `Scoring engine: ${scoring.bandLabel} swing (${scoring.overallScore}/100).`,
+  };
+
+  // Ensure minimum array lengths so the UI never renders empty sections.
+  if (result.evidence.length < 3) {
+    const fallback = fallbackText(scoring, primaryCat);
+    while (result.evidence.length < 3 && fallback.evidence!.length > result.evidence.length) {
+      result.evidence.push(fallback.evidence![result.evidence.length]);
+    }
+  }
+  if (result.fixes.length < 3) {
+    const fallback = fallbackText(scoring, primaryCat);
+    while (result.fixes.length < 3 && fallback.fixes!.length > result.fixes.length) {
+      result.fixes.push(fallback.fixes![result.fixes.length]);
+    }
+  }
+  if (result.keyCheckpoints.length < 3) {
+    result.keyCheckpoints.push('Hold finish for 3 seconds.', 'Check setup posture in a mirror.', 'Film from the same angle each time.');
+    result.keyCheckpoints = result.keyCheckpoints.slice(0, 3);
+  }
+
+  return humanizeSwingResultText(result);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN EXPORT
+// ─────────────────────────────────────────────────────────────────────────────
 export async function analyzeSwingFrames(
   base64Frames: string[],
   club?: string,
-  previousResult?: SwingResult,
+  _previousResult?: SwingResult,
   temporalMetrics?: TemporalMetrics,
   landmarks?: PerFrameLandmarks,
 ): Promise<SwingResult> {
-  let content = await callOpenRouter(base64Frames, club, SYSTEM_PROMPT, temporalMetrics, landmarks);
+  // ── 1. Deterministic scoring ─────────────────────────────────────────────
+  console.log(
+    '═════════════════════════════════════════════════════════════════════\n' +
+      '[openrouter] ANALYSIS START — ' +
+      `frames=${base64Frames.length} ` +
+      `landmarks={setup:${!!landmarks?.setup}, top:${!!landmarks?.top}, ` +
+      `impact:${!!landmarks?.impact}, finish:${!!landmarks?.finish}} ` +
+      `tempoMetrics=${temporalMetrics?.computedTempoScore != null ? 'yes' : 'no'} ` +
+      `club=${club ?? 'unknown'}\n` +
+      '═════════════════════════════════════════════════════════════════════',
+  );
 
-  if (!content) {
-    console.warn('[openrouter] empty response — using fallback');
-    return buildFallback(club);
+  const scoring = scoreSwing({
+    landmarks,
+    temporal: temporalMetrics,
+    club,
+  });
+
+  // Full debug log — engine prints exactly which metric drove each score
+  console.log(scoring.debug.log);
+
+  const primaryCat = pickPrimaryCategory(scoring);
+  console.log(
+    `[openrouter] primary category: ${primaryCat ?? '(none — clean swing)'} ` +
+      `→ issueCategory="${primaryCat ? ENGINE_CATEGORY_TO_ISSUE[primaryCat] : 'unclear'}" ` +
+      `leaderboard=${scoring.isLeaderboardEligible}`,
+  );
+
+  // ── 2. LLM for coaching text only ───────────────────────────────────────
+  let content = '';
+  try {
+    content = await callOpenRouter(base64Frames, club, SYSTEM_PROMPT, scoring, primaryCat);
+  } catch (e) {
+    console.warn('[openrouter] LLM call failed:', (e as Error).message);
   }
 
-  // If the AI refused, retry once with a forced-JSON override prompt
-  if (isRefusal(content)) {
-    console.warn('[openrouter] AI refused — retrying with forced-JSON prompt. Raw:', content.slice(0, 80));
-    content = await callOpenRouter(base64Frames, club, SYSTEM_PROMPT + '\n\n' + FORCE_JSON_PROMPT, temporalMetrics, landmarks)
-      .catch(() => '');
+  let llm: LlmTextResult | null = null;
+  if (content && !isRefusal(content)) {
+    llm = parseLlm(content);
+    if (!llm) console.warn('[openrouter] LLM JSON parse failed:', content.slice(0, 120));
+  } else if (content) {
+    console.warn('[openrouter] LLM refusal:', content.slice(0, 100));
   }
 
-  let result = parseResult(content);
-  if (!result) {
-    console.warn('[openrouter] parse failed. Raw:', content.slice(0, 150));
-    return buildFallback(club, content.slice(0, 120));
+  if (!llm) {
+    console.warn('[openrouter] using engine-derived fallback text');
+    llm = fallbackText(scoring, primaryCat);
   }
 
-  result = validateAndFix(result, club, temporalMetrics);
+  // ── 3. Hybrid scoring ───────────────────────────────────────────────────
+  // The deterministic engine owns the ranking. The LLM's qualitative visual
+  // grades can make only small bounded adjustments, and measured faults cap
+  // the upside so a bad swing cannot be graded above a cleaner one.
+  applyVisualGradeScoring(scoring, llm);
+  applyNarrativeCalibration(scoring, llm);
+  const finalPrimaryCat = pickPrimaryCategory(scoring);
 
-  const needsSecondPass =
-    isGenericAnalysis(result) ||
-    (previousResult ? isTooSimilarToPrevious(result, previousResult) : false);
+  // ── 4. Merge hybrid numbers + LLM text ──────────────────────────────────
+  const result = buildResult(llm, scoring, club, finalPrimaryCat);
 
-  if (needsSecondPass) {
-    console.log('[openrouter] triggering second pass');
-    const content2 = await callOpenRouter(base64Frames, club, SYSTEM_PROMPT + SECOND_PASS_SUFFIX, temporalMetrics, landmarks);
-    const result2  = parseResult(content2);
-    if (result2) {
-      const fixed2 = validateAndFix(result2, club, temporalMetrics);
-      if (!isGenericAnalysis(fixed2)) {
-        console.log('[openrouter] second pass succeeded');
-        return fixed2;
-      }
-    }
-    console.warn('[openrouter] second pass still generic — using first pass');
-  }
+  console.log(
+    `[openrouter] FINAL overall=${result.scores?.overallScore} ` +
+      `(${scoring.bandLabel}, conf=${scoring.confidence}) ` +
+      `issueCategory=${result.issueCategory} ` +
+      `leaderboard=${scoring.isLeaderboardEligible} ` +
+      `primaryIssue="${result.primaryIssue?.slice(0, 80) ?? ''}"`,
+  );
 
-  console.log(`[openrouter] final overallScore=${result.scores?.overallScore} tempoScore=${result.scores?.tempoScore} confidence=${result.scores?.confidence}`);
   return result;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Re-export PerFrameLandmarks so existing callers (lib/analysis.ts) still
+// compile against `Parameters<typeof analyzeSwingFrames>[4]`. They were
+// importing the type through the function signature, which is exported via
+// the parameter shape below. We also re-export the underlying type for
+// callers that want to type the value directly.
+// ─────────────────────────────────────────────────────────────────────────────
+export type { PerFrameLandmarks };
+
+// Backwards-compat shim — some callers (e.g. PoseLandmark consumers) may
+// have imported these from this module before the refactor. Keep them
+// alive so we don't break unrelated imports.
+export type { PoseLandmark };

@@ -24,24 +24,34 @@ interface SwingHistoryCardProps {
   swing: Swing;
   onView: () => void;
   onReAnalyze: () => void;
-  onCompare: () => void;
+  onGames: () => void;
+  reAnalyzeLocked?: boolean;
+  onReAnalyzeLocked?: () => void;
 }
 
-export function SwingHistoryCard({ swing, onView, onReAnalyze, onCompare }: SwingHistoryCardProps) {
+export function SwingHistoryCard({
+  swing,
+  onView,
+  onReAnalyze,
+  onGames,
+  reAnalyzeLocked = false,
+  onReAnalyzeLocked,
+}: SwingHistoryCardProps) {
   const score = Math.round(getSwingScore(swing.result_json));
   const sc = scoreColor(score);
   const version = swing.analysis_version ?? 1;
 
   return (
     <View style={styles.card}>
-      {/* Top row: thumbnail + main info */}
       <TouchableOpacity style={styles.topRow} onPress={onView} activeOpacity={0.8}>
         <SwingThumbnail swing={swing} size="lg" />
 
         <View style={styles.info}>
           <View style={styles.infoTop}>
-            <Text style={styles.issue} numberOfLines={2}>{swing.result_json.primaryIssue}</Text>
-            <View style={[styles.scorePill, { backgroundColor: sc + '22' }]}>
+            <Text style={styles.issue} numberOfLines={2}>
+              {swing.result_json.primaryIssue}
+            </Text>
+            <View style={[styles.scorePill, { backgroundColor: sc + '22', borderColor: sc + '44' }]}>
               <Text style={[styles.scoreText, { color: sc }]}>{score}</Text>
             </View>
           </View>
@@ -68,7 +78,6 @@ export function SwingHistoryCard({ swing, onView, onReAnalyze, onCompare }: Swin
         </View>
       </TouchableOpacity>
 
-      {/* Actions */}
       <View style={styles.actions}>
         <TouchableOpacity style={styles.actionBtn} onPress={onView} activeOpacity={0.8}>
           <Ionicons name="eye-outline" size={14} color="#FFFFFF" />
@@ -77,16 +86,26 @@ export function SwingHistoryCard({ swing, onView, onReAnalyze, onCompare }: Swin
 
         <View style={styles.actionDivider} />
 
-        <TouchableOpacity style={styles.actionBtn} onPress={onReAnalyze} activeOpacity={0.8}>
-          <Ionicons name="refresh-outline" size={14} color="#4CAF50" />
-          <Text style={[styles.actionText, { color: '#4CAF50' }]}>Re-Analyze</Text>
+        <TouchableOpacity
+          style={styles.actionBtn}
+          onPress={reAnalyzeLocked ? onReAnalyzeLocked : onReAnalyze}
+          activeOpacity={0.8}
+        >
+          <Ionicons
+            name={reAnalyzeLocked ? 'lock-closed-outline' : 'refresh-outline'}
+            size={14}
+            color={reAnalyzeLocked ? '#8E8E93' : '#4CAF50'}
+          />
+          <Text style={[styles.actionText, { color: reAnalyzeLocked ? '#8E8E93' : '#4CAF50' }]}>
+            {reAnalyzeLocked ? 'Pro' : 'Re-Analyze'}
+          </Text>
         </TouchableOpacity>
 
         <View style={styles.actionDivider} />
 
-        <TouchableOpacity style={styles.actionBtn} onPress={onCompare} activeOpacity={0.8}>
-          <Ionicons name="git-compare-outline" size={14} color="#8E8E93" />
-          <Text style={[styles.actionText, { color: '#8E8E93' }]}>Compare</Text>
+        <TouchableOpacity style={styles.actionBtn} onPress={onGames} activeOpacity={0.8}>
+          <Ionicons name="flag-outline" size={14} color="#8E8E93" />
+          <Text style={[styles.actionText, { color: '#8E8E93' }]}>Games</Text>
         </TouchableOpacity>
       </View>
     </View>
@@ -108,15 +127,17 @@ const styles = StyleSheet.create({
   },
   info: {
     flex: 1,
-    justifyContent: 'space-between',
+    minWidth: 0,
+    justifyContent: 'flex-start',
   },
   infoTop: {
     flexDirection: 'row',
     alignItems: 'flex-start',
-    gap: 8,
+    gap: 10,
   },
   issue: {
     flex: 1,
+    minWidth: 0,
     fontSize: 15,
     fontWeight: '700',
     color: '#FFFFFF',
@@ -129,6 +150,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     flexShrink: 0,
+    borderWidth: 1,
   },
   scoreText: {
     fontSize: 16,

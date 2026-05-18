@@ -55,9 +55,17 @@ export interface ExtractFramesResult {
   meta: ExtractFramesMeta | null;
 }
 
-const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
+import { fetchWithTimeout } from '@/lib/fetchWithTimeout';
 
-const ANALYSIS_DEFAULT_FRAMES = 8;
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? '';
+/** Fast coaching upload — small frame count, shorter server work. */
+export const COACHING_EXTRACT_TIMEOUT_MS = 45_000;
+const EXTRACT_FRAMES_TIMEOUT_MS = 120_000;
+
+/** Frames sent to the coaching LLM (kept low for speed). */
+export const COACHING_FRAME_COUNT = 5;
+
+const ANALYSIS_DEFAULT_FRAMES = COACHING_FRAME_COUNT;
 const PHASE_DETECTION_DEFAULT_FRAMES = 75;
 
 // Hard caps prevent accidentally requesting absurd counts that would
@@ -111,9 +119,10 @@ export async function extractFramesFromVideoWithMeta(
   // NOTE: don't set Content-Type manually — RN needs to inject the
   // multipart boundary itself, and overriding the header silently
   // breaks the upload on some platforms.
-  const response = await fetch(`${BACKEND_URL}/extract-frames`, {
+  const response = await fetchWithTimeout(`${BACKEND_URL}/extract-frames`, {
     method: 'POST',
     body: formData,
+    timeoutMs: mode === 'analysis' ? COACHING_EXTRACT_TIMEOUT_MS : EXTRACT_FRAMES_TIMEOUT_MS,
   });
 
   if (!response.ok) {
@@ -155,6 +164,23 @@ export async function extractFramesFromVideoWithMeta(
         : ''),
   );
   return { frames, meta };
+}
+
+/** Lightweight extraction for swing coaching (not full phase-detection). */
+export async function extractCoachingFrames(videoUri: string): Promise<string[]> {
+  return extractFramesFromVideo(videoUri, {
+    mode: 'analysis',
+    frameCount: COACHING_FRAME_COUNT,
+  });
+}
+
+/** Pick 4 evenly spaced frames from a short coaching sample for the LLM. */
+export function pickCoachingFramesForLlm(frames: string[]): string[] {
+  const valid = frames.filter((f) => f && f.length > 0);
+  if (valid.length <= 4) return valid;
+  const last = valid.length - 1;
+  const idx = [0, Math.round(last * 0.35), Math.round(last * 0.68), last];
+  return idx.map((i) => valid[i]);
 }
 
 function getMockFrames(count: number = ANALYSIS_DEFAULT_FRAMES): string[] {

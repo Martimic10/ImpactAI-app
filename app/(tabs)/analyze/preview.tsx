@@ -15,6 +15,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { VideoView, useVideoPlayer } from 'expo-video';
 import { useTheme } from '@/hooks/useTheme';
 import { useAppColors } from '@/lib/theme';
+import { decodeVideoUriFromRoute, encodeVideoUriForRoute } from '@/lib/analysisUri';
 
 const { height: SCREEN_H } = Dimensions.get('window');
 const GREEN = '#4CAF50';
@@ -30,7 +31,8 @@ export default function PreviewScreen() {
   const router = useRouter();
   const { theme } = useTheme();
   const colors = useAppColors();
-  const { uri } = useLocalSearchParams<{ uri: string }>();
+  const params = useLocalSearchParams<{ uri?: string | string[] }>();
+  const uri = decodeVideoUriFromRoute(params.uri);
   const [club, setClub] = React.useState('Driver');
   const [isPlaying, setIsPlaying] = React.useState(true);
 
@@ -58,7 +60,11 @@ export default function PreviewScreen() {
   }
 
   function handleAnalyze() {
-    router.push({ pathname: '/(tabs)/analyze/processing', params: { uri, club } });
+    if (!uri) return;
+    router.push({
+      pathname: '/(tabs)/analyze/processing',
+      params: { uri: encodeVideoUriForRoute(uri), club },
+    });
   }
 
   return (

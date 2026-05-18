@@ -2,6 +2,11 @@ import React, { useEffect, useState } from 'react';
 import { View, Image, StyleSheet, ViewStyle } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { Swing } from '@/types';
+import {
+  extractVideoThumbnailUri,
+  getCachedSwingThumbnail,
+} from '@/lib/thumbnails';
+import { subscribeSwingDataUpdates } from '@/lib/swingDataUpdates';
 
 export type ThumbnailSize = 'sm' | 'md' | 'lg';
 
@@ -10,17 +15,6 @@ const SIZE_MAP: Record<ThumbnailSize, { w: number; h: number; r: number; icon: n
   md: { w: 72, h: 72, r: 14, icon: 24 },
   lg: { w: 100, h: 68, r: 16, icon: 28 },
 };
-
-function getVideoThumbnails() {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const mod = require('expo-video-thumbnails');
-    if (typeof mod?.getThumbnailAsync !== 'function') return null;
-    return mod;
-  } catch {
-    return null;
-  }
-}
 
 // In-memory cache: swingId → local thumb URI
 const thumbCache: Record<string, string> = {};
@@ -43,36 +37,48 @@ export function SwingThumbnail({
   const d = SIZE_MAP[size];
 
   const storedUrl = swing?.thumbnail_url ?? null;
-  const [dynamicUrl, setDynamicUrl] = useState<string | null>(
-    swing?.id ? (thumbCache[swing.id] ?? null) : null
-  );
+  const cached =
+    swing?.id ? thumbCache[swing.id] ?? getCachedSwingThumbnail(swing.id) : null;
+  const [dynamicUrl, setDynamicUrl] = useState<string | null>(cached);
 
   const displayUrl = storedUrl ?? dynamicUrl;
 
   useEffect(() => {
     if (!swing?.id) return;
     if (storedUrl) return;
-    if (thumbCache[swing.id]) { setDynamicUrl(thumbCache[swing.id]); return; }
+
+    const prefetched = thumbCache[swing.id] ?? getCachedSwingThumbnail(swing.id);
+    if (prefetched) {
+      setDynamicUrl(prefetched);
+      return;
+    }
 
     const videoUrl = swing.video_url;
     if (!videoUrl) return;
 
-    const VideoThumbnails = getVideoThumbnails();
-    if (!VideoThumbnails) {
-      console.warn('[SwingThumbnail] expo-video-thumbnails unavailable');
-      return;
-    }
-
-    VideoThumbnails.getThumbnailAsync(videoUrl, { time: 1000, quality: 0.6 })
-      .then(({ uri }: { uri: string }) => {
-        console.log('[SwingThumbnail] dynamic thumbnail loaded for', swing.id);
+    let cancelled = false;
+    extractVideoThumbnailUri(videoUrl, swing.id)
+      .then((uri) => {
+        if (cancelled || !uri) return;
         thumbCache[swing.id] = uri;
         setDynamicUrl(uri);
       })
       .catch((e: unknown) => {
         console.warn('[SwingThumbnail] thumbnail extraction failed for', swing.id, e);
       });
+
+    return () => {
+      cancelled = true;
+    };
   }, [swing?.id, storedUrl, swing?.video_url]);
+
+  useEffect(() => {
+    if (!swing?.id || storedUrl) return undefined;
+    return subscribeSwingDataUpdates(() => {
+      const uri = thumbCache[swing.id] ?? getCachedSwingThumbnail(swing.id);
+      if (uri) setDynamicUrl(uri);
+    });
+  }, [swing?.id, storedUrl]);
 
   const containerStyle: ViewStyle[] = [
     styles.wrap,

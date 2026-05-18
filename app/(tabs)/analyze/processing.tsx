@@ -1,5 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, Alert, StyleSheet } from 'react-native';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { View, Text, Alert, StyleSheet, TouchableOpacity } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -7,12 +7,12 @@ import Animated, {
   useAnimatedStyle,
   useSharedValue,
   withTiming,
-  withSequence,
   Easing,
   useDerivedValue,
   runOnJS,
 } from 'react-native-reanimated';
 import { runSwingAnalysis } from '@/lib/analysis';
+import { decodeVideoUriFromRoute } from '@/lib/analysisUri';
 import { useAuth } from '@/hooks/useAuth';
 import { useTheme } from '@/hooks/useTheme';
 import { useAppColors } from '@/lib/theme';
@@ -21,32 +21,26 @@ export default function ProcessingScreen() {
   const router = useRouter();
   const { theme } = useTheme();
   const colors = useAppColors();
-  const { uri, club } = useLocalSearchParams<{ uri: string; club?: string }>();
+  const params = useLocalSearchParams<{ uri?: string | string[]; club?: string | string[] }>();
+  const videoUri = useMemo(() => decodeVideoUriFromRoute(params.uri), [params.uri]);
+  const club = useMemo(() => {
+    const c = params.club;
+    return (Array.isArray(c) ? c[0] : c) ?? undefined;
+  }, [params.club]);
   const { user, loading: authLoading } = useAuth();
 
   const [stepLabel, setStepLabel] = useState('Preparing…');
   const [pctText, setPctText] = useState(0);
-  const progress = useSharedValue(0); // 0-100
-  const hasRun = useRef(false);
-  // The bar runs in two stages so it NEVER appears frozen, no matter how long
-  // the backend takes:
-  //   Stage 1 (FAST): 0 → 80% linear over EXPECTED_FAST_MS. This is the
-  //                    "things are happening" phase that covers the typical
-  //                    analysis time on a healthy connection.
-  //   Stage 2 (SLOW): 80 → 96% ease-out over LONG_TAIL_MS. A long, decelerating
-  //                    creep so the bar always advances by at least a pixel.
-  //                    Asymptotes toward 96% — the final 4% is reserved for
-  //                    the "done" tween so it lands cleanly at 100.
-  const EXPECTED_FAST_MS = 8000;
-  const LONG_TAIL_MS = 22000;
+  const [fatalError, setFatalError] = useState<string | null>(null);
+  const progress = useSharedValue(0);
+  const progressFloor = useRef(0);
+  const analysisDone = useRef(false);
+  const analysisStarted = useRef(false);
 
   const barStyle = useAnimatedStyle(() => ({
     width: `${progress.value}%`,
   }));
 
-  // Mirror the animated shared value to React state so the percentage number
-  // updates smoothly. We gate the runOnJS call on the UI thread so React
-  // only sees a new value when the rounded integer actually ticks.
   const lastEmitted = useSharedValue(-1);
   useDerivedValue(() => {
     const v = Math.round(progress.value);
@@ -56,13 +50,10 @@ export default function ProcessingScreen() {
     }
   });
 
-  function setLabel(label: string) {
+  const setLabel = useCallback((label: string) => {
     setStepLabel(label);
-  }
+  }, []);
 
-  // Finish the bar cleanly when the analysis is actually done. We pick a
-  // tween duration that scales with the remaining distance so the final
-  // sweep feels natural whether the bar was at 50% or 88% when done fired.
   function finishProgress() {
     const current = progress.value;
     const remaining = Math.max(0, 100 - current);
@@ -74,54 +65,119 @@ export default function ProcessingScreen() {
   }
 
   useEffect(() => {
-    if (authLoading) return;
-    if (hasRun.current) return;
-    hasRun.current = true;
-    // Fast linear climb, then a long ease-out tail. Combined, the user always
-    // sees the bar moving even on slow networks; finishProgress() snaps the
-    // remaining distance smoothly when the analysis actually returns.
-    progress.value = withSequence(
-      withTiming(80, { duration: EXPECTED_FAST_MS, easing: Easing.linear }),
-      withTiming(96, { duration: LONG_TAIL_MS, easing: Easing.out(Easing.quad) }),
-    );
-    runAnalysis();
-  }, [authLoading]);
+    progress.value = withTiming(4, { duration: 500, easing: Easing.out(Easing.cubic) });
+    progressFloor.current = 4;
 
-  async function runAnalysis() {
-    if (!uri || !user) {
-      Alert.alert('Error', 'Missing video or user.', [
-        { text: 'Back', onPress: () => router.back() },
-      ]);
+    const tickId = setInterval(() => {
+      if (analysisDone.current) return;
+      const cur = progress.value;
+      const floor = progressFloor.current;
+      const cap = 97;
+      const step = cur < 20 ? 0.35 : cur < 60 ? 0.28 : 0.22;
+      const target = Math.min(cap, Math.max(floor, cur + step));
+      if (target > cur + 0.04) {
+        progress.value = withTiming(target, { duration: 130, easing: Easing.linear });
+      }
+    }, 110);
+
+    return () => clearInterval(tickId);
+  }, [progress]);
+
+  const runAnalysis = useCallback(async () => {
+    if (!videoUri || !user) {
+      const msg = !videoUri
+        ? 'No video file was passed to analysis. Go back and try again.'
+        : 'You must be signed in to analyze a swing.';
+      console.error('[processing] cannot start:', msg);
+      setFatalError(msg);
+      Alert.alert('Cannot analyze', msg, [{ text: 'Go back', onPress: () => router.back() }]);
       return;
     }
 
+    console.log('[processing] starting analysis', {
+      userId: user.id,
+      club: club ?? '(none)',
+      uri: `${videoUri.slice(0, 48)}…`,
+    });
+
+    setFatalError(null);
+    setLabel('Preparing…');
+
     try {
       const { swingId } = await runSwingAnalysis({
-        uri,
+        uri: videoUri,
         userId: user.id,
-        club: club ?? undefined,
-        onProgress: ({ label }) => {
-          // Milestones drive the label only — the bar climbs on its own.
+        club,
+        onProgress: ({ pct, label }) => {
           setLabel(label);
+          progressFloor.current = Math.max(progressFloor.current, Math.min(99, pct));
         },
       });
 
+      console.log('[processing] analysis complete, swingId=', swingId);
+      analysisDone.current = true;
+      progressFloor.current = 100;
       finishProgress();
       setLabel('Done');
       setTimeout(() => {
-        router.push({
+        router.replace({
           pathname: '/(tabs)/analyze/swing/[id]',
           params: { id: swingId, from: 'analysis' },
         });
       }, 450);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Analysis failed';
-      console.error('[Analysis]', msg);
+      console.error('[processing] analysis failed:', err);
+      setFatalError(msg);
+      analysisStarted.current = false;
       Alert.alert('Analysis Error', msg, [
-        { text: 'Try Again', onPress: () => router.back() },
+        { text: 'Go back', onPress: () => router.back() },
+        {
+          text: 'Retry',
+          onPress: () => {
+            analysisStarted.current = false;
+            void runAnalysis();
+          },
+        },
       ]);
     }
-  }
+  }, [videoUri, user, club, router, setLabel]);
+
+  // Start only when auth + video URI + user are all ready (uri can arrive after first paint).
+  useEffect(() => {
+    if (authLoading) {
+      setLabel('Checking account…');
+      return;
+    }
+    if (!videoUri) {
+      console.warn('[processing] waiting for video URI param');
+      setLabel('Waiting for video…');
+      return;
+    }
+    if (!user) {
+      console.warn('[processing] no signed-in user');
+      setLabel('Sign in required…');
+      return;
+    }
+    if (analysisStarted.current) return;
+
+    analysisStarted.current = true;
+    void runAnalysis();
+  }, [authLoading, videoUri, user, runAnalysis]);
+
+  // If params never resolve, surface an error instead of spinning forever.
+  useEffect(() => {
+    if (authLoading || videoUri) return;
+    const t = setTimeout(() => {
+      if (!videoUri && !analysisStarted.current) {
+        const msg = 'The video could not be loaded. Please go back and select your clip again.';
+        setFatalError(msg);
+        setLabel('Missing video');
+        Alert.alert('Missing video', msg, [{ text: 'Go back', onPress: () => router.back() }]);
+      }
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [authLoading, videoUri, router]);
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
@@ -133,7 +189,7 @@ export default function ProcessingScreen() {
         </View>
 
         <Text style={styles.headline}>Analyzing your swing</Text>
-        <Text style={styles.sub}>{stepLabel}</Text>
+        <Text style={[styles.sub, fatalError && { color: '#FF6B6B' }]}>{fatalError ?? stepLabel}</Text>
 
         <View style={styles.barRow}>
           <View style={styles.barTrack}>
@@ -142,11 +198,17 @@ export default function ProcessingScreen() {
           <Text style={styles.pctText}>{pctText}%</Text>
         </View>
 
-        {club && (
+        {club ? (
           <View style={styles.clubPill}>
             <Text style={styles.clubPillText}>{club}</Text>
           </View>
-        )}
+        ) : null}
+
+        {fatalError ? (
+          <TouchableOpacity style={styles.retryBtn} onPress={() => router.back()} activeOpacity={0.88}>
+            <Text style={styles.retryBtnText}>Go back</Text>
+          </TouchableOpacity>
+        ) : null}
       </View>
     </SafeAreaView>
   );
@@ -188,6 +250,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginBottom: 32,
     minHeight: 18,
+    paddingHorizontal: 8,
   },
 
   barRow: {
@@ -225,10 +288,23 @@ const styles = StyleSheet.create({
     backgroundColor: '#1B2E1B',
     borderWidth: 1,
     borderColor: '#2E7D32',
+    marginBottom: 16,
   },
   clubPillText: {
     fontSize: 13,
     fontWeight: '600',
     color: '#4CAF50',
+  },
+  retryBtn: {
+    marginTop: 8,
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 14,
+    backgroundColor: '#2A2A2A',
+  },
+  retryBtnText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#FFFFFF',
   },
 });

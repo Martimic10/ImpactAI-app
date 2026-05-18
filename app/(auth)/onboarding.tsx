@@ -2,7 +2,6 @@ import React, { useRef, useState } from 'react';
 import {
   View,
   Text,
-  Image,
   TouchableOpacity,
   Dimensions,
   FlatList,
@@ -23,6 +22,15 @@ import Animated, {
   withTiming,
   Easing,
 } from 'react-native-reanimated';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
+/** Aligns onboarding with Home / product: premium dark + electric green */
+const ACCENT = '#34E06F';
+const ACCENT_GLOW = 'rgba(52, 224, 111, 0.42)';
+const ACCENT_SOFT = 'rgba(52, 224, 111, 0.14)';
+const ACCENT_BORDER = 'rgba(52, 224, 111, 0.38)';
+const BG = '#0A0A0A';
+const SURFACE = '#121212';
 
 const { width, height } = Dimensions.get('window');
 const AnimatedFlatList = Animated.createAnimatedComponent(FlatList<OnboardingSlide>);
@@ -34,11 +42,9 @@ interface OnboardingSlide {
   visual: React.ReactNode;
 }
 
-// Card scales with the screen so it lands with the same visual weight on
-// every iPhone — bigger on Plus/Pro Max, sensibly smaller on SE. Shared
-// across all three slides for a consistent product feel. Tuned so the
-// content of slides 2 & 3 fills the frame without empty pockets.
-const CARD_HEIGHT = Math.min(520, Math.max(400, height * 0.54));
+// Card height / width: compact so titles + CTA have room; still readable on SE.
+const VISUAL_CARD_WIDTH = width - 56;
+const CARD_HEIGHT = Math.min(360, Math.max(252, height * 0.34));
 
 // Slow synchronized pulse used by every "live" / "rec" dot in the deck.
 // Defined as a hook so each slide can subscribe independently.
@@ -60,45 +66,81 @@ function useSlowPulse() {
   }));
 }
 
-// ── Screen 1: Welcome — full-bleed photo ─────────────────────────────────────
+// ── Screen 1: Home hub — built in code (no raster) ───────────────────────────
 //
-// The hero card. Tall, glowing green border, frosted bottom badge with a
-// pulsing dot. Corner brackets live on the recording screen now (they're a
-// camera/AI-tracking signal, not a "welcome" signal).
-function WelcomeVisual() {
+// Matches today’s app IA: streak snapshot, tab strip with elevated Upload,
+// quick actions row, and a Social teaser. Scales cleanly on every phone size.
+function HomeHubVisual() {
   const pulseStyle = useSlowPulse();
 
   return (
     <View style={styles.visualContainer}>
       <View style={shared.cardShadow}>
-        <View style={shared.card}>
-          <Image
-            source={require('@/assets/onboarding-screen-1.png')}
-            style={v1.photo}
-            resizeMode="cover"
-          />
+        <View style={[shared.card, hub.cardBg]}>
+          <View pointerEvents="none" style={hub.glowBlob} />
 
-          {/* Bottom-up dark gradient so the badge reads cleanly over any
-              photo. Stacked semi-opaque bands instead of a native lib. */}
-          <View pointerEvents="none" style={shared.gradientStack}>
-            <View style={[shared.gradBand, { opacity: 0.0 }]} />
-            <View style={[shared.gradBand, { opacity: 0.15 }]} />
-            <View style={[shared.gradBand, { opacity: 0.32 }]} />
-            <View style={[shared.gradBand, { opacity: 0.55 }]} />
-            <View style={[shared.gradBand, { opacity: 0.78, height: 70 }]} />
+          <View style={hub.pad}>
+            <View style={hub.rowBetween}>
+              <Text style={hub.brand}>IMPACTAI</Text>
+              <View style={hub.notif}>
+                <Animated.View style={[hub.notifDot, pulseStyle]} />
+              </View>
+            </View>
+
+            <Text style={hub.greetSm}>Your hub</Text>
+            <Text style={hub.greetLg}>Home</Text>
+
+            <View style={hub.streakCard}>
+              <Ionicons name="flame" size={18} color={ACCENT} />
+              <View style={{ flex: 1 }}>
+                <Text style={hub.streakLabel}>Practice streak</Text>
+                <Text style={hub.streakValue}>7 days</Text>
+              </View>
+              <View style={hub.streakRing}>
+                <Text style={hub.streakNum}>7</Text>
+              </View>
+            </View>
+
+            <View style={hub.chromeCard}>
+              <Text style={hub.chromeLabel}>Navigation</Text>
+              <View style={hub.fakeTabBar}>
+                <Ionicons name="home" size={16} color={ACCENT} />
+                <Ionicons name="chatbubble-ellipses-outline" size={15} color="rgba(255,255,255,0.32)" />
+                <View style={hub.uploadFab}>
+                  <Ionicons name="add" size={22} color="#0A0A0A" />
+                </View>
+                <Ionicons name="people-outline" size={16} color="rgba(255,255,255,0.32)" />
+                <Ionicons name="person-outline" size={16} color="rgba(255,255,255,0.32)" />
+              </View>
+            </View>
+
+            <Text style={hub.sectionKicker}>Quick snapshot</Text>
+            <View style={hub.miniActions}>
+              <View style={hub.miniChip}>
+                <Ionicons name="cloud-upload-outline" size={16} color={ACCENT} />
+                <Text style={hub.miniChipTxt}>Upload</Text>
+              </View>
+              <View style={hub.miniChip}>
+                <Ionicons name="sparkles" size={16} color={ACCENT} />
+                <Text style={hub.miniChipTxt}>Coach</Text>
+              </View>
+              <View style={hub.miniChip}>
+                <Ionicons name="trophy-outline" size={16} color={ACCENT} />
+                <Text style={hub.miniChipTxt}>Social</Text>
+              </View>
+            </View>
           </View>
 
-          {/* Top-right "LIVE" chip */}
           <View style={shared.topChip}>
             <Animated.View style={[shared.topChipDot, pulseStyle]} />
             <Text style={shared.topChipText}>LIVE</Text>
           </View>
 
-          {/* Bottom badge — frosted glass */}
-          <View style={v1.badge}>
-            <Animated.View style={[v1.badgeDot, pulseStyle]} />
-            <Text style={v1.badgeText}>AI-Powered Swing Analysis</Text>
-            <Ionicons name="sparkles" size={13} color="#A5D6A7" style={{ marginLeft: 4 }} />
+          <View style={hub.bottomBadge}>
+            <Ionicons name="layers-outline" size={15} color={ACCENT} />
+            <Text style={hub.bottomBadgeTxt} numberOfLines={2}>
+              Home · Coach · Upload · Social — one focused surface
+            </Text>
           </View>
         </View>
       </View>
@@ -108,42 +150,28 @@ function WelcomeVisual() {
 
 // Shared card frame styles used by all three slides.
 const shared = StyleSheet.create({
-  // Soft green-tinted outer glow.
   cardShadow: {
-    width: width - 40,
-    borderRadius: 32,
-    shadowColor: '#4CAF50',
-    shadowOpacity: 0.25,
-    shadowRadius: 28,
-    shadowOffset: { width: 0, height: 12 },
-    elevation: 18,
+    width: VISUAL_CARD_WIDTH,
+    borderRadius: 22,
+    shadowColor: ACCENT_GLOW,
+    shadowOpacity: 0.32,
+    shadowRadius: 24,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 16,
   },
   card: {
     width: '100%',
     height: CARD_HEIGHT,
-    borderRadius: 32,
+    borderRadius: 22,
     overflow: 'hidden',
-    borderWidth: 1.5,
-    borderColor: 'rgba(76,175,80,0.32)',
-    backgroundColor: '#0A0A0A',
-  },
-  gradientStack: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    height: 240,
-    justifyContent: 'flex-end',
-  },
-  gradBand: {
-    width: '100%',
-    height: 40,
-    backgroundColor: '#000000',
+    borderWidth: 1,
+    borderColor: ACCENT_BORDER,
+    backgroundColor: SURFACE,
   },
   topChip: {
     position: 'absolute',
-    top: 18,
-    right: 18,
+    top: 12,
+    right: 12,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
@@ -158,48 +186,205 @@ const shared = StyleSheet.create({
     width: 6,
     height: 6,
     borderRadius: 3,
-    backgroundColor: '#4CAF50',
+    backgroundColor: ACCENT,
   },
   topChipText: {
     fontSize: 10,
     fontWeight: '800',
     color: '#FFFFFF',
-    letterSpacing: 1.4,
+    letterSpacing: 1.6,
   },
 });
 
-const v1 = StyleSheet.create({
-  photo: {
-    width: '100%',
-    height: '100%',
+const hub = StyleSheet.create({
+  cardBg: {
+    backgroundColor: SURFACE,
   },
-  badge: {
+  glowBlob: {
     position: 'absolute',
-    bottom: 22,
-    left: 22,
-    right: 22,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 9,
-    backgroundColor: 'rgba(10,16,12,0.7)',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderRadius: 18,
-    borderWidth: 1,
-    borderColor: 'rgba(76,175,80,0.45)',
+    width: 200,
+    height: 200,
+    borderRadius: 100,
+    backgroundColor: ACCENT_SOFT,
+    top: -85,
+    right: -65,
+    opacity: 0.8,
   },
-  badgeDot: {
+  pad: {
+    flex: 1,
+    paddingHorizontal: 14,
+    paddingTop: 18,
+    paddingBottom: 68,
+  },
+  rowBetween: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  brand: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: 'rgba(255,255,255,0.35)',
+    letterSpacing: 2.4,
+  },
+  notif: {
+    width: 30,
+    height: 30,
+    borderRadius: 10,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  notifDot: {
     width: 8,
     height: 8,
-    borderRadius: 5,
-    backgroundColor: '#4CAF50',
+    borderRadius: 4,
+    backgroundColor: ACCENT,
   },
-  badgeText: {
-    flex: 1,
-    fontSize: 14,
-    fontWeight: '700',
+  greetSm: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: 'rgba(255,255,255,0.4)',
+    marginTop: 8,
+  },
+  greetLg: {
+    fontSize: 24,
+    fontWeight: '800',
     color: '#FFFFFF',
-    letterSpacing: 0.2,
+    letterSpacing: -0.7,
+    marginBottom: 10,
+  },
+  streakCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    backgroundColor: 'rgba(14,16,14,0.92)',
+    borderWidth: 1,
+    borderColor: ACCENT_BORDER,
+    marginBottom: 8,
+  },
+  streakLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: 'rgba(255,255,255,0.42)',
+  },
+  streakValue: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: '#FFFFFF',
+    letterSpacing: -0.4,
+    marginTop: 1,
+  },
+  streakRing: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    borderWidth: 2.5,
+    borderColor: ACCENT,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#161616',
+  },
+  streakNum: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: ACCENT,
+  },
+  chromeCard: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'rgba(8,8,8,0.72)',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    marginBottom: 8,
+    gap: 6,
+  },
+  chromeLabel: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: 'rgba(255,255,255,0.32)',
+    letterSpacing: 1.4,
+  },
+  fakeTabBar: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-end',
+    paddingHorizontal: 4,
+  },
+  uploadFab: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: ACCENT,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 2,
+    borderWidth: 2,
+    borderColor: SURFACE,
+    shadowColor: ACCENT,
+    shadowOpacity: 0.35,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 6,
+  },
+  sectionKicker: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: 'rgba(255,255,255,0.32)',
+    letterSpacing: 1.4,
+    marginBottom: 6,
+  },
+  miniActions: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  miniChip: {
+    flex: 1,
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+    borderRadius: 12,
+    backgroundColor: 'rgba(52,224,111,0.07)',
+    borderWidth: 1,
+    borderColor: 'rgba(52,224,111,0.24)',
+  },
+  miniChipTxt: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: 'rgba(255,255,255,0.92)',
+    letterSpacing: -0.15,
+  },
+  bottomBadge: {
+    position: 'absolute',
+    bottom: 12,
+    left: 12,
+    right: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(12, 14, 12, 0.9)',
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: ACCENT_BORDER,
+  },
+  bottomBadgeTxt: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#FFFFFF',
+    letterSpacing: 0.02,
+    lineHeight: 17,
   },
 });
 
@@ -282,8 +467,8 @@ function RecordVisual() {
 
                 {/* Pose landmark dots on the golfer */}
                 <View style={[v2.poseDot, { left: 56, top: 18 }]} />
-                <View style={[v2.poseDot, { left: 48, top: 48, backgroundColor: '#4CAF50' }]} />
-                <View style={[v2.poseDot, { left: 68, top: 48, backgroundColor: '#4CAF50' }]} />
+                <View style={[v2.poseDot, { left: 48, top: 48, backgroundColor: ACCENT }]} />
+                <View style={[v2.poseDot, { left: 68, top: 48, backgroundColor: ACCENT }]} />
                 <View style={[v2.poseDot, { left: 62, top: 94 }]} />
               </View>
             </View>
@@ -292,7 +477,7 @@ function RecordVisual() {
             <View style={v2.bottomBar}>
               <View style={v2.chipRow}>
                 <View style={v2.featureChip}>
-                  <Ionicons name="scan-outline" size={11} color="#4CAF50" />
+                  <Ionicons name="scan-outline" size={11} color={ACCENT} />
                   <Text style={v2.featureText}>Pose tracking</Text>
                 </View>
                 <View style={v2.featureChip}>
@@ -323,7 +508,7 @@ const v2 = StyleSheet.create({
     left: 0,
     right: 0,
     height: '38%',
-    backgroundColor: '#0F1A24',
+    backgroundColor: '#0C1418',
   },
   midBand: {
     position: 'absolute',
@@ -331,8 +516,8 @@ const v2 = StyleSheet.create({
     left: 0,
     right: 0,
     height: '22%',
-    backgroundColor: '#11231A',
-    opacity: 0.85,
+    backgroundColor: '#0F1A12',
+    opacity: 0.9,
   },
   groundBand: {
     position: 'absolute',
@@ -340,7 +525,7 @@ const v2 = StyleSheet.create({
     left: 0,
     right: 0,
     bottom: 0,
-    backgroundColor: '#0A0A0A',
+    backgroundColor: BG,
   },
 
   cornersWrap: {
@@ -354,18 +539,19 @@ const v2 = StyleSheet.create({
     position: 'absolute',
     width: 26,
     height: 26,
-    borderColor: '#4CAF50',
-    borderWidth: 2.2,
+    borderColor: ACCENT,
+    borderWidth: 2,
+    opacity: 0.9,
   },
-  cornerTL: { top: 16, left: 16, borderRightWidth: 0, borderBottomWidth: 0, borderTopLeftRadius: 6 },
-  cornerTR: { top: 16, right: 16, borderLeftWidth: 0, borderBottomWidth: 0, borderTopRightRadius: 6 },
-  cornerBL: { bottom: 16, left: 16, borderRightWidth: 0, borderTopWidth: 0, borderBottomLeftRadius: 6 },
-  cornerBR: { bottom: 16, right: 16, borderLeftWidth: 0, borderTopWidth: 0, borderBottomRightRadius: 6 },
+  cornerTL: { top: 12, left: 12, borderRightWidth: 0, borderBottomWidth: 0, borderTopLeftRadius: 6 },
+  cornerTR: { top: 12, right: 12, borderLeftWidth: 0, borderBottomWidth: 0, borderTopRightRadius: 6 },
+  cornerBL: { bottom: 12, left: 12, borderRightWidth: 0, borderTopWidth: 0, borderBottomLeftRadius: 6 },
+  cornerBR: { bottom: 12, right: 12, borderLeftWidth: 0, borderTopWidth: 0, borderBottomRightRadius: 6 },
 
   content: {
     flex: 1,
-    paddingTop: 22,
-    paddingBottom: 22,
+    paddingTop: 14,
+    paddingBottom: 14,
   },
 
   topRow: {
@@ -406,13 +592,13 @@ const v2 = StyleSheet.create({
     width: 18,
     height: 18,
     borderRadius: 9,
-    backgroundColor: '#A5D6A7',
+    backgroundColor: 'rgba(255,255,255,0.38)',
     marginLeft: 10,
   },
   golferTorso: {
     width: 4,
     height: 40,
-    backgroundColor: '#A5D6A7',
+    backgroundColor: 'rgba(255,255,255,0.32)',
     marginLeft: 17,
     marginTop: 2,
     borderRadius: 2,
@@ -421,7 +607,7 @@ const v2 = StyleSheet.create({
     position: 'absolute',
     width: 3,
     height: 32,
-    backgroundColor: '#A5D6A7',
+    backgroundColor: 'rgba(255,255,255,0.28)',
     top: 60,
     left: 14,
     transform: [{ rotate: '-7deg' }],
@@ -431,7 +617,7 @@ const v2 = StyleSheet.create({
     position: 'absolute',
     width: 3,
     height: 32,
-    backgroundColor: '#A5D6A7',
+    backgroundColor: 'rgba(255,255,255,0.28)',
     top: 60,
     left: 21,
     transform: [{ rotate: '7deg' }],
@@ -441,7 +627,7 @@ const v2 = StyleSheet.create({
     position: 'absolute',
     width: 3,
     height: 26,
-    backgroundColor: '#A5D6A7',
+    backgroundColor: 'rgba(255,255,255,0.32)',
     top: 24,
     left: 26,
     transform: [{ rotate: '35deg' }],
@@ -465,7 +651,7 @@ const v2 = StyleSheet.create({
     borderRadius: 5,
     backgroundColor: '#FFFFFF',
     borderWidth: 2,
-    borderColor: 'rgba(76,175,80,0.85)',
+    borderColor: ACCENT,
   },
 
   arcDot: {
@@ -473,19 +659,19 @@ const v2 = StyleSheet.create({
     width: 10,
     height: 10,
     borderRadius: 5,
-    backgroundColor: '#4CAF50',
+    backgroundColor: ACCENT,
   },
 
   bottomBar: {
-    marginHorizontal: 22,
-    backgroundColor: 'rgba(10,12,10,0.78)',
-    borderRadius: 22,
+    marginHorizontal: 14,
+    backgroundColor: 'rgba(14, 14, 14, 0.88)',
+    borderRadius: 16,
     borderWidth: 1,
-    borderColor: 'rgba(76,175,80,0.25)',
-    paddingTop: 12,
-    paddingBottom: 14,
-    paddingHorizontal: 16,
-    gap: 10,
+    borderColor: 'rgba(52, 224, 111, 0.22)',
+    paddingTop: 8,
+    paddingBottom: 10,
+    paddingHorizontal: 12,
+    gap: 8,
   },
   chipRow: {
     flexDirection: 'row',
@@ -496,31 +682,31 @@ const v2 = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 5,
-    backgroundColor: 'rgba(30,32,30,0.95)',
+    backgroundColor: 'rgba(26, 28, 26, 0.96)',
     paddingHorizontal: 10,
     paddingVertical: 5,
     borderRadius: 999,
     borderWidth: 1,
-    borderColor: '#2A2A2A',
+    borderColor: 'rgba(255,255,255,0.06)',
   },
-  featureText: { fontSize: 11, fontWeight: '700', color: '#4CAF50', letterSpacing: 0.2 },
+  featureText: { fontSize: 11, fontWeight: '700', color: ACCENT, letterSpacing: 0.15 },
 
   recordRow: {
     alignItems: 'center',
   },
   recordBtnOuter: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
+    width: 46,
+    height: 46,
+    borderRadius: 23,
     borderWidth: 3,
     borderColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
   },
   recordBtnInner: {
-    width: 20,
-    height: 20,
-    borderRadius: 6,
+    width: 18,
+    height: 18,
+    borderRadius: 5,
     backgroundColor: '#FF453A',
   },
 });
@@ -533,7 +719,7 @@ const SCORES: Array<{ label: string; value: number; color: string }> = [
   { label: 'Setup',      value: 72, color: '#FFD23A' },
   { label: 'Posture',    value: 65, color: '#FFD23A' },
   { label: 'Swing Path', value: 42, color: '#FF453A' },
-  { label: 'Tempo',      value: 81, color: '#4CAF50' },
+  { label: 'Tempo',      value: 81, color: ACCENT },
   { label: 'Contact',    value: 51, color: '#FF453A' },
 ];
 
@@ -606,13 +792,13 @@ function CoachVisual() {
               </Text>
             </View>
 
-            <View style={v3.drillRow}>
+              <View style={v3.drillRow}>
               <View style={v3.drillChip}>
-                <Ionicons name="repeat" size={11} color="#4CAF50" />
+                <Ionicons name="repeat" size={11} color={ACCENT} />
                 <Text style={v3.drillText}>Hip-bump drill</Text>
               </View>
               <View style={v3.drillChip}>
-                <Ionicons name="time-outline" size={11} color="#A5D6A7" />
+                <Ionicons name="time-outline" size={11} color={ACCENT} style={{ opacity: 0.75 }} />
                 <Text style={v3.drillText}>10 reps · 3 sets</Text>
               </View>
             </View>
@@ -625,61 +811,61 @@ function CoachVisual() {
 
 const v3 = StyleSheet.create({
   card: {
-    backgroundColor: '#0E0F0E',
+    backgroundColor: SURFACE,
   },
   summaryRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 14,
-    paddingHorizontal: 18,
-    paddingTop: 22,
-    paddingBottom: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: '#1F221F',
+    gap: 10,
+    paddingHorizontal: 14,
+    paddingTop: 14,
+    paddingBottom: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: 'rgba(255,255,255,0.06)',
   },
   scoreRingOuter: {
-    padding: 3,
+    padding: 2,
     borderRadius: 999,
-    backgroundColor: 'rgba(255,210,58,0.12)',
+    backgroundColor: ACCENT_SOFT,
   },
   scoreRing: {
-    width: 74,
-    height: 74,
-    borderRadius: 37,
-    borderWidth: 5,
-    borderColor: '#FFD23A',
+    width: 62,
+    height: 62,
+    borderRadius: 31,
+    borderWidth: 3,
+    borderColor: ACCENT,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#141414',
+    backgroundColor: '#161616',
   },
-  scoreNum: { color: '#FFFFFF', fontSize: 24, fontWeight: '800', lineHeight: 26 },
-  scoreLabel: { color: '#8A98A3', fontSize: 9, letterSpacing: 1.2, fontWeight: '800', marginTop: 2 },
+  scoreNum: { color: '#FFFFFF', fontSize: 20, fontWeight: '800', lineHeight: 22 },
+  scoreLabel: { color: '#8E8E93', fontSize: 9, letterSpacing: 1.2, fontWeight: '800', marginTop: 2 },
 
   kickerRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   kickerDot: {
     width: 6,
     height: 6,
     borderRadius: 3,
-    backgroundColor: '#B6FF2F',
+    backgroundColor: ACCENT,
   },
-  aiKicker: { color: '#B6FF2F', fontSize: 10, fontWeight: '800', letterSpacing: 2 },
+  aiKicker: { color: ACCENT, fontSize: 10, fontWeight: '800', letterSpacing: 2 },
 
-  issueTitle: { color: '#FFFFFF', fontSize: 16, fontWeight: '800', letterSpacing: -0.3 },
-  issueSub: { color: '#8A98A3', fontSize: 12, lineHeight: 17 },
+  issueTitle: { color: '#FFFFFF', fontSize: 14, fontWeight: '800', letterSpacing: -0.3 },
+  issueSub: { color: '#8E8E93', fontSize: 11, lineHeight: 15 },
 
   scoresPanel: {
-    paddingHorizontal: 18,
-    paddingVertical: 14,
-    gap: 9,
-    borderBottomWidth: 1,
-    borderBottomColor: '#1F221F',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    gap: 6,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: 'rgba(255,255,255,0.06)',
   },
-  scoreRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  rowLabel: { fontSize: 12, fontWeight: '700', color: '#FFFFFF', width: 76 },
+  scoreRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  rowLabel: { fontSize: 11, fontWeight: '700', color: '#FFFFFF', width: 68 },
   barTrack: {
     flex: 1,
-    height: 6,
-    backgroundColor: '#1F221F',
+    height: 5,
+    backgroundColor: 'rgba(255,255,255,0.06)',
     borderRadius: 3,
     overflow: 'hidden',
   },
@@ -694,12 +880,12 @@ const v3 = StyleSheet.create({
 
   fixCard: {
     flex: 1,
-    paddingHorizontal: 18,
-    paddingTop: 16,
-    paddingBottom: 20,
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 12,
     justifyContent: 'space-between',
   },
-  fixTop: { gap: 10 },
+  fixTop: { gap: 8 },
   fixHeader: { flexDirection: 'row', alignItems: 'center', gap: 9 },
   warnIcon: {
     width: 26,
@@ -711,7 +897,7 @@ const v3 = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,159,10,0.35)',
   },
-  fixTitle: { flex: 1, color: '#F4F7FA', fontSize: 13, fontWeight: '800', letterSpacing: 0.2 },
+  fixTitle: { flex: 1, color: '#FFFFFF', fontSize: 13, fontWeight: '800', letterSpacing: 0.15 },
   highPill: {
     borderWidth: 1,
     borderColor: '#FF453AAA',
@@ -721,7 +907,7 @@ const v3 = StyleSheet.create({
     backgroundColor: 'rgba(255,69,58,0.08)',
   },
   highPillText: { fontSize: 10, fontWeight: '800', color: '#FF453A', letterSpacing: 1 },
-  fixDetail: { color: '#9DA8B0', fontSize: 12, lineHeight: 17 },
+  fixDetail: { color: '#8E8E93', fontSize: 11, lineHeight: 15 },
 
   drillRow: {
     flexDirection: 'row',
@@ -734,31 +920,34 @@ const v3 = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 5,
     borderRadius: 999,
-    backgroundColor: '#152119',
+    backgroundColor: 'rgba(52, 224, 111, 0.08)',
     borderWidth: 1,
-    borderColor: 'rgba(76,175,80,0.32)',
+    borderColor: 'rgba(52, 224, 111, 0.28)',
   },
-  drillText: { color: '#A5D6A7', fontSize: 11, fontWeight: '700' },
+  drillText: { color: 'rgba(255,255,255,0.88)', fontSize: 10, fontWeight: '700' },
 });
 
 // ── Slides data ──────────────────────────────────────────────────────────────
 const SLIDES: OnboardingSlide[] = [
   {
     id: '1',
-    title: 'Welcome to\nImpactAI',
-    subtitle: 'Your AI golf coach. Instant swing analysis and personalized feedback to improve your game.',
-    visual: <WelcomeVisual />,
+    title: 'ImpactAI\nstarts on Home',
+    subtitle:
+      'Home is your hub: streaks, clear next steps, and light social context. Upload when you are ready—the AI takes it from there.',
+    visual: <HomeHubVisual />,
   },
   {
     id: '2',
-    title: 'Record or\nUpload Your Swing',
-    subtitle: 'Film face-on or down-the-line. Our AI reads every frame and breaks down your technique in seconds.',
+    title: 'Upload is\nalways one tap away',
+    subtitle:
+      'Use the Upload tab (or Home) to record live or pick a clip. Film face-on or down-the-line and our AI breaks down every frame.',
     visual: <RecordVisual />,
   },
   {
     id: '3',
-    title: 'Get Coached.\nGet Better.',
-    subtitle: 'Receive specific drills, feel cues, and track your improvement over time. Like having a coach in your pocket.',
+    title: 'Coach turns swings\ninto a plan',
+    subtitle:
+      'Trends and drills live under Coach. See how friends are practicing on Social, then tune your account in Profile.',
     visual: <CoachVisual />,
   },
 ];
@@ -795,13 +984,13 @@ export default function OnboardingScreen() {
   }
 
   return (
-    <View style={styles.container}>
+    <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
       <StatusBar style="light" />
 
       {/* Skip */}
       <View style={styles.skipRow}>
         {activeIndex > 0 && (
-          <TouchableOpacity onPress={handleSkip} style={styles.skipBtn}>
+          <TouchableOpacity onPress={handleSkip} style={styles.skipBtn} hitSlop={12}>
             <Text style={styles.skipText}>Skip</Text>
           </TouchableOpacity>
         )}
@@ -853,25 +1042,26 @@ export default function OnboardingScreen() {
           </Text>
         </TouchableOpacity>
       </View>
-    </View>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0D0D0D' },
+  container: { flex: 1, backgroundColor: BG },
   skipRow: {
-    height: 60,
-    paddingTop: 56,
-    paddingHorizontal: 24,
+    paddingHorizontal: 22,
+    paddingTop: 4,
+    paddingBottom: 8,
+    minHeight: 36,
     alignItems: 'flex-end',
     justifyContent: 'center',
   },
-  skipBtn: { paddingHorizontal: 4, paddingVertical: 4 },
-  skipText: { color: '#8E8E93', fontSize: 16 },
+  skipBtn: { paddingHorizontal: 8, paddingVertical: 6 },
+  skipText: { color: 'rgba(255,255,255,0.45)', fontSize: 15, fontWeight: '600', letterSpacing: 0.2 },
   slide: {
     width,
     flex: 1,
-    paddingHorizontal: 24,
+    paddingHorizontal: 22,
   },
   visualArea: {
     flex: 1,
@@ -879,39 +1069,50 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   visualContainer: {
-    width: width - 48,
+    width: VISUAL_CARD_WIDTH,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  textArea: { paddingBottom: 24, gap: 12 },
+  textArea: { paddingBottom: 20, gap: 10, paddingTop: 4 },
   title: {
-    fontSize: 34,
-    fontWeight: '700',
+    fontSize: 32,
+    fontWeight: '800',
     color: '#FFFFFF',
-    lineHeight: 40,
-    letterSpacing: -0.5,
+    lineHeight: 38,
+    letterSpacing: -0.65,
   },
-  subtitle: { fontSize: 16, color: '#8E8E93', lineHeight: 24 },
+  subtitle: {
+    fontSize: 16,
+    color: '#8E8E93',
+    lineHeight: 24,
+    fontWeight: '500',
+    letterSpacing: 0.1,
+  },
   dotsRow: {
     flexDirection: 'row',
     justifyContent: 'center',
     alignItems: 'center',
-    gap: 6,
-    paddingBottom: 20,
+    gap: 7,
+    paddingBottom: 16,
   },
-  dot: { height: 8, borderRadius: 4, backgroundColor: '#4CAF50' },
-  ctaArea: { paddingHorizontal: 24, paddingBottom: 48 },
+  dot: { height: 8, borderRadius: 4, backgroundColor: ACCENT },
+  ctaArea: { paddingHorizontal: 22, paddingBottom: 12 },
   nextBtn: {
-    backgroundColor: '#2E7D32',
+    backgroundColor: ACCENT,
     borderRadius: 16,
-    height: 58,
+    height: 56,
     alignItems: 'center',
     justifyContent: 'center',
+    shadowColor: ACCENT_GLOW,
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.35,
+    shadowRadius: 20,
+    elevation: 8,
   },
   nextText: {
-    color: '#FFFFFF',
+    color: '#0A0A0A',
     fontSize: 17,
-    fontWeight: '700',
-    letterSpacing: 0.2,
+    fontWeight: '800',
+    letterSpacing: -0.2,
   },
 });

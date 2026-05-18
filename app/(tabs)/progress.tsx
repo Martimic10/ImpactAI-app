@@ -22,6 +22,8 @@ import { Button } from '@/components/ui/Button';
 import { Swing, getSwingScore } from '@/types';
 import { useTheme } from '@/hooks/useTheme';
 import { useAppColors } from '@/lib/theme';
+import { ProUpsellCard } from '@/components/ProUpsellCard';
+import { usePaywall } from '@/hooks/usePaywall';
 
 const BAR_H = 140;
 const CHART_MAX = 8;
@@ -119,6 +121,7 @@ export default function ProgressScreen() {
   const { theme } = useTheme();
   const colors = useAppColors();
   const { swings, loading, refetch } = useSwings(user?.id);
+  const { isPro, requirePro, openPaywall, Paywall } = usePaywall();
   const [reanalyzingId, setReanalyzingId] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -139,6 +142,7 @@ export default function ProgressScreen() {
   async function handleReAnalyze(swing: Swing) {
     if (!user) return;
     if (reanalyzingId) return;
+    if (!requirePro()) return;
 
     Alert.alert(
       'Re-Analyze Swing',
@@ -240,8 +244,18 @@ export default function ProgressScreen() {
               </View>
             </View>
 
-            {/* Chart */}
-            {swings.length >= 2 && <LineChart swings={swings} />}
+            {/* Chart — Pro */}
+            {swings.length >= 2 ? (
+              isPro ? (
+                <LineChart swings={swings} />
+              ) : (
+                <ProUpsellCard
+                  title="Advanced progress tracking"
+                  subtitle="Unlock score trends, streaks, and full history with ImpactAI Pro."
+                  onUpgrade={openPaywall}
+                />
+              )
+            ) : null}
 
             {/* History */}
             <View style={styles.historySection}>
@@ -259,7 +273,11 @@ export default function ProgressScreen() {
                         swing={swing}
                         onView={() => router.push({ pathname: '/(tabs)/analyze/swing/[id]', params: { id: swing.id } })}
                         onReAnalyze={() => handleReAnalyze(swing)}
-                        onCompare={() => router.push({ pathname: '/(tabs)/compare', params: { swingId: swing.id } })}
+                        reAnalyzeLocked={!isPro}
+                        onReAnalyzeLocked={openPaywall}
+                        onGames={() =>
+                          router.push({ pathname: '/(tabs)/friends', params: { segment: 'games' } })
+                        }
                       />
                     )}
                   </View>
@@ -269,6 +287,7 @@ export default function ProgressScreen() {
           </>
         )}
       </ScrollView>
+      <Paywall />
     </SafeAreaView>
   );
 }

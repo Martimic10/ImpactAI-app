@@ -2,9 +2,9 @@ import * as LegacyFS from 'expo-file-system/legacy';
 import { SwingResult } from '@/types';
 import { uploadSwingVideo } from '@/lib/supabase/storage';
 import { extractFrames } from '@/lib/video';
+import { extractCoachingFrames, pickCoachingFramesForLlm, MOCK_SWING_RESULT } from '@/lib/frames';
 import { analyzeSwingFrames } from '@/lib/openrouter';
-import { MOCK_SWING_RESULT } from '@/lib/frames';
-import { generateAndUploadThumbnail } from '@/lib/thumbnails';
+import { generateAndUploadThumbnail, prefetchSwingThumbnail } from '@/lib/thumbnails';
 import {
   fetchBackendResult,
   buildVisualAnalysisFromBackendResult,
@@ -12,6 +12,10 @@ import {
 import { getSwingById, saveSwingThumbnail, updateSwingAnalysis } from '@/lib/swings';
 import { supabase } from '@/lib/supabase';
 import { getSwingPrivacy } from '@/lib/preferences';
+import { notifySwingDataUpdates } from '@/lib/swingDataUpdates';
+import { assertVideoFileReadable } from '@/lib/verifyVideoFile';
+import { DEV_MODE } from '@/lib/devMode';
+import { runWithProgressTicks } from '@/lib/analysisProgress';
 
 async function downloadToLocal(remoteUrl: string, swingId: string): Promise<string> {
   const dest = `${LegacyFS.cacheDirectory}swing_${swingId}.mp4`;
@@ -59,59 +63,101 @@ const useMock = () =>
   !process.env.EXPO_PUBLIC_OPENROUTER_API_KEY ||
   process.env.EXPO_PUBLIC_OPENROUTER_API_KEY === 'your_openrouter_api_key';
 
-// ─── Unified backend analysis ─────────────────────────────────────────────────
-// Calls /extract-key-frames once to get phase-aligned frames + temporal metrics,
-// feeds them directly to the AI. Eliminates the separate /extract-frames call.
-// Falls back to /extract-frames if the backend is unavailable.
 interface FrameAnalysisResult {
   result: SwingResult;
-  backendResult?: Awaited<ReturnType<typeof fetchBackendResult>>;
 }
 
+/** Rich phase overlays + landmarks — runs after the user sees coaching results. */
+function scheduleRichVisualAnalysis(
+  swingId: string,
+  userId: string,
+  uri: string,
+  club: string | undefined,
+  result: SwingResult,
+) {
+  if (!process.env.EXPO_PUBLIC_BACKEND_URL) return;
+
+  void (async () => {
+    const t0 = Date.now();
+    try {
+      console.log('[analysis] background visual analysis start', swingId);
+      const backendResult = await fetchBackendResult(uri, club);
+      if (!backendResult) return;
+      await buildVisualAnalysisFromBackendResult(backendResult, swingId, userId, result, uri);
+      console.log(`[analysis] background visual analysis done in ${Date.now() - t0}ms`);
+    } catch (e) {
+      console.warn('[analysis] background visual analysis failed:', e);
+    }
+  })();
+}
+
+/**
+ * Fast coaching path: one small frame extract + LLM.
+ * Skips pose tracking and 75-frame dense pipeline during the loading screen.
+ */
 async function runFrameAnalysis(
   uri: string,
   club?: string,
   onProgress?: (p: AnalysisProgress) => void,
 ): Promise<FrameAnalysisResult> {
   if (useMock()) {
-    await new Promise((r) => setTimeout(r, 1200));
+    await new Promise((r) => setTimeout(r, 400));
     return { result: { ...MOCK_SWING_RESULT, selectedClub: club ?? MOCK_SWING_RESULT.selectedClub } };
   }
 
-  // /extract-frames + /analyze-frames pipeline
-  onProgress?.({ pct: 28, label: 'Reading frames…' });
-  const backendResult = await fetchBackendResult(uri, club);
-  const bfFrames = backendResult?.frames ?? [];
-  const goodFrames = bfFrames.filter((f) => f.frame);
+  const extractStart = Date.now();
+  onProgress?.({ pct: 14, label: 'Reading swing…' });
 
-  let frames: string[];
-  let landmarks: Parameters<typeof analyzeSwingFrames>[4] | undefined;
-  if (goodFrames.length >= 2) {
-    frames = goodFrames.map((f) => f.frame!);
-    if (bfFrames.length === 4) {
-      landmarks = {
-        setup:  bfFrames[0]?.landmarks ?? null,
-        top:    bfFrames[1]?.landmarks ?? null,
-        impact: bfFrames[2]?.landmarks ?? null,
-        finish: bfFrames[3]?.landmarks ?? null,
-      };
-    }
-    console.log(`[analysis] using ${frames.length} phase-aligned backend frames` +
-      (landmarks ? ' with landmarks' : ''));
-  } else {
-    frames = await extractFrames(uri);
-    console.log(`[analysis] fallback: ${frames.length} frames, sizes: ${frames.slice(0, 3).map(f => f.length).join(',')}`);
+  let rawFrames: string[] = [];
+  try {
+    rawFrames = await runWithProgressTicks(
+      onProgress,
+      14,
+      48,
+      'Extracting key frames…',
+      () => extractCoachingFrames(uri),
+      200,
+    );
+  } catch (e) {
+    console.warn('[analysis] coaching extract failed, trying fallback:', e);
   }
+
+  if (rawFrames.length < 2) {
+    onProgress?.({ pct: 36, label: 'Extracting frames…' });
+    rawFrames = await runWithProgressTicks(
+      onProgress,
+      36,
+      50,
+      'Extracting frames…',
+      () => extractFrames(uri),
+      180,
+    );
+  }
+
+  const frames = pickCoachingFramesForLlm(rawFrames);
+  console.log(
+    `[analysis] coaching frames: ${frames.length} for LLM (${rawFrames.length} extracted) in ${Date.now() - extractStart}ms`,
+  );
 
   if (frames.length === 0) {
     console.warn('[analysis] No frames — using mock result');
     return { result: { ...MOCK_SWING_RESULT, selectedClub: club ?? MOCK_SWING_RESULT.selectedClub } };
   }
 
-  onProgress?.({ pct: 58, label: 'Coaching with AI…' });
-  const metrics = goodFrames.length >= 2 ? (backendResult?.metrics ?? undefined) : undefined;
-  const result = await analyzeSwingFrames(frames, club, undefined, metrics ?? undefined, landmarks);
-  return { result, backendResult: goodFrames.length >= 2 ? backendResult : undefined };
+  onProgress?.({ pct: 52, label: 'Coaching with AI…' });
+
+  const coachStart = Date.now();
+  const result = await runWithProgressTicks(
+    onProgress,
+    54,
+    88,
+    'Coaching with AI…',
+    () => analyzeSwingFrames(frames, club),
+    220,
+  );
+  console.log(`[analysis] LLM coaching done in ${Date.now() - coachStart}ms`);
+
+  return { result };
 }
 
 // ── New swing analysis ─────────────────────────────────────────────────────
@@ -125,15 +171,23 @@ export async function runSwingAnalysis({
   const notify = (s: AnalysisStage) => onStage?.(s);
   const progress = (pct: number, label: string) => onProgress?.({ pct, label });
 
-  // 1. Fire upload + frame extraction in parallel. Both read the local video
-  //    file and both have meaningful latency (~3-8s for upload, ~4-6s for the
-  //    backend frame pipeline). Running them sequentially was wasting ~30%
-  //    of the wall-clock; running them concurrently saves that flat.
-  progress(6, 'Preparing…');
+  console.log('[analysis] runSwingAnalysis start', {
+    userId,
+    club: club ?? '(none)',
+    uriPrefix: uri.slice(0, 60),
+    mock: useMock(),
+    backend: Boolean(process.env.EXPO_PUBLIC_BACKEND_URL),
+  });
+
+  progress(2, 'Checking video…');
+  await assertVideoFileReadable(uri);
+
+  const totalStart = Date.now();
+  progress(4, 'Preparing…');
   notify('uploading');
   const tempId = `${userId}-${Date.now()}`;
 
-  progress(14, 'Uploading video…');
+  // Start upload in background — coaching only needs the local file.
   const uploadStart = Date.now();
   const uploadPromise: Promise<string> = uploadSwingVideo(uri, userId, tempId)
     .then((url) => {
@@ -145,15 +199,21 @@ export async function runSwingAnalysis({
       return uri;
     });
 
-  progress(22, 'Reading frames…');
   notify('extracting');
   notify('analyzing');
-  const analysisPromise = runFrameAnalysis(uri, club, (p) => progress(p.pct, p.label));
+  progress(12, 'Analyzing swing…');
 
-  const [videoUrl, { result, backendResult }] = await Promise.all([
-    uploadPromise,
-    analysisPromise,
-  ]);
+  const analysisOut = await runFrameAnalysis(uri, club, (p) => progress(p.pct, p.label)).catch(
+    (err) => {
+      console.error('[analysis] frame analysis failed:', err);
+      throw err;
+    },
+  );
+  const result = analysisOut.result;
+
+  progress(82, 'Saving video…');
+  const videoUrl = await uploadPromise;
+  console.log(`[analysis] coaching pipeline done in ${Date.now() - totalStart}ms`);
 
   // 3. Save to DB
   progress(86, 'Saving results…');
@@ -194,6 +254,9 @@ export async function runSwingAnalysis({
   }
 
   const swingId = data.id;
+  prefetchSwingThumbnail(swingId, uri);
+  notifySwingDataUpdates();
+
   progress(94, 'Finalizing…');
 
   // 4. Thumbnail + visual analysis save run in background — don't block the
@@ -203,13 +266,7 @@ export async function runSwingAnalysis({
     .then((url) => { if (url) saveSwingThumbnail(swingId, url); })
     .catch(() => {});
 
-  if (backendResult) {
-    buildVisualAnalysisFromBackendResult(backendResult, swingId, userId, result, uri)
-      .then((va) => {
-        if (va) console.log('[analysis] visual analysis saved inline for', swingId);
-      })
-      .catch((e) => console.warn('[analysis] inline VA save failed:', e));
-  }
+  scheduleRichVisualAnalysis(swingId, userId, uri, club, result);
 
   if (MEDIAPIPE_URL && videoUrl !== uri && data) {
     requestOverlay(swingId, videoUrl, userId);
@@ -244,9 +301,7 @@ export async function reanalyzeSwing(
 
   progress(22, 'Reading frames…');
   notify('analyzing');
-  const { result, backendResult } = await runFrameAnalysis(localUri, swing.club, (p) =>
-    progress(p.pct, p.label),
-  );
+  const { result } = await runFrameAnalysis(localUri, swing.club, (p) => progress(p.pct, p.label));
 
   progress(86, 'Saving results…');
   notify('saving');
@@ -258,10 +313,7 @@ export async function reanalyzeSwing(
       .catch(() => {});
   }
 
-  if (backendResult) {
-    buildVisualAnalysisFromBackendResult(backendResult, swingId, userId, result, localUri)
-      .catch(() => {});
-  }
+  scheduleRichVisualAnalysis(swingId, userId, localUri, swing.club, result);
 
   progress(100, 'Done');
   notify('done');

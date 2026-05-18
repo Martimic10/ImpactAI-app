@@ -25,6 +25,49 @@ export interface SwingScores {
   balanceScore?: number;
 }
 
+// v4 — granular per-category scoring with confidence + explainability.
+// Populated alongside the legacy SwingScores so old screens keep rendering,
+// while new UI can opt in to the richer breakdown.
+export interface SwingCategoryScoreV4 {
+  key: string;            // 'setup' | 'balance' | 'tempo' | 'rotation' | 'swingPath' | 'impactPosition' | 'followThrough'
+  name: string;           // user-facing label
+  score: number;          // 0-100 (after confidence adjustment)
+  rawScore: number;       // 0-100 (before confidence adjustment)
+  weight: number;         // 0-1
+  confidence: number;     // 0-1
+  reason: string;
+  topIssue?: string;
+  suggestedFix?: string;
+  metrics: Record<string, number | null>;
+  penalties: Array<{
+    metric: string;
+    value: number;
+    ideal: string;
+    penalty: number;
+    severity: 'minor' | 'moderate' | 'severe';
+    fault: string;
+    fix: string;
+  }>;
+}
+
+export interface SwingScoringV4 {
+  overallScore: number;
+  band: 'excellent' | 'strong' | 'solid' | 'needs-work' | 'major-issues' | 'poor';
+  bandLabel: string;
+  confidence: 'high' | 'medium' | 'low';
+  confidenceScore: number;          // 0-1
+  isLeaderboardEligible: boolean;
+  warnings: string[];
+  topFaults: string[];
+  club: { selected: string; group: string };
+  categories: Record<string, SwingCategoryScoreV4>;
+  phaseValidation: {
+    valid: boolean;
+    warnings: string[];
+    havePhases: { setup: boolean; top: boolean; impact: boolean; finish: boolean };
+  };
+}
+
 export interface SwingScoreReasoning {
   // v3 field names
   position?: string;
@@ -55,6 +98,7 @@ export interface SwingResult {
   cameraAngle: 'down-the-line' | 'face-on' | 'unclear';
   scores?: SwingScores;
   scoreReasoning?: SwingScoreReasoning;
+  scoringV4?: SwingScoringV4;          // v4 — deterministic breakdown
   temporalMetrics?: TemporalMetrics;
   // Legacy
   confidence?: number;
@@ -78,6 +122,9 @@ export interface SwingResult {
 // Helper — get the overall 1-100 score from any swing (handles all schema versions)
 export function getSwingScore(result: SwingResult | null | undefined): number {
   if (!result) return 50;
+  if (typeof result.scoringV4?.overallScore === 'number') {
+    return Math.max(0, Math.min(100, Math.round(result.scoringV4.overallScore)));
+  }
   if (result.scores?.overallScore) {
     const s = result.scores.overallScore;
     return s <= 10 ? s * 10 : s;

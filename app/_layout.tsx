@@ -7,6 +7,8 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useAuth } from '@/hooks/useAuth';
 import { ThemeProvider } from '@/hooks/useTheme';
 import { DEV_MODE } from '@/lib/devMode';
+import { useAppColors } from '@/lib/theme';
+import { stackScreenOptions } from '@/lib/navigation';
 
 // Keep the native splash visible until index.tsx decides where to route
 SplashScreen.preventAutoHideAsync().catch(() => {});
@@ -28,16 +30,24 @@ function AuthGate({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+function RootNavigator() {
+  const colors = useAppColors();
+
+  return (
+    <Stack screenOptions={stackScreenOptions(colors)}>
+      <Stack.Screen name="index" />
+      <Stack.Screen name="(auth)" />
+      <Stack.Screen name="(tabs)" />
+    </Stack>
+  );
+}
+
 export default function RootLayout() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <ThemeProvider>
         <AuthGate>
-          <Stack screenOptions={{ headerShown: false }}>
-            <Stack.Screen name="index" />
-            <Stack.Screen name="(auth)" />
-            <Stack.Screen name="(tabs)" />
-          </Stack>
+          <RootNavigator />
           <StatusBar style="auto" />
         </AuthGate>
       </ThemeProvider>

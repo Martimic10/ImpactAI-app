@@ -93,6 +93,9 @@ create policy "Users can manage their friends"
 create policy "Users can view received requests"
   on public.requests for select using (auth.uid() = receiver_id);
 
+create policy "Users can view sent requests"
+  on public.requests for select using (auth.uid() = sender_id);
+
 create policy "Users can send requests"
   on public.requests for insert with check (auth.uid() = sender_id);
 

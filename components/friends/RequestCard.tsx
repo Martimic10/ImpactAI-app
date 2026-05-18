@@ -1,69 +1,90 @@
 import React from 'react';
 import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
-import { Card } from '@/components/ui/Card';
-import { FriendRequest } from '@/types';
+import { Ionicons } from '@expo/vector-icons';
 import { useAppColors } from '@/lib/theme';
+import { ProfileAvatar } from '@/components/ProfileAvatar';
 
-interface RequestCardProps {
-  request: FriendRequest;
+export interface RequestCardData {
+  id: string;
+  senderId: string;
+  displayName: string;
+  username: string;
+  avatarInitials: string;
+}
+
+interface Props {
+  data: RequestCardData;
   onAccept: () => void;
   onDecline: () => void;
 }
 
-export function RequestCard({ request, onAccept, onDecline }: RequestCardProps) {
+export function RequestCard({ data, onAccept, onDecline }: Props) {
   const colors = useAppColors();
-  const username = request.sender?.username ?? 'Unknown';
 
   return (
-    <Card variant="elevated">
-      <View style={styles.row}>
-        <View style={[styles.avatar, { backgroundColor: colors.surfaceSuccess }]}>
-          <Text style={{ fontSize: 18 }}>🏌️</Text>
-        </View>
-        <View style={styles.info}>
-          <Text style={[styles.username, { color: colors.text }]}>{username}</Text>
-          <Text style={[styles.subtitle, { color: colors.textSecondary }]}>wants to be your golf buddy</Text>
-        </View>
-        <View style={styles.actions}>
-          <TouchableOpacity onPress={onDecline} style={[styles.declineBtn, { backgroundColor: colors.surfaceAlt }]}> 
-            <Text style={[styles.declineIcon, { color: colors.textSecondary }]}>✕</Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={onAccept} style={[styles.acceptBtn, { backgroundColor: colors.success }]}> 
-            <Text style={styles.acceptIcon}>✓</Text>
-          </TouchableOpacity>
+    <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <View style={styles.topRow}>
+        <ProfileAvatar
+          size="sm"
+          initials={data.avatarInitials}
+          backgroundColor="#1A1A28"
+          initialsColor="#A0A0D0"
+        />
+        <View style={styles.nameBlock}>
+          <Text style={[styles.displayName, { color: colors.text }]}>{data.displayName}</Text>
+          <Text style={styles.username}>@{data.username}</Text>
+          <Text style={styles.subtitle}>wants to be your golf buddy</Text>
         </View>
       </View>
-    </Card>
+
+      <View style={styles.btnRow}>
+        <TouchableOpacity onPress={onDecline} activeOpacity={0.8} style={[styles.declineBtn, { borderColor: colors.border }]}>
+          <Ionicons name="close" size={14} color="#8E8E93" />
+          <Text style={styles.declineText}>Decline</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={onAccept} activeOpacity={0.8} style={styles.acceptBtn}>
+          <Ionicons name="checkmark" size={14} color="#0D0D0D" />
+          <Text style={styles.acceptText}>Accept</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  row: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  avatar: {
-    width: 40,
-    height: 40,
+  card: {
     borderRadius: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
+    borderWidth: 1,
+    padding: 16,
+    gap: 14,
   },
-  info: { flex: 1 },
-  username: { fontSize: 14, fontWeight: '600' },
-  subtitle: { fontSize: 12, marginTop: 2 },
-  actions: { flexDirection: 'row', gap: 8 },
+  topRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
+  nameBlock: { flex: 1, gap: 2 },
+  displayName: { fontSize: 16, fontWeight: '700', letterSpacing: -0.2 },
+  username: { fontSize: 12, color: '#555', fontWeight: '500' },
+  subtitle: { fontSize: 13, color: '#666', marginTop: 3 },
+  btnRow: { flexDirection: 'row', gap: 8 },
   declineBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+    flex: 1,
+    flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    backgroundColor: '#111',
   },
-  declineIcon: { fontSize: 14 },
+  declineText: { fontSize: 13, fontWeight: '600', color: '#8E8E93' },
   acceptBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+    flex: 1.5,
+    flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: '#4CAF50',
   },
-  acceptIcon: { fontSize: 14, color: '#FFFFFF', fontWeight: '700' },
+  acceptText: { fontSize: 13, fontWeight: '700', color: '#0D0D0D' },
 });

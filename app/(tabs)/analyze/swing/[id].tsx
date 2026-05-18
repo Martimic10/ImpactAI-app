@@ -2,13 +2,10 @@ import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
-  Image,
   ScrollView,
   TouchableOpacity,
   StyleSheet,
   ActivityIndicator,
-  Modal,
-  Dimensions,
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -18,333 +15,16 @@ import { VideoView, useVideoPlayer } from 'expo-video';
 import { useAuth } from '@/hooks/useAuth';
 import { useSwings } from '@/hooks/useSwings';
 import { getSwingById } from '@/lib/swings';
-import { supabase } from '@/lib/supabase';
-import { Swing, getSwingScore, SwingPhase, VisualAnalysis } from '@/types';
+import { Swing, getSwingScore } from '@/types';
 import { useTheme } from '@/hooks/useTheme';
 import { useAppColors } from '@/lib/theme';
-import { generateVisualAnalysisPreview, saveVisualAnalysis, saveManualFrameOverride, VISUAL_ANALYSIS_VERSION } from '@/lib/visualAnalysis';
-import { SwingOverlay } from '@/components/SwingOverlay';
-import { hasProAccess } from '@/lib/plans';
-import { PaywallModal } from '@/components/PaywallModal';
+import { humanizeSwingText } from '@/lib/humanizeSwingText';
 
-const { width: SW, height: SH } = Dimensions.get('window');
-
-const PHASE_LABEL: Record<SwingPhase, string> = {
-  setup:  'Address',
-  top:    'Top of Backswing',
-  impact: 'Impact',
-  finish: 'Follow-Through',
-};
-
-const VA_PHASES: SwingPhase[] = ['setup', 'top', 'impact', 'finish'];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fullscreen viewer — user-controlled thumbnail strip, no auto-pause
+// Inline video — tap to play/pause, no overlay / fullscreen analysis
 // ─────────────────────────────────────────────────────────────────────────────
-// Phases the user can manually correct (address and FT are usually fine)
-const ADJUSTABLE_PHASES: SwingPhase[] = ['top', 'impact'];
-
-function FullscreenVideoViewer({
-  url,
-  swingId,
-  visualAnalysis,
-  visible,
-  onClose,
-  onPhaseAdjusted,
-}: {
-  url: string;
-  swingId: string;
-  visualAnalysis?: VisualAnalysis;
-  visible: boolean;
-  onClose: () => void;
-  onPhaseAdjusted?: (phase: SwingPhase, timeMs: number) => void;
-}) {
-  const [activePhase, setActivePhase]   = useState<SwingPhase | null>(null);
-  const [isPlaying, setIsPlaying]       = useState(false);
-  const [showPose, setShowPose]         = useState(true);
-  const [playbackRate, setPlaybackRate] = useState(0.35);
-  const [frameAspect, setFrameAspect]   = useState(9 / 16);
-  const [adjustMode, setAdjustMode]     = useState(false);
-  const [savedPhase, setSavedPhase]     = useState<SwingPhase | null>(null);
-
-  const player = useVideoPlayer(url || null, (p) => {
-    p.loop = true;
-    p.muted = false;
-    p.playbackRate = 0.35;
-    p.pause();
-  });
-
-  useEffect(() => { player.playbackRate = playbackRate; }, [playbackRate]);
-
-  useEffect(() => {
-    if (!visible) return;
-    setActivePhase(null);
-    setAdjustMode(false);
-    setSavedPhase(null);
-    setShowPose(true);
-    setIsPlaying(true);
-    player.currentTime = 0;
-    player.play();
-  }, [visible]);
-
-  function togglePhase(phase: SwingPhase) {
-    setAdjustMode(false);
-    setSavedPhase(null);
-    if (activePhase === phase) {
-      setActivePhase(null);
-      player.play();
-      setIsPlaying(true);
-    } else {
-      setActivePhase(phase);
-      setShowPose(true);
-      player.pause();
-      setIsPlaying(false);
-      // Prefer manual override timestamp if set, then stored timeMs
-      const frame = visualAnalysis?.[phase];
-      const seekMs = frame?.manualTimeMs ?? frame?.timeMs;
-      if (seekMs != null) {
-        player.currentTime = seekMs / 1000;
-      }
-    }
-  }
-
-  async function markCurrentFrame() {
-    if (!activePhase) return;
-    const timeMs = Math.round(player.currentTime * 1000);
-    setSavedPhase(activePhase);
-    setAdjustMode(false);
-    await saveManualFrameOverride(swingId, activePhase, timeMs);
-    onPhaseAdjusted?.(activePhase, timeMs);
-    setTimeout(() => setSavedPhase(null), 2000);
-  }
-
-  function togglePlayPause() {
-    // If a phase is frozen, tapping play dismisses it and resumes
-    if (activePhase) {
-      setActivePhase(null);
-      player.play();
-      setIsPlaying(true);
-      return;
-    }
-    if (isPlaying) { player.pause(); setIsPlaying(false); }
-    else           { player.play();  setIsPlaying(true);  }
-  }
-
-  function handleClose() {
-    player.pause();
-    onClose();
-  }
-
-  const activeFrame = activePhase ? visualAnalysis?.[activePhase] : null;
-  const hasPose = !!(activeFrame?.landmarks && activeFrame.landmarks.length >= 29);
-  const videoH = SH * 0.52;
-  const frameW = Math.min(SW, videoH * frameAspect);
-  const frameH = frameW / frameAspect;
-  const frameLeft = (SW - frameW) / 2;
-  const frameTop  = (videoH - frameH) / 2;
-
-  return (
-    <Modal visible={visible} animationType="slide" statusBarTranslucent>
-      <View style={fs.container}>
-        <StatusBar style="light" />
-
-        {/* ── Header ── */}
-        <View style={fs.topBar}>
-          <TouchableOpacity onPress={handleClose} style={fs.topBtn}>
-            <Ionicons name="close" size={20} color="#FFF" />
-          </TouchableOpacity>
-
-          {/* Speed controls */}
-          <View style={fs.speedRow}>
-            {([0.25, 0.5, 0.75, 1.0] as const).map((rate) => (
-              <TouchableOpacity
-                key={rate}
-                onPress={() => setPlaybackRate(rate)}
-                style={[fs.speedBtn, playbackRate === rate && fs.speedBtnActive]}
-                activeOpacity={0.8}
-              >
-                <Text style={[fs.speedText, playbackRate === rate && fs.speedTextActive]}>
-                  {rate === 1.0 ? '1×' : `${rate}×`}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-
-          <TouchableOpacity onPress={togglePlayPause} style={fs.topBtn}>
-            <Ionicons name={isPlaying ? 'pause' : 'play'} size={20} color="#FFF" />
-          </TouchableOpacity>
-        </View>
-
-        {/* ── Video area ── */}
-        <TouchableOpacity
-          style={[fs.videoArea, { height: videoH }]}
-          onPress={togglePlayPause}
-          activeOpacity={1}
-        >
-          <VideoView
-            player={player}
-            style={StyleSheet.absoluteFill}
-            contentFit="contain"
-            nativeControls={false}
-          />
-
-          {/* Frozen frame image — only when imageUrl available */}
-          {activeFrame?.imageUrl ? (
-            <View style={StyleSheet.absoluteFill} pointerEvents="none">
-              <Image
-                source={{ uri: activeFrame.imageUrl, cache: 'reload' }}
-                style={StyleSheet.absoluteFill}
-                resizeMode="contain"
-                onLoad={(e) => {
-                  const { width, height } = e.nativeEvent.source;
-                  if (width > 0 && height > 0) setFrameAspect(width / height);
-                }}
-              />
-            </View>
-          ) : null}
-
-          {/* Skeleton overlay — shows on top of video OR frozen frame whenever
-              a phase is active and landmarks exist, regardless of imageUrl */}
-          {activePhase && showPose && activeFrame?.landmarks && activeFrame.landmarks.length >= 29 && (
-            <View
-              style={[fs.poseFrame, { left: frameLeft, top: frameTop, width: frameW, height: frameH }]}
-              pointerEvents="none"
-            >
-              <SwingOverlay
-                landmarks={activeFrame.landmarks}
-                width={frameW}
-                height={frameH}
-                mode="minimal"
-                showGlow
-              />
-            </View>
-          )}
-
-          {/* Pause overlay hint */}
-          {!activePhase && !isPlaying && (
-            <View style={fs.pauseHint} pointerEvents="none">
-              <View style={fs.pauseCircle}>
-                <Ionicons name="play" size={30} color="#FFF" />
-              </View>
-            </View>
-          )}
-        </TouchableOpacity>
-
-        {/* ── Coaching area ── */}
-        {activePhase ? (
-          <View style={fs.coachCard}>
-            <View style={fs.coachRow}>
-              <View style={fs.coachIcon}>
-                <Ionicons name="golf" size={14} color="#4CAF50" />
-              </View>
-              <Text style={fs.coachPhase}>{PHASE_LABEL[activePhase]}</Text>
-              <View style={{ flexDirection: 'row', gap: 6 }}>
-                {hasPose && !adjustMode && (
-                  <TouchableOpacity
-                    onPress={() => setShowPose((v) => !v)}
-                    style={[fs.poseBtn, showPose && fs.poseBtnOn]}
-                    activeOpacity={0.8}
-                  >
-                    <Ionicons name="body-outline" size={12} color={showPose ? '#0D0D0D' : '#FFF'} />
-                    <Text style={[fs.poseBtnText, showPose && fs.poseBtnTextOn]}>
-                      {showPose ? 'Hide' : 'Overlay'}
-                    </Text>
-                  </TouchableOpacity>
-                )}
-                {ADJUSTABLE_PHASES.includes(activePhase) && !adjustMode && (
-                  <TouchableOpacity
-                    onPress={() => { setAdjustMode(true); player.play(); setIsPlaying(true); }}
-                    style={fs.adjustBtn}
-                    activeOpacity={0.8}
-                  >
-                    <Ionicons name="pencil-outline" size={12} color="#FF9F0A" />
-                    <Text style={fs.adjustBtnText}>Adjust</Text>
-                  </TouchableOpacity>
-                )}
-              </View>
-            </View>
-
-            {adjustMode ? (
-              <View style={fs.adjustArea}>
-                <Text style={fs.adjustHint}>
-                  Play to the correct {PHASE_LABEL[activePhase]} moment, then tap Mark.
-                </Text>
-                <TouchableOpacity onPress={markCurrentFrame} style={fs.markBtn} activeOpacity={0.85}>
-                  <Ionicons name="bookmark" size={13} color="#0D0D0D" />
-                  <Text style={fs.markBtnText}>Mark as {PHASE_LABEL[activePhase].split(' ')[0]}</Text>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={() => setAdjustMode(false)} style={fs.cancelAdjust}>
-                  <Text style={fs.cancelAdjustText}>Cancel</Text>
-                </TouchableOpacity>
-              </View>
-            ) : savedPhase === activePhase ? (
-              <View style={fs.savedRow}>
-                <Ionicons name="checkmark-circle" size={16} color="#4CAF50" />
-                <Text style={fs.savedText}>Frame saved!</Text>
-              </View>
-            ) : (
-              <Text style={fs.coachNote} numberOfLines={3}>{activeFrame?.coachingNote ?? ''}</Text>
-            )}
-          </View>
-        ) : (
-          <View style={fs.hintCard}>
-            <Ionicons name="hand-left-outline" size={16} color="#555" />
-            <Text style={fs.hintText}>Tap a phase to freeze it · tap Adjust to correct Top or Impact</Text>
-          </View>
-        )}
-
-        {/* ── Phase thumbnail strip ── */}
-        <View style={fs.strip}>
-          {VA_PHASES.map((phase) => {
-            const frame = visualAnalysis?.[phase];
-            const isActive = activePhase === phase;
-            return (
-              <TouchableOpacity
-                key={phase}
-                onPress={() => togglePhase(phase)}
-                style={[fs.card, isActive && fs.cardActive]}
-                activeOpacity={0.85}
-              >
-                {frame?.imageUrl ? (
-                  <Image source={{ uri: frame.imageUrl }} style={fs.cardImg} resizeMode="cover" />
-                ) : (
-                  <View style={fs.cardPlaceholder}>
-                    <Ionicons name="image-outline" size={20} color="#333" />
-                  </View>
-                )}
-                {isActive && <View style={fs.cardRing} />}
-                <View style={fs.cardLabel}>
-                  <Text style={[fs.cardLabelText, isActive && fs.cardLabelActive]} numberOfLines={1}>
-                    {PHASE_LABEL[phase].split(' ')[0]}
-                  </Text>
-                </View>
-              </TouchableOpacity>
-            );
-          })}
-        </View>
-      </View>
-    </Modal>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Inline video player (on results screen) — tap expand to go fullscreen
-// ─────────────────────────────────────────────────────────────────────────────
-function VideoPlayerInline({
-  url,
-  onBack,
-  onExpand,
-  onRegenerate,
-  hasVisualAnalysis,
-  vaGenerating,
-}: {
-  url: string;
-  onBack: () => void;
-  onExpand: () => void;
-  onRegenerate: () => void;
-  hasVisualAnalysis: boolean;
-  vaGenerating: boolean;
-}) {
+function VideoPlayerInline({ url, onBack }: { url: string; onBack: () => void }) {
   const [playing, setPlaying] = useState(true);
   const player = useVideoPlayer(url || null, (p) => {
     p.loop = true;
@@ -354,7 +34,11 @@ function VideoPlayerInline({
 
   function toggle() {
     if (!player) return;
-    if (playing) { player.pause(); } else { player.play(); }
+    if (playing) {
+      player.pause();
+    } else {
+      player.play();
+    }
     setPlaying((p) => !p);
   }
 
@@ -362,33 +46,9 @@ function VideoPlayerInline({
     <TouchableOpacity style={styles.videoWrap} onPress={toggle} activeOpacity={1}>
       <VideoView player={player} style={styles.video} contentFit="cover" nativeControls={false} />
 
-      {/* Back button */}
       <TouchableOpacity onPress={onBack} style={styles.circleBtn} activeOpacity={0.85}>
         <Ionicons name="arrow-back" size={20} color="#FFFFFF" />
       </TouchableOpacity>
-
-      {/* Expand / Overlay button — top right */}
-      <TouchableOpacity onPress={onExpand} style={[styles.expandBtn, vaGenerating && styles.expandBtnGenerating]} activeOpacity={0.85}>
-        {vaGenerating ? (
-          <>
-            <ActivityIndicator size="small" color="#4CAF50" />
-            <Text style={styles.expandBtnGeneratingText}>Generating…</Text>
-          </>
-        ) : (
-          <>
-            <Ionicons name={hasVisualAnalysis ? 'body-outline' : 'expand-outline'} size={15} color="#FFFFFF" />
-            {hasVisualAnalysis && <Text style={styles.expandBtnText}>Overlay</Text>}
-          </>
-        )}
-      </TouchableOpacity>
-
-      {/* Regenerate button — bottom right, only when overlay exists */}
-      {hasVisualAnalysis && !vaGenerating && (
-        <TouchableOpacity onPress={onRegenerate} style={styles.regenBtn} activeOpacity={0.8}>
-          <Ionicons name="refresh-outline" size={12} color="#8E8E93" />
-          <Text style={styles.regenBtnText}>Regenerate</Text>
-        </TouchableOpacity>
-      )}
 
       {!playing && (
         <View style={styles.playOverlay} pointerEvents="none">
@@ -423,27 +83,40 @@ function metricFromScore(score: number, offset: number) { return clampScore(scor
 type ScoreRow = { label: string; value: number; reason?: string };
 
 function buildScoreRows(swing: Swing): ScoreRow[] {
+  const v4 = swing.result_json.scoringV4?.categories;
+  if (v4) {
+    return [
+      { label: 'Setup',      value: clampScore(v4.setup?.score ?? 50),          reason: humanizeSwingText(v4.setup?.reason) },
+      { label: 'Balance',    value: clampScore(v4.balance?.score ?? 50),        reason: humanizeSwingText(v4.balance?.reason) },
+      { label: 'Tempo',      value: clampScore(v4.tempo?.score ?? 50),          reason: humanizeSwingText(v4.tempo?.reason) },
+      { label: 'Rotation',   value: clampScore(v4.rotation?.score ?? 50),       reason: humanizeSwingText(v4.rotation?.reason) },
+      { label: 'Swing Path', value: clampScore(v4.swingPath?.score ?? 50),      reason: humanizeSwingText(v4.swingPath?.reason) },
+      { label: 'Impact',     value: clampScore(v4.impactPosition?.score ?? 50), reason: humanizeSwingText(v4.impactPosition?.reason) },
+      { label: 'Finish',     value: clampScore(v4.followThrough?.score ?? 50),  reason: humanizeSwingText(v4.followThrough?.reason) },
+    ];
+  }
+
   const s = swing.result_json.scores;
   const r = swing.result_json.scoreReasoning;
   if (s) {
     // v3 schema — new category names
     if (s.positionScore != null) {
       return [
-        { label: 'Position',  value: clampScore(s.positionScore),  reason: r?.position },
-        { label: 'Tempo',     value: clampScore(s.tempoScore),     reason: r?.tempo },
-        { label: 'Sequence',  value: clampScore(s.sequenceScore),  reason: r?.sequence },
-        { label: 'Stability', value: clampScore(s.stabilityScore), reason: r?.stability },
-        { label: 'Contact',   value: clampScore(s.contactScore),   reason: r?.contact },
+        { label: 'Position',  value: clampScore(s.positionScore),  reason: humanizeSwingText(r?.position) },
+        { label: 'Tempo',     value: clampScore(s.tempoScore),     reason: humanizeSwingText(r?.tempo) },
+        { label: 'Sequence',  value: clampScore(s.sequenceScore),  reason: humanizeSwingText(r?.sequence) },
+        { label: 'Stability', value: clampScore(s.stabilityScore), reason: humanizeSwingText(r?.stability) },
+        { label: 'Contact',   value: clampScore(s.contactScore),   reason: humanizeSwingText(r?.contact) },
       ];
     }
     // Legacy v2 schema — old field names
     return [
-      { label: 'Setup',      value: clampScore(s.setupScore ?? 50),     reason: r?.setup },
-      { label: 'Posture',    value: clampScore(s.postureScore ?? 50),   reason: r?.posture },
-      { label: 'Swing Path', value: clampScore(s.swingPathScore ?? 50), reason: r?.swingPath },
-      { label: 'Tempo',      value: clampScore(s.tempoScore),           reason: r?.tempo },
-      { label: 'Balance',    value: clampScore(s.balanceScore ?? 50),   reason: r?.balance },
-      { label: 'Contact',    value: clampScore(s.contactScore),         reason: r?.contact },
+      { label: 'Setup',      value: clampScore(s.setupScore ?? 50),     reason: humanizeSwingText(r?.setup) },
+      { label: 'Posture',    value: clampScore(s.postureScore ?? 50),   reason: humanizeSwingText(r?.posture) },
+      { label: 'Swing Path', value: clampScore(s.swingPathScore ?? 50), reason: humanizeSwingText(r?.swingPath) },
+      { label: 'Tempo',      value: clampScore(s.tempoScore),           reason: humanizeSwingText(r?.tempo) },
+      { label: 'Balance',    value: clampScore(s.balanceScore ?? 50),   reason: humanizeSwingText(r?.balance) },
+      { label: 'Contact',    value: clampScore(s.contactScore),         reason: humanizeSwingText(r?.contact) },
     ];
   }
   const base = clampScore(getSwingScore(swing.result_json));
@@ -496,9 +169,16 @@ export default function SwingDetailScreen() {
   const { id, from } = useLocalSearchParams<{ id: string; from?: string }>();
   const goBack = () => {
     if (from === 'analysis') {
-      // After a fresh analysis, replace the whole stack with the analyze home
-      // so the back history doesn't include preview/processing screens
-      router.replace('/(tabs)/analyze');
+      // Fresh analysis starts from full-screen modal screens
+      // (preview/processing). If we simply replace with the analyze home from
+      // inside that modal stack, the home screen can appear as a dismissible
+      // modal without the tab bar. Dismiss the modal stack back to the real tab
+      // first; fall back to replace when there's nothing to dismiss.
+      if (router.canDismiss()) {
+        router.dismissAll();
+      } else {
+        router.replace('/(tabs)/analyze');
+      }
     } else if (router.canGoBack()) {
       router.back();
     } else {
@@ -506,83 +186,22 @@ export default function SwingDetailScreen() {
     }
   };
   const { user } = useAuth();
-  const isPro = hasProAccess(user);
   const { swings } = useSwings(user?.id);
   const [directSwing, setDirectSwing] = useState<Swing | null>(null);
   const [fetching, setFetching] = useState(false);
-  const [overlayMode, setOverlayMode] = useState<'original' | 'overlay'>('original');
-  const [liveSwing, setLiveSwing] = useState<Swing | null>(null);
-  const [showFullscreen, setShowFullscreen] = useState(false);
-  const [showPaywall, setShowPaywall] = useState(false);
-  const [vaGenerating, setVaGenerating] = useState(false);
 
   const cached = swings.find((s) => s.id === id);
-  const swing = liveSwing ?? cached ?? directSwing;
+  const swing = cached ?? directSwing;
 
   useEffect(() => {
     if (!cached && id && !fetching) {
       setFetching(true);
-      getSwingById(id).then((s) => { setDirectSwing(s); setFetching(false); });
+      getSwingById(id).then((s) => {
+        setDirectSwing(s);
+        setFetching(false);
+      });
     }
   }, [cached, id]);
-
-  // Auto-generate visual analysis for ANY swing that is missing it
-  useEffect(() => {
-    if (!swing?.id || !user?.id) return;
-    if (swing.visual_analysis && (swing.analysis_version ?? 0) >= VISUAL_ANALYSIS_VERSION) return;
-    if (!swing.video_url) return;
-    if (vaGenerating) return;
-    runVisualAnalysis(swing);
-  }, [swing?.id, user?.id]);
-
-  function runVisualAnalysis(target: Swing) {
-    if (!user?.id || vaGenerating) return;
-    console.log('[VA] starting generation for swing', target.id, 'video:', target.video_url.slice(0, 60));
-    setVaGenerating(true);
-    generateVisualAnalysisPreview(target.video_url, user.id, target.id, target.result_json)
-      .then((generated) => {
-        console.log('[VA] generation result:', generated ? 'SUCCESS' : 'NULL — check logs above');
-        if (generated) {
-          setLiveSwing((prev) => prev
-            ? { ...prev, visual_analysis: generated.preview, analysis_version: VISUAL_ANALYSIS_VERSION }
-            : { ...(target as Swing), visual_analysis: generated.preview, analysis_version: VISUAL_ANALYSIS_VERSION });
-
-          setVaGenerating(false);
-          generated.persist()
-            .then((savedVa) => {
-              if (!savedVa) return;
-              saveVisualAnalysis(target.id, savedVa);
-              setLiveSwing((prev) => prev
-                ? { ...prev, visual_analysis: savedVa, analysis_version: VISUAL_ANALYSIS_VERSION }
-                : prev);
-            })
-            .catch((e) => console.error('[VA] background upload/save threw:', e));
-        }
-      })
-      .catch((e) => console.error('[VA] generation threw:', e))
-      .finally(() => setVaGenerating(false));
-  }
-
-  function regenerateVisualAnalysis() {
-    if (!swing || vaGenerating) return;
-    // Clear local visual_analysis so the viewer shows fresh data
-    const cleared = { ...(swing as Swing), visual_analysis: undefined as unknown as typeof swing.visual_analysis };
-    setLiveSwing(cleared);
-    runVisualAnalysis(cleared);
-  }
-
-  // Poll for overlay completion
-  useEffect(() => {
-    if (!id || !swing || swing.overlay_status !== 'processing') return;
-    const interval = setInterval(async () => {
-      const { data } = await supabase.from('swings').select('overlay_status, overlay_video_url').eq('id', id).single();
-      if (data?.overlay_status !== 'processing') {
-        setLiveSwing((prev) => prev ? { ...prev, ...data } : { ...(swing as Swing), ...data });
-        clearInterval(interval);
-      }
-    }, 4000);
-    return () => clearInterval(interval);
-  }, [id, swing?.overlay_status]);
 
   if (!swing) {
     return (
@@ -607,11 +226,8 @@ export default function SwingDetailScreen() {
   const fixes = buildFixes(swing);
   const drills = buildDrills(swing);
   const ringColor = scoreColor(score);
-  const activeVideoUrl = overlayMode === 'overlay' && swing.overlay_video_url
-    ? swing.overlay_video_url : swing.video_url;
-  const hasVideo = !!swing.video_url;
-  const hasOverlay = swing.overlay_status === 'completed' && !!swing.overlay_video_url;
-  const overlayProcessing = swing.overlay_status === 'processing';
+  const videoUrl = swing.video_url ?? '';
+  const hasVideo = !!videoUrl;
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]} edges={['top']}>
@@ -621,17 +237,7 @@ export default function SwingDetailScreen() {
         {/* Video */}
         <View style={styles.hero}>
           {hasVideo ? (
-            <VideoPlayerInline
-              url={activeVideoUrl}
-              onBack={goBack}
-              onExpand={() => {
-                if (!isPro) { setShowPaywall(true); return; }
-                setShowFullscreen(true);
-              }}
-              onRegenerate={regenerateVisualAnalysis}
-              hasVisualAnalysis={!!swing.visual_analysis}
-              vaGenerating={vaGenerating}
-            />
+            <VideoPlayerInline url={videoUrl} onBack={goBack} />
           ) : (
             <>
               <View style={styles.heroShade} />
@@ -641,31 +247,6 @@ export default function SwingDetailScreen() {
             </>
           )}
         </View>
-
-        {/* Overlay toggle */}
-        {(hasOverlay || overlayProcessing) && (
-          <View style={styles.toggleRow}>
-            <TouchableOpacity
-              onPress={() => setOverlayMode('original')}
-              style={[styles.toggleBtn, overlayMode === 'original' && styles.toggleBtnActive]}
-              activeOpacity={0.8}
-            >
-              <Text style={[styles.toggleText, overlayMode === 'original' && styles.toggleTextActive]}>Original</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              onPress={() => hasOverlay && setOverlayMode('overlay')}
-              style={[styles.toggleBtn, overlayMode === 'overlay' && styles.toggleBtnActive, !hasOverlay && styles.toggleBtnDisabled]}
-              activeOpacity={hasOverlay ? 0.8 : 1}
-            >
-              {overlayProcessing && overlayMode !== 'overlay' && (
-                <ActivityIndicator size="small" color="#8E8E93" style={{ marginRight: 6 }} />
-              )}
-              <Text style={[styles.toggleText, overlayMode === 'overlay' && styles.toggleTextActive, !hasOverlay && styles.toggleTextDisabled]}>
-                {overlayProcessing ? 'Processing…' : 'Pose Overlay'}
-              </Text>
-            </TouchableOpacity>
-          </View>
-        )}
 
         {/* Meta */}
         <View style={styles.heroMeta}>
@@ -682,7 +263,7 @@ export default function SwingDetailScreen() {
           </View>
           <View style={styles.summaryCopy}>
             <Text style={styles.summaryKicker}>AI SUMMARY</Text>
-            <Text style={styles.summaryBody} numberOfLines={4}>{swing.result_json.summary}</Text>
+            <Text style={styles.summaryBody} numberOfLines={4}>{humanizeSwingText(swing.result_json.summary)}</Text>
             {swing.result_json.scores?.tempoScore != null && (
               <Text style={styles.tempoLine}>◷ Tempo · {swing.result_json.scores.tempoScore}/100</Text>
             )}
@@ -719,7 +300,7 @@ export default function SwingDetailScreen() {
                   <View style={styles.leadingIconGood}>
                     <Ionicons name="checkmark" size={12} color="#B6FF2F" />
                   </View>
-                  <Text style={styles.rowTextStrong}>{s}</Text>
+                  <Text style={styles.rowTextStrong}>{humanizeSwingText(s)}</Text>
                 </View>
               ))}
             </View>
@@ -736,7 +317,7 @@ export default function SwingDetailScreen() {
                   <View style={styles.leadingIconEvidence}>
                     <Ionicons name="eye-outline" size={12} color="#8E8E93" />
                   </View>
-                  <Text style={[styles.rowTextStrong, { color: '#C0CDD6', fontWeight: '500' }]}>{e}</Text>
+                  <Text style={[styles.rowTextStrong, { color: '#C0CDD6', fontWeight: '500' }]}>{humanizeSwingText(e)}</Text>
                 </View>
               ))}
             </View>
@@ -784,54 +365,27 @@ export default function SwingDetailScreen() {
           ))}
         </View>
 
-        {/* Compare */}
-        <View style={[styles.panel, styles.compareCard]}>
-          <View style={styles.compareCardLeft}>
+        {/* Games (Social) */}
+        <View style={[styles.panel, styles.gamesCard]}>
+          <View style={styles.gamesCardLeft}>
             <View style={styles.leadingIconGood}>
-              <Ionicons name="trophy-outline" size={12} color="#B6FF2F" />
+              <Ionicons name="flag-outline" size={12} color="#B6FF2F" />
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={styles.compareTitle}>Keep the momentum</Text>
-              <Text style={styles.compareSub}>Compare this swing to another to track your progress.</Text>
+              <Text style={styles.gamesTitle}>Join the action</Text>
+              <Text style={styles.gamesSub}>Live games, challenges, and friendly competition on Social.</Text>
             </View>
           </View>
           <TouchableOpacity
-            style={styles.compareBtn}
-            onPress={() => router.navigate({ pathname: '/(tabs)/compare', params: { swingId: id } })}
+            style={styles.gamesCta}
+            onPress={() => router.push({ pathname: '/(tabs)/friends', params: { segment: 'games' } })}
             activeOpacity={0.85}
           >
-            <Ionicons name="trending-up" size={12} color="#0D0D0D" />
-            <Text style={styles.compareBtnText}>Compare</Text>
+            <Ionicons name="trophy-outline" size={12} color="#0D0D0D" />
+            <Text style={styles.gamesCtaText}>Games</Text>
           </TouchableOpacity>
         </View>
       </ScrollView>
-
-      {/* Fullscreen video + frame overlay viewer — pro only */}
-      {hasVideo && (
-        <FullscreenVideoViewer
-          url={activeVideoUrl}
-          swingId={id}
-          visualAnalysis={swing.visual_analysis}
-          visible={showFullscreen}
-          onClose={() => setShowFullscreen(false)}
-          onPhaseAdjusted={(phase, timeMs) => {
-            // Patch the live swing state so the corrected frame is used immediately
-            setLiveSwing((prev) => {
-              const base = prev ?? swing;
-              if (!base?.visual_analysis) return prev;
-              return {
-                ...base,
-                visual_analysis: {
-                  ...base.visual_analysis,
-                  [phase]: { ...base.visual_analysis[phase], manualTimeMs: timeMs },
-                },
-              };
-            });
-          }}
-        />
-      )}
-
-      <PaywallModal visible={showPaywall} onClose={() => setShowPaywall(false)} />
     </SafeAreaView>
   );
 }
@@ -860,32 +414,6 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(8,12,14,0.55)',
     borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)',
     alignItems: 'center', justifyContent: 'center',
-  },
-  expandBtn: {
-    position: 'absolute', top: 12, right: 12, zIndex: 10,
-    minWidth: 40, height: 40, borderRadius: 20,
-    backgroundColor: 'rgba(8,12,14,0.55)',
-    borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)',
-    paddingHorizontal: 12,
-    gap: 6,
-    flexDirection: 'row',
-    alignItems: 'center', justifyContent: 'center',
-  },
-  expandBtnText: { color: '#FFFFFF', fontSize: 12, fontWeight: '800' },
-  expandBtnGenerating: { width: 'auto', paddingHorizontal: 10, gap: 6, flexDirection: 'row', alignItems: 'center' },
-  expandBtnGeneratingText: { color: '#4CAF50', fontSize: 11, fontWeight: '700' },
-  regenBtn: {
-    position: 'absolute', bottom: 12, right: 12,
-    flexDirection: 'row', alignItems: 'center', gap: 4,
-    backgroundColor: 'rgba(8,12,14,0.55)',
-    borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)',
-    borderRadius: 14, paddingHorizontal: 9, paddingVertical: 5,
-  },
-  regenBtnText: { color: '#8E8E93', fontSize: 11, fontWeight: '600' },
-  overlayDot: {
-    position: 'absolute', top: 8, right: 8,
-    width: 7, height: 7, borderRadius: 4,
-    backgroundColor: '#4CAF50',
   },
   kicker: { color: '#B6FF2F', fontSize: 12, fontWeight: '700', letterSpacing: 2, marginBottom: 6 },
   heroTitle: { color: '#FFFFFF', fontSize: 22, fontWeight: '800', letterSpacing: -0.5 },
@@ -957,15 +485,15 @@ const styles = StyleSheet.create({
     borderRadius: 14, paddingHorizontal: 9, paddingVertical: 4,
   },
   timeText: { color: '#9AA0A6', fontSize: 12, fontWeight: '700' },
-  compareCard: { marginTop: 14, flexDirection: 'column', gap: 12 },
-  compareCardLeft: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, flex: 1 },
-  compareTitle: { color: '#F4F7FA', fontSize: 15, fontWeight: '700' },
-  compareSub: { color: '#98A4AD', fontSize: 12, marginTop: 2, maxWidth: 200 },
-  compareBtn: {
+  gamesCard: { marginTop: 14, flexDirection: 'column', gap: 12 },
+  gamesCardLeft: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, flex: 1 },
+  gamesTitle: { color: '#F4F7FA', fontSize: 15, fontWeight: '700' },
+  gamesSub: { color: '#98A4AD', fontSize: 12, marginTop: 2, maxWidth: 200 },
+  gamesCta: {
     backgroundColor: '#4CAF50', borderRadius: 12, paddingHorizontal: 14, paddingVertical: 8,
     flexDirection: 'row', alignItems: 'center', gap: 5, alignSelf: 'flex-start',
   },
-  compareBtnText: { color: '#FFFFFF', fontSize: 12, fontWeight: '800' },
+  gamesCtaText: { color: '#FFFFFF', fontSize: 12, fontWeight: '800' },
   errorState: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 10 },
   errorTitle: { color: '#FFFFFF', fontSize: 18, fontWeight: '700' },
   errorBtn: { backgroundColor: '#1A1A1A', borderRadius: 12, borderWidth: 1, borderColor: '#2A2A2A', paddingHorizontal: 14, paddingVertical: 10 },
@@ -978,17 +506,6 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.55)', borderWidth: 1.5,
     borderColor: 'rgba(255,255,255,0.25)', alignItems: 'center', justifyContent: 'center',
   },
-  toggleRow: {
-    flexDirection: 'row', marginHorizontal: 16, marginTop: 10,
-    backgroundColor: '#1A1A1A', borderRadius: 14, padding: 3,
-    borderWidth: 1, borderColor: '#2A2A2A',
-  },
-  toggleBtn: { flex: 1, paddingVertical: 9, borderRadius: 11, alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 4 },
-  toggleBtnActive: { backgroundColor: '#2E7D32' },
-  toggleBtnDisabled: { opacity: 0.5 },
-  toggleText: { fontSize: 13, fontWeight: '600', color: '#8E8E93' },
-  toggleTextActive: { color: '#FFFFFF' },
-  toggleTextDisabled: { color: '#555' },
   heroMeta: { marginHorizontal: 16, marginTop: 14, marginBottom: 4 },
 
   // Unused legacy styles kept so existing layout isn't broken
@@ -1001,120 +518,5 @@ const styles = StyleSheet.create({
   metricBarTrack: { height: 5, borderRadius: 3, backgroundColor: '#2A2A2A', overflow: 'hidden' },
   metricBarFill: { height: '100%', borderRadius: 3 },
   metricTarget: { color: '#647381', fontSize: 13, marginTop: 2 },
-  playOverlay2: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center' },
-  activeDot: { position: 'absolute', top: 10, right: 10, width: 10, height: 10, borderRadius: 5, backgroundColor: 'rgba(76,175,80,0.2)', alignItems: 'center', justifyContent: 'center' },
-  activeDotInner: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#4CAF50' },
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Fullscreen styles
-// ─────────────────────────────────────────────────────────────────────────────
-const fs = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#000' },
-
-  // ── Header ──
-  topBar: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingHorizontal: 14, paddingTop: 54, paddingBottom: 10,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-  },
-  topBtn: {
-    width: 38, height: 38, borderRadius: 19,
-    backgroundColor: 'rgba(255,255,255,0.12)',
-    alignItems: 'center', justifyContent: 'center',
-  },
-  speedRow: { flexDirection: 'row', gap: 6 },
-  speedBtn: {
-    paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16,
-    backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)',
-  },
-  speedBtnActive: { backgroundColor: '#2E7D32', borderColor: '#4CAF50' },
-  speedText: { fontSize: 12, fontWeight: '700', color: '#888' },
-  speedTextActive: { color: '#FFFFFF' },
-
-  // ── Video ──
-  videoArea: { width: SW, backgroundColor: '#000', overflow: 'hidden' },
-  poseFrame: { position: 'absolute', zIndex: 4 },
-  pauseHint: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center' },
-  pauseCircle: {
-    width: 64, height: 64, borderRadius: 32,
-    backgroundColor: 'rgba(0,0,0,0.55)',
-    borderWidth: 2, borderColor: 'rgba(255,255,255,0.25)',
-    alignItems: 'center', justifyContent: 'center',
-  },
-
-  // ── Coaching card ──
-  coachCard: {
-    backgroundColor: '#0E0E0E',
-    paddingHorizontal: 18, paddingTop: 14, paddingBottom: 10, gap: 8,
-    borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#1E1E1E',
-  },
-  coachRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  coachIcon: {
-    width: 28, height: 28, borderRadius: 14,
-    backgroundColor: '#1B2E1B', alignItems: 'center', justifyContent: 'center',
-  },
-  coachPhase: { flex: 1, fontSize: 15, fontWeight: '800', color: '#FFF', letterSpacing: -0.2 },
-  poseBtn: {
-    flexDirection: 'row', alignItems: 'center', gap: 4,
-    backgroundColor: 'rgba(255,255,255,0.08)',
-    paddingHorizontal: 10, paddingVertical: 5,
-    borderRadius: 14, borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)',
-  },
-  poseBtnOn: { backgroundColor: '#4CAF50', borderColor: '#4CAF50' },
-  poseBtnText: { fontSize: 11, fontWeight: '700', color: '#FFF' },
-  poseBtnTextOn: { color: '#0D0D0D' },
-  coachNote: { fontSize: 13, color: '#B0BEC5', lineHeight: 19 },
-
-  // ── Adjust mode ──
-  adjustBtn: {
-    flexDirection: 'row', alignItems: 'center', gap: 4,
-    backgroundColor: 'rgba(255,159,10,0.15)',
-    paddingHorizontal: 9, paddingVertical: 5,
-    borderRadius: 14, borderWidth: 1, borderColor: 'rgba(255,159,10,0.4)',
-  },
-  adjustBtnText: { fontSize: 11, fontWeight: '700', color: '#FF9F0A' },
-  adjustArea: { gap: 8, paddingTop: 4 },
-  adjustHint: { fontSize: 12, color: '#8E8E93', lineHeight: 17 },
-  markBtn: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6,
-    backgroundColor: '#FF9F0A', borderRadius: 12,
-    paddingVertical: 10,
-  },
-  markBtnText: { fontSize: 13, fontWeight: '800', color: '#0D0D0D' },
-  cancelAdjust: { alignItems: 'center', paddingVertical: 4 },
-  cancelAdjustText: { fontSize: 12, color: '#555', fontWeight: '600' },
-  savedRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  savedText: { fontSize: 13, color: '#4CAF50', fontWeight: '600' },
-
-  // ── Hint (no phase selected) ──
-  hintCard: {
-    flexDirection: 'row', alignItems: 'center', gap: 8,
-    backgroundColor: '#0E0E0E',
-    paddingHorizontal: 18, paddingVertical: 12,
-    borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#1E1E1E',
-  },
-  hintText: { fontSize: 13, color: '#444' },
-
-  // ── Phase thumbnail strip ──
-  strip: {
-    flexDirection: 'row', flex: 1,
-    backgroundColor: '#080808',
-    paddingHorizontal: 12, paddingTop: 12, paddingBottom: 28, gap: 10,
-  },
-  card: { flex: 1, borderRadius: 14, overflow: 'hidden', opacity: 0.55 },
-  cardActive: { opacity: 1 },
-  cardImg: { width: '100%', aspectRatio: 0.72, borderRadius: 14 },
-  cardPlaceholder: {
-    width: '100%', aspectRatio: 0.72, borderRadius: 14,
-    backgroundColor: '#1A1A1A', alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: '#2A2A2A',
-  },
-  cardRing: {
-    position: 'absolute', top: 0, left: 0, right: 0, bottom: 22,
-    borderRadius: 14, borderWidth: 2.5, borderColor: '#4CAF50',
-  },
-  cardLabel: { alignItems: 'center', paddingTop: 5 },
-  cardLabelText: { fontSize: 11, fontWeight: '600', color: '#555' },
-  cardLabelActive: { color: '#4CAF50' },
-});

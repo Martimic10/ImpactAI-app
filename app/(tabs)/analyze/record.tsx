@@ -11,6 +11,7 @@ import Animated, {
 } from 'react-native-reanimated';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '@/hooks/useTheme';
+import { encodeVideoUriForRoute } from '@/lib/analysisUri';
 
 export default function RecordScreen() {
   const router = useRouter();
@@ -68,7 +69,7 @@ export default function RecordScreen() {
       if (video) {
         router.push({
           pathname: '/(tabs)/analyze/preview',
-          params: { uri: video.uri },
+          params: { uri: encodeVideoUriForRoute(video.uri) },
         });
       }
     } catch {

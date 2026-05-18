@@ -2,13 +2,21 @@ import { useState, useEffect, useCallback } from 'react';
 import { supabase } from '@/lib/supabase';
 import { Swing } from '@/types';
 import { DEV_MODE, MOCK_SWINGS } from '@/lib/devMode';
+import { subscribeSwingDataUpdates } from '@/lib/swingDataUpdates';
 
 export function useSwings(userId: string | undefined) {
-  const [swings, setSwings] = useState<Swing[]>(DEV_MODE ? MOCK_SWINGS : []);
+  const [swings, setSwings] = useState<Swing[]>(() => (DEV_MODE ? MOCK_SWINGS : []));
   const [loading, setLoading] = useState(false);
 
   const fetchSwings = useCallback(async () => {
-    if (DEV_MODE || !userId) return;
+    if (DEV_MODE) {
+      setSwings(MOCK_SWINGS);
+      return;
+    }
+    if (!userId) {
+      setSwings([]);
+      return;
+    }
     setLoading(true);
     const { data } = await supabase
       .from('swings')
@@ -17,7 +25,8 @@ export function useSwings(userId: string | undefined) {
       .order('created_at', { ascending: false })
       .limit(20);
 
-    if (data) setSwings((data as Swing[]).filter((s) => s.result_json != null));
+    const dbSwings = ((data ?? []) as Swing[]).filter((s) => s.result_json != null);
+    setSwings(dbSwings);
     setLoading(false);
   }, [userId]);
 
@@ -25,10 +34,17 @@ export function useSwings(userId: string | undefined) {
     fetchSwings();
   }, [fetchSwings]);
 
+  useEffect(() => {
+    if (DEV_MODE) return undefined;
+    return subscribeSwingDataUpdates(() => {
+      void fetchSwings();
+    });
+  }, [fetchSwings]);
+
   async function saveSwing(
     videoUrl: string,
     resultJson: object,
-    privacy: 'private' | 'friends' = 'private'
+    privacy: 'private' | 'friends' = 'private',
   ) {
     if (DEV_MODE) {
       const newSwing: Swing = {
@@ -70,15 +86,11 @@ export function useSwings(userId: string | undefined) {
 }
 
 export function useFriendSwings(friendId: string | undefined) {
-  const [swings, setSwings] = useState<Swing[]>([]);
+  const [swings, setSwings] = useState<Swing[]>(DEV_MODE ? MOCK_SWINGS.filter((s) => s.privacy === 'friends') : []);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (DEV_MODE) {
-      // Return mock swings for any friend in dev mode
-      setSwings(MOCK_SWINGS.filter((s) => s.privacy === 'friends'));
-      return;
-    }
+    if (DEV_MODE) return;
 
     if (!friendId) return;
     setLoading(true);

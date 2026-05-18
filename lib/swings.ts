@@ -1,4 +1,5 @@
 import { supabase } from '@/lib/supabase';
+import { notifySwingDataUpdates } from '@/lib/swingDataUpdates';
 import { Swing } from '@/types';
 
 export async function getSwingById(swingId: string): Promise<Swing | null> {
@@ -32,6 +33,7 @@ export async function saveSwingThumbnail(
     console.error('[swings] saveSwingThumbnail failed:', error.message, '— run migration to add thumbnail_url column');
   } else {
     console.log('[swings] thumbnail saved for swing', swingId);
+    notifySwingDataUpdates();
   }
 }
 
