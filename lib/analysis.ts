@@ -48,17 +48,6 @@ interface RunSwingAnalysisOptions {
   onProgress?: (p: AnalysisProgress) => void;
 }
 
-const MEDIAPIPE_URL = process.env.EXPO_PUBLIC_MEDIAPIPE_URL ?? '';
-
-function requestOverlay(swingId: string, videoUrl: string, userId: string) {
-  if (!MEDIAPIPE_URL) return;
-  fetch(`${MEDIAPIPE_URL}/process-overlay`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ swing_id: swingId, video_url: videoUrl, user_id: userId }),
-  }).catch((e) => console.warn('[overlay] request failed:', e));
-}
-
 const useMock = () =>
   !process.env.EXPO_PUBLIC_OPENROUTER_API_KEY ||
   process.env.EXPO_PUBLIC_OPENROUTER_API_KEY === 'your_openrouter_api_key';
@@ -267,10 +256,6 @@ export async function runSwingAnalysis({
     .catch(() => {});
 
   scheduleRichVisualAnalysis(swingId, userId, uri, club, result);
-
-  if (MEDIAPIPE_URL && videoUrl !== uri && data) {
-    requestOverlay(swingId, videoUrl, userId);
-  }
 
   progress(100, 'Done');
   notify('done');

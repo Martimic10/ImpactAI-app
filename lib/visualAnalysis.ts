@@ -68,18 +68,8 @@ function buildCoachingNotes(result: SwingResult): Record<SwingPhase, string> {
 
 // ─── Backend phase-detection pipeline ────────────────────────────────────────
 //
-// PRIMARY: dense-frame + on-demand landmarks.
-//   1. POST /extract-frames mode=phaseDetection — 75 evenly-spaced JPEGs + meta
-//   2. Pick 4 phase frames using fallback windows + dedup
-//   3. POST /analyze-frames — MediaPipe pose landmarks for those 4 frames
-//   4. Compute tempo metrics from picked indices + fps
-//
-// This avoids the slower /extract-key-frames endpoint, which (a) does
-// server-side URL downloads that frequently fail, and (b) runs a full
-// MediaPipe pose track on ~50 frames before returning anything. The dense
-// path is faster end-to-end AND more reliable — the only endpoints we hit
-// are /extract-frames and /analyze-frames, both of which only need a
-// decodable video.
+// POST /extract-frames mode=phaseDetection — dense JPEGs + motion + audio hint.
+// Client picks setup/top/impact/finish, then uploads phase stills (no pose overlay).
 
 interface BackendFrameResult {
   frame: string | null;       // base64 JPEG
@@ -93,153 +83,12 @@ interface BackendResult {
   metrics: TemporalMetrics | null;
 }
 
-// Session-level circuit breaker for the pose endpoint. Once /detect-phases-pose
-// fails with a network/transport error (typically: backend hasn't been
-// redeployed with that route, so the request fails before reaching FastAPI),
-// don't keep paying the retry cost every time. The dense pipeline already
-// handles fallback correctly and runs against the older /extract-frames +
-// /analyze-frames endpoints that we know are live. Resets on app reload.
-let poseEndpointDeadUntil = 0;
-const POSE_DEAD_TTL_MS = 5 * 60 * 1000;
-
-function markPoseEndpointDead(reason: string) {
-  poseEndpointDeadUntil = Date.now() + POSE_DEAD_TTL_MS;
-  console.log(
-    `[visualAnalysis] disabling /detect-phases-pose for this session — ${reason}. ` +
-      `Falling back to dense pipeline. ` +
-      `(Likely cause: backend hasn't been redeployed with the new endpoint yet.)`,
-  );
-}
-
 export async function fetchBackendResult(
   videoUri: string,
-  club?: string,
+  _club?: string,
 ): Promise<BackendResult | null> {
   if (!BACKEND_URL) return null;
-
-  // Skip pose endpoint if its transport has been failing this session. The
-  // breaker is tripped ONLY for unreachable/404/transport errors, not for
-  // "endpoint worked but returned too few usable frames on this particular
-  // video" — that's a per-video signal, not an endpoint-wide one.
-  const poseDead = Date.now() < poseEndpointDeadUntil;
-  if (!poseDead) {
-    const posed = await detectPhasesViaPose(videoUri, club);
-    if (posed && posed.frames.filter((f) => f.frame).length >= 2) return posed;
-  }
-
-  return extractPhasesViaDense(videoUri, club);
-}
-
-// ─── Pose-based phase detection (primary) ────────────────────────────────────
-// Calls /detect-phases-pose which tracks the golfer's hands through the video
-// via MediaPipe Pose and identifies phases from the hand trajectory:
-//
-//   Impact = peak hand velocity (the fastest moment in any swing)
-//   Top    = last local energy minimum before impact (the reversal pause)
-//   Address = lowest-energy frame in first 22% (golfer still at setup)
-//   Finish = ~0.35s after impact (post-contact hold)
-//
-// Returns the 4 phase frames at full resolution + MediaPipe landmarks
-// + deterministic tempo metrics in one round trip (~3-5s).
-
-async function detectPhasesViaPose(
-  videoUri: string,
-  club?: string,
-): Promise<BackendResult | null> {
-  // /detect-phases-pose is a multipart upload endpoint — needs a local URI.
-  let localUri = videoUri;
-  if (videoUri.startsWith('http')) {
-    try {
-      const cacheKey = videoUri.split('/').pop()?.split('?')[0] ?? `va_${Date.now()}`;
-      localUri = await resolveLocalUri(videoUri, cacheKey.replace(/\W+/g, '_'));
-    } catch (e) {
-      console.warn('[visualAnalysis] pose: failed to fetch video to local cache:', e);
-      return null;
-    }
-  }
-
-  try {
-    const formData = new FormData();
-    formData.append('video', {
-      uri: localUri,
-      name: 'swing.mp4',
-      type: 'video/mp4',
-    } as unknown as Blob);
-    if (club) formData.append('club', club);
-    formData.append('include_overlays', 'false');
-
-    const res = await fetchWithTimeout(`${BACKEND_URL}/detect-phases-pose`, {
-      method: 'POST',
-      body: formData,
-      timeoutMs: BACKEND_FETCH_TIMEOUT_MS,
-    });
-    if (!res.ok) {
-      // 404 = endpoint isn't deployed; 5xx = server can't handle pose requests.
-      // Both are endpoint-wide problems, so trip the breaker for the session.
-      if (res.status === 404) {
-        markPoseEndpointDead('endpoint not deployed (404)');
-      } else if (res.status >= 500) {
-        markPoseEndpointDead(`server error (${res.status})`);
-      } else {
-        console.warn('[visualAnalysis] /detect-phases-pose error:', res.status);
-      }
-      return null;
-    }
-    const json = await res.json();
-    const frames = (json.frames ?? []) as BackendFrameResult[];
-    const metrics = (json.metrics ?? null) as TemporalMetrics | null;
-    const validCount = frames.filter((f) => f.frame).length;
-    const landmarkCount = frames.filter((f) => f.landmarks && f.landmarks.length > 0).length;
-    console.log(
-      `[visualAnalysis] pose pipeline: ${validCount}/4 frames, ${landmarkCount}/4 landmarks` +
-        (metrics?.tempoRatio != null
-          ? ` tempoRatio=${metrics.tempoRatio} tempoScore=${metrics.computedTempoScore}`
-          : ''),
-    );
-    if (validCount < 2) return null;
-    return { frames, metrics };
-  } catch (e) {
-    // "TypeError: Network request failed" almost always means the route
-    // doesn't exist on the running backend (backend wasn't redeployed) or
-    // the server hard-closed the connection. Either way we skip the pose
-    // endpoint for the rest of this session via the circuit breaker.
-    const msg = e instanceof Error ? e.message : String(e);
-    markPoseEndpointDead(`unreachable (${msg})`);
-    return null;
-  }
-}
-
-// ─── /analyze-frames helper ──────────────────────────────────────────────────
-
-async function analyzeFramesForLandmarks(
-  base64Frames: Array<string | null>,
-): Promise<(PoseLandmark[] | null)[]> {
-  // Empty strings ask the backend to skip that slot — keeps array indices
-  // aligned with the requested phase order.
-  const payload = base64Frames.map((f) => f ?? '');
-  if (!BACKEND_URL || payload.every((f) => !f)) {
-    return payload.map(() => null);
-  }
-  try {
-    const res = await fetchWithTimeout(`${BACKEND_URL}/analyze-frames`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ frames: payload }),
-      timeoutMs: BACKEND_FETCH_TIMEOUT_MS,
-    });
-    if (!res.ok) {
-      console.warn('[visualAnalysis] /analyze-frames error:', res.status);
-      return payload.map(() => null);
-    }
-    const json = await res.json();
-    const results = (json.frames ?? []) as Array<PoseLandmark[] | null>;
-    // Backend may return fewer entries than we sent on error — pad with nulls.
-    while (results.length < payload.length) results.push(null);
-    return results;
-  } catch (e) {
-    console.warn('[visualAnalysis] /analyze-frames threw:', e);
-    return payload.map(() => null);
-  }
+  return extractPhasesViaDense(videoUri);
 }
 
 // ─── Client-side tempo metrics ───────────────────────────────────────────────
@@ -698,10 +547,7 @@ function pickPhaseIndicesFromDense(
   return pickPhaseIndicesFromWindows(totalDenseFrames);
 }
 
-async function extractPhasesViaDense(
-  videoUri: string,
-  _club?: string,
-): Promise<BackendResult | null> {
+async function extractPhasesViaDense(videoUri: string): Promise<BackendResult | null> {
   // /extract-frames requires a local URI (multipart upload). Download once
   // if we were handed an https URL.
   let localUri = videoUri;
@@ -755,10 +601,6 @@ async function extractPhasesViaDense(
 
   const selectedFrames = picks.map((p) => usable[p]);
 
-  // Fetch MediaPipe landmarks for the 4 selected frames in a single request.
-  // ~1-2s on Render vs. the ~10-15s /extract-key-frames-upload was costing.
-  const landmarks = await analyzeFramesForLandmarks(selectedFrames);
-
   // Map picked dense indices back to source video frame indices and compute
   // tempo metrics deterministically.
   let metrics: TemporalMetrics | null = null;
@@ -773,9 +615,8 @@ async function extractPhasesViaDense(
     timeMs = picks.map((_, i) => i * 1000);
   }
 
-  const landmarkCount = landmarks.filter((l) => l && l.length > 0).length;
   console.log(
-    `[visualAnalysis] dense pipeline: picks=${picks.join(',')} landmarks=${landmarkCount}/4 ` +
+    `[visualAnalysis] dense pipeline: picks=${picks.join(',')} ` +
       (metrics?.tempoRatio != null
         ? `tempoRatio=${metrics.tempoRatio} tempoScore=${metrics.computedTempoScore}`
         : 'no metrics'),
@@ -783,7 +624,7 @@ async function extractPhasesViaDense(
 
   const bfFrames: BackendFrameResult[] = PHASES.map((_, i) => ({
     frame: selectedFrames[i],
-    landmarks: landmarks[i] ?? null,
+    landmarks: null,
     time_ms: timeMs[i],
   }));
 
@@ -967,7 +808,6 @@ export async function generateVisualAnalysis(
     if (backendResult && backendResult.frames.filter((f) => f.frame).length >= 2) {
       patchSwingMetricsAsync(swingId, backendResult.metrics);
       const va = await buildPersistedFromBackendResult(backendResult.frames, notes, userId, swingId);
-      console.log(`[visualAnalysis] landmarks: ${backendResult.frames.filter((f) => f.landmarks).length}/4`);
       return va;
     }
     console.warn('[visualAnalysis] dense pipeline returned no usable frames');

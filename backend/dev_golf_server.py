@@ -1,9 +1,8 @@
 """
-Minimal local server for GolfCourseAPI (course search / tees).
-Use when full main.py won't start (e.g. Python 3.14 + mediapipe issues).
+Golf-only dev server (no frame extraction). Prefer main.py for full backend.
 
   cd backend
-  .venv/bin/pip install fastapi uvicorn python-dotenv
+  .venv/bin/pip install -r requirements.txt
   .venv/bin/python dev_golf_server.py
 """
 from __future__ import annotations

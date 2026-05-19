@@ -8,12 +8,5 @@ services:
     dockerfilePath: ./Dockerfile
     plan: free
     envVars:
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_KEY
-        sync: false
       - key: GOLF_COURSE_API_KEY
         sync: false
-      - key: OPENROUTER_API_KEY
-        sync: false
-        optional: true
