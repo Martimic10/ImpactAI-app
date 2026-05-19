@@ -1,0 +1,19 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Existing service: set Root Directory to "backend" and redeploy if not using Blueprint.
+services:
+  - type: web
+    name: impactai-backend
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: GOLF_COURSE_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+        optional: true
